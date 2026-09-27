@@ -2507,7 +2507,7 @@ function render(){
   app.innerHTML=(S.tab==="home"?pwaStart():"")+v();
   app.querySelectorAll("[data-keep]").forEach(e=>{const x=keep[e.dataset.keep];if(x)e.scrollLeft=x;});
   if(S.tab==="plan"&&S.planView==="result")drawChart();
-  syncChip();
+  syncChip();navSync();
   if(!S.sync.boot&&syncOn()&&S.gdAvail&&syncLoaded()){S.sync.boot=true;setTimeout(()=>syncRun(true),400);}
 }
 
@@ -2527,10 +2527,33 @@ app.addEventListener("change",async e=>{const id=e.target.id;
 
 /* ---------- sheets ---------- */
 const root=document.getElementById("sheetRoot");
-function openSheet(html,onMount){root.innerHTML=`<div class="sheet-bg"><div class="sheet" role="dialog" aria-modal="true">${html}</div></div>`;
+function openSheet(html,onMount){const had=!!root.firstChild;root.innerHTML=`<div class="sheet-bg"><div class="sheet" role="dialog" aria-modal="true">${html}</div></div>`;
+  if(NAV&&!had&&!navBack&&!(history.state&&history.state.sheet))history.pushState({...(history.state||{kf:1,...navKey(),d:0}),sheet:true},"");   // 뒤로 가기로 시트를 닫게
   const bg=root.firstChild;bg.addEventListener("click",e=>{if(e.target===bg)closeSheet();});
   const first=bg.querySelector("input,select");if(first)setTimeout(()=>first.focus(),50);onMount&&onMount(bg);}
-function closeSheet(){root.innerHTML="";}
+function closeSheet(){root.innerHTML="";if(NAV&&history.state&&history.state.sheet&&!navBack){navBack=true;history.back();}}
+/* ---------- 뒤로 가기 (PC·안드로이드 앱): 화면 이동과 시트를 브라우저 기록에 남겨, 뒤로 가기가 앱을 닫지 않고 앞 화면으로 가게 한다 ---------- */
+const NAV=PWA&&!!(window.history&&history.pushState);
+let navBack=false,navRestoring=false;   // navBack: 코드가 부른 뒤로 가기(시트 닫기)가 진행 중
+function navKey(){const pl=S.tab==="plan";return {tab:S.tab,acct:S.openAcct||null,mv:S.memberView||null,ps:pl?S.planSel||null:null,pv:pl&&S.planSel?S.planView:null};}
+const NAV_K=["acct","mv","ps","pv"];
+const navSame=(a,b)=>!!a&&!!b&&a.tab===b.tab&&NAV_K.every(k=>(a[k]||null)===(b[k]||null));
+function navSync(){if(!NAV||navBack)return;const cur=history.state&&history.state.kf?history.state:null;const k=navKey();
+  if(!cur){history.replaceState({kf:1,...k,d:0,sheet:false},"");return;}
+  if(cur.sheet||navSame(cur,k))return;
+  if(navRestoring){history.replaceState({...cur,...k},"");return;}
+  if(cur.up&&navSame(cur.up,k)){navBack=true;history.back();return;}   // 바로 앞 화면으로 돌아간 것이면(‹ 계좌 목록, 앞 탭) 기록을 쌓지 않고 뒤로
+  history.pushState({kf:1,...k,d:(cur.d||0)+1,up:{tab:cur.tab,acct:cur.acct||null,mv:cur.mv||null,ps:cur.ps||null,pv:cur.pv||null},sheet:false},"");}
+function applyNav(st){navRestoring=true;try{S.tab=st.tab||"home";S.openAcct=st.acct&&S.accounts[st.acct]?st.acct:null;S.memberView=st.mv||null;S.reorder=null;
+  if(S.tab==="plan"){S.planSel=st.ps||null;if(st.pv)S.planView=st.pv;try{localStorage.setItem("rf.psel",S.planSel||"");localStorage.setItem("rf.pv",S.planView);}catch(e){}}
+  try{localStorage.setItem("rf.tab",S.tab);}catch(e){}render();}finally{navRestoring=false;}window.scrollTo(0,0);}
+if(NAV){try{history.scrollRestoration="manual";}catch(e){}
+  window.addEventListener("popstate",e=>{const st=e.state&&e.state.kf?e.state:null;
+    if(navBack){navBack=false;   // 코드가 부른 뒤로 가기(시트 닫기·앞 화면으로)가 끝남
+      if(root.firstChild)history.pushState({...(st||{kf:1,...navKey(),d:0}),sheet:true},"");   // 그사이 새 시트가 열렸으면 다시 기록
+      else navSync();return;}
+    if(root.firstChild){root.innerHTML="";if(st&&!st.sheet&&!navSame(st,navKey()))applyNav(st);return;}   // 열린 시트부터 닫는다
+    if(st)applyNav(st);});}
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&root.innerHTML)closeSheet();});
 // ‘가져오기…’ 버튼(파일 선택)도 키보드로 열 수 있게
 document.addEventListener("keydown",e=>{const t=e.target;if((e.key==="Enter"||e.key===" ")&&t&&t.getAttribute&&t.getAttribute("for")==="importFile"){e.preventDefault();const f=document.getElementById("importFile");if(f)f.click();}});

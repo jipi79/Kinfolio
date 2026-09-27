@@ -55,10 +55,11 @@
     return { size: list.length, empty: !list.length, docs: list.map(x => ({ id: x.id, exists: true, data: () => clone(x.d) })) };
   }
   const docSnap = p => ({ id: p.slice(p.lastIndexOf("/") + 1), exists: p in docs, data: () => clone(docs[p]) });
+  const dirtyC = new Set(), dirtyD = new Set(); let flushT = null;
   function notify(p) {
-    const c = colOf(p);
-    (colL[c] || []).forEach(l => setTimeout(() => l.fn(colSnap(c, l.q)), 0));
-    (docL[p] || []).forEach(fn => setTimeout(() => fn(docSnap(p)), 0));
+    dirtyC.add(colOf(p)); dirtyD.add(p);
+    if (!flushT) flushT = setTimeout(() => { flushT = null; const cs = [...dirtyC], ds = [...dirtyD]; dirtyC.clear(); dirtyD.clear();
+      cs.forEach(c => (colL[c] || []).forEach(l => l.fn(colSnap(c, l.q)))); ds.forEach(d => (docL[d] || []).forEach(fn => fn(docSnap(d)))); }, 0);
   }
   function query(col, q) {
     return {
@@ -180,11 +181,13 @@
       return pub(await api("POST", `${UP}/files?uploadType=multipart&fields=${FIELDS}`, m));
     },
     async download_file_content(i) {
-      const f = await api("GET", `${API}/files/${encodeURIComponent(i.fileId)}?fields=id,name,mimeType`);
-      const g = /^application\/vnd\.google-apps\./.test(f.mimeType);
-      const type = g ? (i.exportMimeType || "text/plain") : f.mimeType;
-      const res = await api("GET", g ? `${API}/files/${encodeURIComponent(i.fileId)}/export?mimeType=${encodeURIComponent(type)}` : `${API}/files/${encodeURIComponent(i.fileId)}?alt=media`, { raw: true });
-      return { content: b64(await res.arrayBuffer()), id: f.id, mimeType: type, title: f.name };
+      const id = encodeURIComponent(i.fileId);
+      // 시세 시트처럼 내보낼 형식을 주면 바로 export, 아니면 파일 내용 그대로 (메타데이터를 먼저 묻지 않아 요청이 한 번)
+      if (i.exportMimeType) { const res = await api("GET", `${API}/files/${id}/export?mimeType=${encodeURIComponent(i.exportMimeType)}`, { raw: true }); return { content: b64(await res.arrayBuffer()), id: i.fileId, mimeType: i.exportMimeType }; }
+      let res;
+      try { res = await api("GET", `${API}/files/${id}?alt=media`, { raw: true }); }
+      catch (e) { if (e && e.code === "tool_error") { res = await api("GET", `${API}/files/${id}/export?mimeType=text%2Fplain`, { raw: true }); } else throw e; }   // 구글 문서 형식이면 글자로 내보낸다
+      return { content: b64(await res.arrayBuffer()), id: i.fileId, mimeType: res.headers.get("content-type") || "" };
     },
     async search_files(i) {
       const u = `${API}/files?q=${encodeURIComponent(toQ(i.query))}&fields=${encodeURIComponent("nextPageToken,files(" + FIELDS + ")")}&pageSize=${Math.min(Number(i.pageSize) || 30, 100)}&orderBy=${encodeURIComponent("modifiedTime desc")}&spaces=drive` + (i.pageToken ? "&pageToken=" + encodeURIComponent(i.pageToken) : "");
@@ -260,6 +263,16 @@
 html,body{background:var(--bg)}
 body{color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.5;padding:0 16px calc(84px + env(safe-area-inset-bottom,0px));font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
 .wrap{max-width:1600px;margin:0 auto;display:flex;flex-direction:column;gap:16px;padding-block:12px}
+.wrap.narrow{max-width:860px}
+/* 가로로 넘치는 표: 오른쪽에 더 있다는 그림자 */
+.tbl-wrap.more{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 22px),rgba(0,0,0,.35));mask-image:linear-gradient(to right,#000 calc(100% - 22px),rgba(0,0,0,.35))}
+/* 긴 설명은 두 줄만, 누르면 펼침 */
+.hint.clamp{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer;position:relative}
+.hint.clamp::after{content:"더 보기";position:absolute;right:0;bottom:0;padding-left:28px;background:linear-gradient(to right,transparent,var(--surface) 24px);color:var(--accent);font-weight:600}
+.hint.clamp.on-bg::after{background:linear-gradient(to right,transparent,var(--bg) 24px)}
+/* 손가락으로 누르는 기기: 버튼을 조금 크게 */
+@media (pointer:coarse){.btn{min-height:44px}.btn.small{min-height:40px;padding:8px 12px}.seg-toggle button{min-height:34px;padding:6px 12px}.lk{width:36px!important;height:36px!important}.subnav button{min-height:38px}}
+.btn[aria-busy="true"]{opacity:.65;pointer-events:none}
 header.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:var(--bg);margin:0 -16px;padding:12px 16px 8px}
 header.top .inner{max-width:1600px;margin:0 auto;display:flex;align-items:baseline;justify-content:space-between;gap:12px}
 h1{font-size:17px;font-weight:700;margin:0;letter-spacing:-.01em}
@@ -603,6 +616,19 @@ const KSync = (() => {
     if (!remoteChanged) for (const p of new Set([...Object.keys(M), ...Object.keys(R)])) if (hash(M[p]) !== hash(R[p])) { remoteChanged = true; break; }
     return { docs: M, tombs: T, localOps, remoteChanged, picks, first };
   }
+  // 드라이브 파일이 지난 동기화 뒤 그대로일 때(내려받지 않음): 이 기기 내용이 곧 결과, 지운 문서만 기록을 남긴다
+  function mergeLocal(L, B, T, opt = {}) {
+    L = L || {}; B = B || {}; const T0 = T || {}; T = { ...T0 };
+    const now = opt.now || Date.now(), nowIso = new Date(now).toISOString();
+    let changed = false;
+    for (const p of new Set([...Object.keys(L), ...Object.keys(B)])) {
+      if (hash(L[p]) === (B[p] ? B[p][0] : "")) continue;
+      changed = true; if (L[p] === undefined) T[p] = T[p] || nowIso; else delete T[p];
+    }
+    const cut = new Date(now - TOMB_DAYS * 864e5).toISOString();
+    for (const p in T) if (T[p] < cut || L[p] !== undefined) delete T[p];
+    return { docs: { ...L }, tombs: T, localOps: [], remoteChanged: changed || stable(T) !== stable(T0), picks: {}, first: false };
+  }
   function serialize(docs, tombs, device, now, rev) {
     return JSON.stringify({ app: "Kinfolio", format: 1, kind: "sync", rev: rev || 1, exportedAt: new Date(now || Date.now()).toISOString(), device: device || "", data: unflatten(docs), tombs: tombs || {} });
   }
@@ -612,7 +638,7 @@ const KSync = (() => {
     const tombs = d.tombs && typeof d.tombs === "object" ? d.tombs : {};
     return { docs: flatten(d.data), tombs, rev: Number(d.rev) || 0, exportedAt: d.exportedAt || null, device: d.device || "" };
   }
-  return { COLS, FIELD, stable, hash, flatten, unflatten, baseOf, merge, merge3, serialize, parse };
+  return { COLS, FIELD, stable, hash, flatten, unflatten, baseOf, merge, merge3, mergeLocal, serialize, parse };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = KSync;
 </script>
@@ -1910,7 +1936,9 @@ function priceInfo(h){const p=S.prices[tkey(h.ticker)];
 function rate(cur){return cur==="USD"?(fx()||0):1;}
 function hVal(h){const p=priceInfo(h);return num(h.qty)*p.price*rate(h.currency);}
 function hCost(h){return num(h.qty)*num(h.avgPrice)*rate(h.currency);}
-function acctHoldings(id){return Object.values(S.holdings).filter(h=>h.accountId===id).sort((a,b)=>{const ao=a.order??1e9,bo=b.order??1e9;return ao!==bo?ao-bo:hVal(b)-hVal(a);});}
+// 화면을 한 번 그리는 동안(render) 같은 계산을 되풀이하지 않도록 결과를 잠깐 기억한다. 그리기가 끝나면 버린다
+function memo(k,f){const m=S.memo;if(!m)return f();if(!(k in m))m[k]=f();return m[k];}
+function acctHoldings(id){return memo("ah:"+id,()=>Object.values(S.holdings).filter(h=>h.accountId===id).sort((a,b)=>{const ao=a.order??1e9,bo=b.order??1e9;return ao!==bo?ao-bo:hVal(b)-hVal(a);})).slice();}
 function expOf(ticker,cls,h){const a=S.assets[tkey(ticker)]||{};const as=AS();const c=cls||"기타";
   const r=has(a.expReturn)?num(a.expReturn):(h&&has(h.expReturn)?num(h.expReturn):null);const d=has(a.expDiv)?num(a.expDiv):null;
   return{r:r??num(as.returns[c]),dy:d??num(as.divYield[c]),autoR:r==null,autoD:d==null};}
@@ -1951,10 +1979,10 @@ function acctExp(a,k){const as=AS();const st=acctStats(a);let rv=0,dv=0,av=0,tv=
 function groupExp(accts,k){let v=0,rv=0,dv=0;accts.forEach(a=>{const e=acctExp(a,k);v+=e.value;rv+=e.value*e.r;dv+=e.value*e.dy;});return v>0?{r:rv/v,dy:dv/v,value:v}:null;}
 function memberAccts(mid){return acctList().filter(a=>mid==="__all"||(mid==="__none"?!ownerOf(a):ownerOf(a)===mid));}
 function memberExp(mid,k){return groupExp(memberAccts(mid),k);}
-function acctStats(a){const hs=acctHoldings(a.id);let v=0,c=0,risky=0;
+function acctStats(a){return {...memo("st:"+a.id+":"+num(a.cash),()=>{const hs=acctHoldings(a.id);let v=0,c=0,risky=0;
   hs.forEach(h=>{const x=hVal(h);v+=x;c+=hCost(h);if(h.risky)risky+=x;});
-  const cash=num(a.cash);return{hs,value:v,cost:c,cash,total:v+cash,risky,riskRatio:(v+cash)>0?risky/(v+cash):0};}
-function acctList(){return Object.values(S.accounts).sort((a,b)=>(a.order??0)-(b.order??0)||String(a.name).localeCompare(b.name));}
+  const cash=num(a.cash);return{hs,value:v,cost:c,cash,total:v+cash,risky,riskRatio:(v+cash)>0?risky/(v+cash):0};})};}
+function acctList(){return memo("acl",()=>Object.values(S.accounts).sort((a,b)=>(a.order??0)-(b.order??0)||String(a.name).localeCompare(b.name))).slice();}
 function totals(){let total=0,cost=0,cash=0;const byClass={};const byAcct=[];
   acctList().forEach(a=>{const st=acctStats(a);total+=st.total;cost+=st.cost;cash+=st.cash;byAcct.push({a,st});
     st.hs.forEach(h=>{const k=h.assetClass||"기타";byClass[k]=(byClass[k]||0)+hVal(h);});});
@@ -2030,8 +2058,10 @@ function vHome(){
     <div class="r"><b>${eok(g.total)}</b><span class="meta">비중 ${t.total?(g.total/t.total*100).toFixed(1):0}%</span></div></div></button>`).join("")}</div></section>`;}
 
   // by account
-  h+=`<section class="card"><h2>계좌별 비중</h2><div class="bar">${t.byAcct.map((x,i)=>`<span style="width:${t.total?(x.st.total/t.total*100):0}%;background:${ACCT_COLORS[i%ACCT_COLORS.length]}"></span>`).join("")}</div>
-    <div class="list">${t.byAcct.map((x,i)=>{const r=x.st.cost?(x.st.value-x.st.cost)/x.st.cost:0;return `<button class="item" data-acct="${esc(x.a.id)}"><div class="row">
+  const TOPN=6,moreA=t.byAcct.length>TOPN+1;   // 계좌가 많으면 큰 순서로 6개만 (나머지는 ‘계좌’ 탭)
+  const byA=moreA?t.byAcct.map((x,i)=>({x,i})).sort((p,q)=>q.x.st.total-p.x.st.total).slice(0,TOPN):t.byAcct.map((x,i)=>({x,i}));
+  h+=`<section class="card"><div class="row"><h2>계좌별 비중</h2>${moreA?`<button class="btn small" data-go="accounts">전체 ${t.byAcct.length}개 보기</button>`:""}</div><div class="bar">${t.byAcct.map((x,i)=>`<span style="width:${t.total?(x.st.total/t.total*100):0}%;background:${ACCT_COLORS[i%ACCT_COLORS.length]}"></span>`).join("")}</div>
+    <div class="list">${byA.map(({x,i})=>{const r=x.st.cost?(x.st.value-x.st.cost)/x.st.cost:0;return `<button class="item" data-acct="${esc(x.a.id)}"><div class="row">
       <div class="l"><span class="name"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ACCT_COLORS[i%ACCT_COLORS.length]};margin-right:7px"></i>${esc(x.a.name)}</span><span class="meta">${esc(x.a.type)}${x.a.broker?" · "+esc(x.a.broker):""} · 예상 연 ${expTxt(acctExp(x.a).r)}</span></div>
       <div class="r"><b>${eok(x.st.total)}</b><span class="meta ${cls(r)}">${pct(r)} · 비중 ${t.total?(x.st.total/t.total*100).toFixed(1):0}%</span></div></div></button>`;}).join("")}</div></section>`;
 
@@ -2281,7 +2311,7 @@ async function gdMakeSheet(){const list=watchList().filter(w=>w.ticker);if(!list
   const f=await gdCreate({title:"Kinfolio 시세",contentMimeType:"text/csv",textContent:sheetCsv(list)});
   if(!f||!f.id)throw{code:"tool_error",message:"시트를 만들지 못했습니다"};
   await saveRet({gSheetId:f.id,gSheetUrl:f.viewUrl||null,gSheetTickers:list.map(w=>tkey(w.ticker)),gSheetAt:new Date().toISOString()});
-  if(old&&old!==f.id){try{await gdCall("trash_file",{fileId:old});}catch(e){}}   // 예전 시트는 휴지통으로 (실패해도 무시)
+  if(old&&old!==f.id)gdCall("trash_file",{fileId:old}).catch(()=>{});   // 예전 시트는 휴지통으로 (기다리지 않고, 실패해도 무시)
   return true;}
 // 시트를 CSV로 읽는다. 방금 만든 시트는 수식 계산 전(Loading…·값 없음)일 수 있어 최대 네 번까지 조금씩 기다렸다 다시 읽는다
 const GD_WAIT=[1500,3000,4500];
@@ -2295,30 +2325,33 @@ async function gdPrices(){let sid=(S.settings||{}).gSheetId;
   let rows;try{rows=await gdSheetRows(sid);}
   catch(e){if(e&&e.code==="tool_error"){await gdMakeSheet();sid=(S.settings||{}).gSheetId;rows=await gdSheetRows(sid);}else throw e;}
   const wl=watchList();const bySym=Object.fromEntries(wl.map(w=>[gfSymbol(w),w]));
-  let n=0,fxv=null;const miss=[];const now=new Date().toISOString();
+  let n=0,fxv=null;const miss=[];const now=new Date().toISOString();const writes=[];
   for(const [sym,price,prev,tt,cur,gname] of rows){
     if(sym==="CURRENCY:USDKRW"){fxv=gfNum(price);continue;}
     const w=bySym[sym]||wl.find(x=>tkey(x.ticker)===String(sym).split(":").pop());if(!w)continue;
     const t=tkey(w.ticker),v=gfNum(price);if(!(v>0)){miss.push(w.name||t);continue;}
     const p0=S.prices[t]||{};const {id:_i,...keep}=p0;const pv=gfNum(prev);
     const data={...keep,name:p0.name||w.name||gname||t,price:v,currency:cur||w.currency||"KRW",asOf:gfDate(tt)||today(),source:"구글 시트 (GOOGLEFINANCE)",updatedAt:now};
-    if(pv>0)data.prevClose=pv;await S.db.doc("prices/"+t).set(data);n++;}
-  if(fxv>0)await saveRet({usdkrw:Math.round(fxv*100)/100,fxAsOf:today()});
+    if(pv>0)data.prevClose=pv;n++;
+    const k=o=>[o.price,o.prevClose,o.asOf,o.currency,o.name,o.source].join("|");if(k(p0)!==k(data))writes.push(["prices/"+t,data]);}   // 그대로인 가격은 다시 쓰지 않는다
+  const fail=await pool(writes,8,([p,v])=>S.db.doc(p).set(v));if(fail)throw{code:"tool_error",message:`가격 ${fail}건을 저장하지 못했습니다`};
+  const fx2=fxv>0?Math.round(fxv*100)/100:null;
+  if(fx2&&(fx2!==num((S.settings||{}).usdkrw)||(S.settings||{}).fxAsOf!==today()))await saveRet({usdkrw:fx2,fxAsOf:today()});
   const sheetT=(S.settings||{}).gSheetTickers||[];const notIn=wl.filter(w=>!sheetT.includes(tkey(w.ticker))&&!bySym[gfSymbol(w)]&&!rows.some(x=>x[0]===gfSymbol(w)));
-  return {n,fx:fxv,miss,notIn:notIn.map(w=>w.name||w.ticker)};}
+  return {n,changed:writes.length,fx:fxv,miss,notIn:notIn.map(w=>w.name||w.ticker)};}
 async function gdBackup(){const f=await gdCreate({title:`Kinfolio 백업 ${today()} ${new Date(Date.now()+9*3600e3).toISOString().slice(11,16).replace(":","-")}.json`,contentMimeType:"application/json",disableConversionToGoogleType:true,textContent:JSON.stringify(exportDoc())});
-  if(!f||!f.id)throw{code:"tool_error",message:"백업 파일을 만들지 못했습니다"};await saveRet({gLastBackup:new Date().toISOString()});return f;}
+  if(!f||!f.id)throw{code:"tool_error",message:"백업 파일을 만들지 못했습니다"};saveRet({gLastBackup:new Date().toISOString()});return f;}
 async function gdBackups(){return gdBackupsIn((S.settings||{}).gFolderId);}
 async function gdBackupsIn(fid){if(!fid)return [];
   const r=await gdCall("search_files",{query:`parentId = '${fid}' and mimeType = 'application/json' and title contains 'Kinfolio 백업'`,excludeContentSnippets:true,pageSize:30});
   return ((r&&r.files)||[]).sort((a,b)=>String(b.createdTime).localeCompare(String(a.createdTime)));}
-function gdPriceMsg(r){return `가격 ${r.n}개${r.fx?` · 환율 ${nf2.format(r.fx)}`:""}를 가져왔습니다.${r.miss.length?` 가격이 나오지 않은 종목: ${r.miss.join(", ")} (시트에서 종목 코드를 확인하세요).`:""}${r.notIn.length?` 시트에 없는 종목: ${r.notIn.join(", ")} → ‘시트 다시 만들기’를 누르세요.`:""}`;}
-async function gdRun(kind){if(S.gdBusy)return;S.gdBusy=kind;gdSet(kind,null);
+function gdPriceMsg(r){return `가격 ${r.n}개${r.changed!=null&&r.changed<r.n?`(바뀐 것 ${r.changed}개)`:""}${r.fx?` · 환율 ${nf2.format(r.fx)}`:""}를 가져왔습니다.${r.miss.length?` 가격이 나오지 않은 종목: ${r.miss.join(", ")} (시트에서 종목 코드를 확인하세요).`:""}${r.notIn.length?` 시트에 없는 종목: ${r.notIn.join(", ")} → ‘시트 다시 만들기’를 누르세요.`:""}`;}
+async function gdRun(kind){if(S.gdBusy)return;S.gdBusy=kind;gdSet(kind,null);const t0=performance.now();
   try{
-    if(kind==="prices"){const r=await gdPrices();if(r)gdSet(kind,gdPriceMsg(r),false);}
+    if(kind==="prices"){const r=await gdPrices();if(r)gdSet(kind,gdPriceMsg(r)+` (${secTxt(t0)})`,false);}
     else if(kind==="sheet"){if(await gdMakeSheet()){const n=((S.settings||{}).gSheetTickers||[]).length;const r=await gdPrices();
-      gdSet(kind,`구글 드라이브 ‘Kinfolio’ 폴더에 시세 시트를 새로 만들었습니다 (종목 ${n}개). ${r?gdPriceMsg(r):""}`);}}
-    else if(kind==="backup"){const f=await gdBackup();gdSet(kind,`‘${f.title}’으로 백업했습니다.`);}
+      gdSet(kind,`구글 드라이브 ‘Kinfolio’ 폴더에 시세 시트를 새로 만들었습니다 (종목 ${n}개). ${r?gdPriceMsg(r):""} (${secTxt(t0)})`);}}
+    else if(kind==="backup"){const f=await gdBackup();gdSet(kind,`‘${f.title}’으로 백업했습니다 (${secTxt(t0)}).`);}
     else if(kind==="restore"){const list=await gdBackups();if(!list.length){gdSet(kind,"드라이브의 Kinfolio 폴더에 백업이 없습니다.",true);}else{S.gdBusy=null;render();gdPickSheet(list);return;}}
   }catch(e){gdSet(kind,gdErrText(e),true);}
   finally{S.gdBusy=null;render();}}
@@ -2352,61 +2385,73 @@ S.syncBase=undefined;   // undefined: 아직 모름, null: 동기화 안 함
 function syncOn(){return !!(S.syncBase&&S.syncBase.h&&!S.syncBase.off);}
 function syncLoaded(){const l=S.loaded||{};return S.dbState==="ok"&&!!(l.accounts&&l.holdingsRaw&&l.prices&&l.assets&&l.settings&&l.snapshots)&&!!S.planLoaded&&S.syncBase!==undefined;}
 function syncSchedule(ms){clearTimeout(S.sync.timer);S.sync.timer=setTimeout(()=>syncRun(true),ms);}
-function syncDirty(){if(syncOn())syncSchedule(PWA?4000:15000);}
+function syncDirty(){if(syncOn())syncSchedule(PWA?4000:10000);}
 // 사용자가 고친 문서에는 수정 시각을 찍고(동기화가 어느 쪽이 나중인지 알도록), 고친 뒤 자동 동기화를 예약한다.
 // 동기화 자신이 쓰는 것은 S.dbRaw로 바로 쓴다
 function hookDb(db){const own=p=>String(p).startsWith("sync/");
   const stamp=(p,v)=>own(p)||!v||typeof v!=="object"?v:{...v,updatedAt:new Date().toISOString()};
   const w=(p,f)=>async(...a)=>{const r=await f(...a);if(!own(p))syncDirty();return r;};
   return {collection:(...a)=>db.collection(...a),doc:p=>{const d=db.doc(p);return {onSnapshot:(...a)=>d.onSnapshot(...a),get:(...a)=>d.get(...a),set:w(p,v=>d.set(stamp(p,v))),update:w(p,v=>d.update(stamp(p,v))),delete:w(p,()=>d.delete())};}};}
+// 저장·드라이브 요청을 한 번에 n개씩 동시에 (하나씩 기다리면 느리다)
+async function pool(items,n,fn){let i=0,fail=0;const work=async()=>{while(i<items.length){const k=i++;try{await fn(items[k],k);}catch(e){fail++;}}};
+  await Promise.all(Array.from({length:Math.min(n,items.length)},work));return fail;}
+const secTxt=t0=>`${((performance.now()-t0)/1000).toFixed(1)}초`;
 const byTimeDesc=(a,b)=>String(b.modifiedTime||b.createdTime||"").localeCompare(String(a.modifiedTime||a.createdTime||""));
 async function gdFindFolder(){const r=await gdCall("search_files",{query:"title = 'Kinfolio' and mimeType = 'application/vnd.google-apps.folder'",excludeContentSnippets:true,pageSize:10});
   const fs=((r&&r.files)||[]).filter(f=>f.title==="Kinfolio").sort((a,b)=>String(a.createdTime||"").localeCompare(String(b.createdTime||"")));return fs[0]?fs[0].id:null;}
-async function syncFolder(){const id=(S.settings||{}).gFolderId;if(id)return id;const f0=await gdFindFolder();if(f0)return f0;
+async function syncFolder(){const id=(S.settings||{}).gFolderId||(S.syncBase&&S.syncBase.fid);if(id)return id;const f0=await gdFindFolder();if(f0)return f0;
   const f=await gdCall("create_file",{title:"Kinfolio",contentMimeType:"application/vnd.google-apps.folder"});if(!f||!f.id)throw{code:"tool_error",message:"폴더를 만들지 못했습니다"};return f.id;}
 async function syncFiles(fid){const r=await gdCall("search_files",{query:`parentId = '${fid}' and title = '${SYNC_NAME}'`,excludeContentSnippets:true,pageSize:20});
   return ((r&&r.files)||[]).filter(f=>f.title===SYNC_NAME).sort(byTimeDesc);}
-const syncKey=l=>l[0]?l[0].id+"@"+(l[0].modifiedTime||l[0].createdTime||""):"";
+const fileKey=f=>f?f.id+"@"+(f.modifiedTime||f.createdTime||""):"";
+const syncKey=l=>fileKey(l[0]);
 async function syncRun(auto){
   if(S.sync.busy){S.sync.again=true;return;}
   if(!S.db||!S.gdAvail||!syncLoaded())return;
   if(auto&&!syncOn())return;
   if(auto&&PWA&&!KinfolioPWA.hasToken()){render();return;}   // 앱: 연결이 끊겼으면 ‘드라이브 연결’을 누를 때까지 기다린다
   const first=!(S.syncBase&&S.syncBase.h);   // 한 번도 맞춘 적 없음 (껐다 켠 것은 지난 기준으로 이어서 맞춘다)
-  S.sync.busy=true;S.sync.err=false;render();if(PWA)KinfolioPWA.quiet=!!auto;
+  S.sync.busy=true;S.sync.boot=true;S.sync.err=false;render();if(PWA)KinfolioPWA.quiet=!!auto;const t0=performance.now();   // 한 번 맞췄으면 열 때 자동 동기화는 다시 하지 않는다
   try{
     for(let round=0;;round++){
       const fid=await syncFolder();const list=await syncFiles(fid);
-      let R={},T={},from=null,rrev=0;
-      if(list[0]){const r=await gdCall("download_file_content",{fileId:list[0].id});const doc=KSync.parse(b64utf8(r&&r.content));
-        if(!doc)throw{code:"tool_error",message:"드라이브의 동기화 파일을 읽을 수 없습니다"};R=doc.docs;T=doc.tombs;rrev=doc.rev;}
-      else if(first&&PWA&&!acctList().length){   // 앱을 처음 연결했는데 동기화 파일이 없으면 가장 최근 백업에서 시작
-        const b=(await gdBackupsIn(fid))[0];
-        if(b){const r=await gdCall("download_file_content",{fileId:b.id});const doc=KSync.parse(b64utf8(r&&r.content));if(doc){R=doc.docs;from=b.title;}}}
+      const B=first?{}:S.syncBase.h,brev=first?0:(S.syncBase.rev||0);
+      // 드라이브 파일이 지난 동기화 뒤 그대로면 내려받지 않는다 (이 기기에서 고친 것만 올리면 된다)
+      const same=!first&&!!list[0]&&!!S.syncBase.fk&&syncKey(list)===S.syncBase.fk;
+      let R={},T={},from=null,rrev=0,res;
       const L=KSync.flatten(exportDoc().data);
-      // 평가액 기록이 읽기 한도(1000개)에 걸렸으면, 못 읽은 기록을 ‘지운 것’으로 보지 않는다
-      if((S.snapshots||[]).length>=1000)for(const p in R)if(p.startsWith("snapshots/")&&!(p in L))L[p]=R[p];
-      const brev=first?0:(S.syncBase.rev||0);
-      const res=KSync.merge(L,R,first?{}:S.syncBase.h,T,{knownTombs:(!first&&S.syncBase.t)||{},preferRemote:first&&!acctList().length,regress:!first&&!!list[0]&&rrev<=brev});
-      const upload=res.remoteChanged||!list[0];let rev=Math.max(rrev,brev);
+      if(same){res=KSync.mergeLocal(L,B,S.syncBase.t||{});rrev=brev;}
+      else{
+        if(list[0]){const r=await gdCall("download_file_content",{fileId:list[0].id});const doc=KSync.parse(b64utf8(r&&r.content));
+          if(!doc)throw{code:"tool_error",message:"드라이브의 동기화 파일을 읽을 수 없습니다"};R=doc.docs;T=doc.tombs;rrev=doc.rev;}
+        else if(first&&PWA&&!acctList().length){   // 앱을 처음 연결했는데 동기화 파일이 없으면 가장 최근 백업에서 시작
+          const b=(await gdBackupsIn(fid))[0];
+          if(b){const r=await gdCall("download_file_content",{fileId:b.id});const doc=KSync.parse(b64utf8(r&&r.content));if(doc){R=doc.docs;from=b.title;}}}
+        // 평가액 기록이 읽기 한도(1000개)에 걸렸으면, 못 읽은 기록을 ‘지운 것’으로 보지 않는다
+        if((S.snapshots||[]).length>=1000)for(const p in R)if(p.startsWith("snapshots/")&&!(p in L))L[p]=R[p];
+        res=KSync.merge(L,R,B,T,{knownTombs:(!first&&S.syncBase.t)||{},preferRemote:first&&!acctList().length,regress:!first&&!!list[0]&&rrev<=brev});}
+      const upload=res.remoteChanged||!list[0];let rev=Math.max(rrev,brev),fk=syncKey(list),old=[];
       if(upload){
-        const now2=await syncFiles(fid);if(syncKey(now2)!==syncKey(list)&&round<2)continue;   // 그사이 다른 기기가 올렸으면 처음부터 다시 맞춘다
+        let now2=list;
+        if(!same&&list[0]){now2=await syncFiles(fid);if(syncKey(now2)!==syncKey(list)&&round<2)continue;}   // 내려받는 사이 다른 기기가 올렸으면 처음부터 다시 맞춘다
         rev=Math.max(rrev,brev)+1;
         const text=KSync.serialize(res.docs,res.tombs,PWA?"앱":"아티팩트",Date.now(),rev);
-        if(PWA&&now2[0]){await gdCall("update_file",{fileId:now2[0].id,textContent:text,contentMimeType:"application/json"});
-          for(const o of now2.slice(1))try{await gdCall("trash_file",{fileId:o.id});}catch(e){}}
+        if(PWA&&now2[0]){const f=await gdCall("update_file",{fileId:now2[0].id,textContent:text,contentMimeType:"application/json"});fk=fileKey(f&&f.id?f:null)||"";old=now2.slice(1);}
         else{const f=await gdCall("create_file",{title:SYNC_NAME,contentMimeType:"application/json",disableConversionToGoogleType:true,textContent:text,parentId:fid});
-          if(!f||!f.id)throw{code:"tool_error",message:"동기화 파일을 만들지 못했습니다"};
-          for(const o of now2)if(o.id!==f.id)try{await gdCall("trash_file",{fileId:o.id});}catch(e){}}   // 커넥터는 내용을 고칠 수 없어 새로 만들고 예전 것은 휴지통으로
+          if(!f||!f.id)throw{code:"tool_error",message:"동기화 파일을 만들지 못했습니다"};fk=fileKey(f);old=now2.filter(o=>o.id!==f.id);}   // 커넥터는 내용을 고칠 수 없어 새로 만들고 예전 것은 휴지통으로
+        if(old.length)pool(old,4,o=>gdCall("trash_file",{fileId:o.id}));   // 휴지통 옮기기는 기다리지 않는다
       }
       // 이 기기에 반영: 동기화하는 사이에 사용자가 고친 문서는 건드리지 않고 다음 동기화에 맡긴다
-      const cur=KSync.flatten(exportDoc().data);let skip=0,done=0;const applied=[];
-      for(const [p,v] of res.localOps){if(KSync.hash(cur[p])!==KSync.hash(L[p])){skip++;continue;}if(v==null)await S.dbRaw.doc(p).delete();else await S.dbRaw.doc(p).set(v);applied.push([p,v]);done++;}
+      const cur=KSync.flatten(exportDoc().data);const ops=res.localOps.filter(([p])=>KSync.hash(cur[p])===KSync.hash(L[p]));const skip=res.localOps.length-ops.length;
+      const fail=await pool(ops,8,([p,v])=>v==null?S.dbRaw.doc(p).delete():S.dbRaw.doc(p).set(v));
+      if(fail)throw{code:"tool_error",message:`이 기기에 ${fail}건을 저장하지 못했습니다`};
+      const done=ops.length;
       // 저장소가 화면 상태(S)에 반영할 때까지 잠깐 기다린다: 다음 동기화가 예전 상태를 ‘이 기기 변경’으로 오해하지 않게
-      for(let i=0;i<30&&applied.length;i++){const nowD=KSync.flatten(exportDoc().data);if(applied.every(([p,v])=>KSync.hash(nowD[p])===KSync.hash(v==null?undefined:v)))break;await new Promise(ok=>setTimeout(ok,100));}
-      const base={h:KSync.baseOf(res.docs),t:res.tombs,rev,at:new Date().toISOString(),n:Object.keys(res.docs).length};
-      await S.dbRaw.doc("sync/base").set(base);S.syncBase=base;
-      S.sync.at=Date.now();S.sync.msg=`${from?`‘${from}’에서 시작했습니다. `:""}받은 변경 ${done}건 · ${upload?"드라이브에 저장했습니다":"드라이브는 그대로입니다"}.`;
+      for(let i=0;i<30&&done;i++){const nowD=KSync.flatten(exportDoc().data);if(ops.every(([p,v])=>KSync.hash(nowD[p])===KSync.hash(v==null?undefined:v)))break;await new Promise(ok=>setTimeout(ok,100));}
+      const base={h:KSync.baseOf(res.docs),t:res.tombs,rev,fk,fid,at:new Date().toISOString(),n:Object.keys(res.docs).length};
+      if(upload||done||fk!==S.syncBase?.fk||fid!==S.syncBase?.fid||first)await S.dbRaw.doc("sync/base").set(base);else base.at=S.syncBase.at;   // 아무것도 안 바뀌었으면 기준도 다시 쓰지 않는다
+      S.syncBase=base;
+      S.sync.at=Date.now();S.sync.msg=`${from?`‘${from}’에서 시작했습니다. `:""}받은 변경 ${done}건 · ${upload?"드라이브에 저장했습니다":"드라이브는 그대로입니다"} (${secTxt(t0)}).`;
       if(skip)S.sync.again=true;
       if(done)S.simCache.key=null;
       break;}
@@ -2480,23 +2525,26 @@ async function importText(txt,fname){let doc;const file={name:fname||"backup.jso
       if(!go.classList.contains("armed")){go.classList.add("armed");go.textContent="한 번 더 누르면 바꿉니다";setTimeout(()=>{if(!go.disabled){go.classList.remove("armed");go.textContent="바꾸기";}},4000);return;}
       go.disabled=true;go.textContent="바꾸는 중…";const r=await applyImport(d,(i,t)=>{go.textContent=`바꾸는 중… ${i}/${t}`;});
       if(r.fail){const e=bg.querySelector("#impErr");e.textContent=`${r.fail}개를 저장하지 못했습니다. 다시 가져오거나 먼저 내보낸 파일로 되돌리세요.`;e.hidden=false;go.disabled=false;go.textContent="다시 바꾸기";return;}
-      closeSheet();toast(`가져왔습니다 (${nf.format(r.done)}건)`);});
+      closeSheet();toast(r.done?`가져왔습니다 (바뀐 문서 ${nf.format(r.done)}건)`:"가져왔습니다 (지금과 같은 내용이라 바뀐 것이 없습니다)");});
   });}
 // 컬렉션마다 파일의 문서를 쓰고, 파일에 없는 지금 문서는 지운다. 설정·계획은 파일에 있을 때만 바꾼다
 async function applyImport(d,progress){if(!S.db)return{done:0,fail:1};
   const cur={accounts:S.accounts,holdings:S.holdingsRaw,prices:S.prices,assets:S.assets,snapshots:Object.fromEntries((S.snapshots||[]).filter(x=>x&&x.date).map(x=>[x.date,x]))};
-  const ops=[];for(const c of DATA_COLS){const src=d[c]&&typeof d[c]==="object"?d[c]:{};for(const id in src)ops.push(["set",c+"/"+id,src[id]]);for(const id in cur[c])if(!(id in src))ops.push(["del",c+"/"+id]);}
+  const strip=o=>{const {id:_x,...r}=o||{};return r;};const same=(a,b)=>KSync.hash(strip(a))===KSync.hash(strip(b));   // 지금과 같은 문서는 다시 쓰지 않는다
+  const ops=[];for(const c of DATA_COLS){const src=d[c]&&typeof d[c]==="object"?d[c]:{};for(const id in src)if(!cur[c][id]||!same(cur[c][id],src[id]))ops.push(["set",c+"/"+id,src[id]]);for(const id in cur[c])if(!(id in src))ops.push(["del",c+"/"+id]);}
   // 구글 드라이브 연결 정보(폴더·시트)는 지금 것을 유지한다: 예전 백업에는 지워진 시트가 적혀 있을 수 있다
-  if(d.settings&&typeof d.settings==="object"){const c0=S.settings||{};const link=Object.fromEntries(GD_KEYS.filter(k=>c0[k]!=null).map(k=>[k,c0[k]]));const {targetAmount:_t,startYear:_y,...st}=d.settings;ops.push(["set","settings/main",{...st,...link}]);}if(d.plan&&typeof d.plan==="object")ops.push(["set","plan/main",d.plan]);
-  let done=0,fail=0;for(const [op,path,v] of ops){try{if(op==="set")await S.db.doc(path).set(v);else await S.db.doc(path).delete();done++;}catch(e){fail++;}progress&&progress(done+fail,ops.length);}
-  S.simCache.key=null;return{done,fail};}
+  if(d.settings&&typeof d.settings==="object"){const c0=S.settings||{};const link=Object.fromEntries(GD_KEYS.filter(k=>c0[k]!=null).map(k=>[k,c0[k]]));const {targetAmount:_t,startYear:_y,...st}=d.settings;const ns={...st,...link};if(!same(ns,S.settings))ops.push(["set","settings/main",ns]);}if(d.plan&&typeof d.plan==="object"&&!(S.planExists&&same(d.plan,S.plan)))ops.push(["set","plan/main",d.plan]);
+  let n=0;const fail=await pool(ops,8,async([op,path,v])=>{try{if(op==="set")await S.db.doc(path).set(v);else await S.db.doc(path).delete();}finally{n++;progress&&progress(n,ops.length);}});
+  S.simCache.key=null;return{done:ops.length-fail,fail};}
 function fixSection(){const s=S.settings||{};const on=!!s.fixRet;
   return `<section class="card"><div class="row"><h2>검증용 고정 수익률</h2>${on?`<span class="chip warn">켜짐</span>`:""}</div>
    <label class="check"><input type="checkbox" id="sFix"${on?" checked":""}> 은퇴 계획에서 모든 계좌 수익률을 한 값으로 고정</label>
    <div class="grid2"><div class="field"><label for="sFixR">연 수익률 (%)</label><input id="sFixR" inputmode="decimal" value="${esc(s.fixRetR??5)}"></div>
    <div class="field"><label for="sFixD">그중 배당·분배 (%)</label><input id="sFixD" inputmode="decimal" value="${esc(s.fixRetDy??0)}"></div></div>
    <span class="hint">계산값을 손으로 맞춰 보기 위한 설정입니다. 켜면 계획 계산에서 모든 계좌(생활비 통장 포함)가 이 수익률로 굴러가고, 종목별 예상 수익률·계좌 계획에서 직접 넣은 수익률·보수/낙관 보정은 쓰지 않습니다. 배당·분배는 일반계좌에서 해마다 15.4% 원천징수되는 부분이고, 생활비 통장 이자는 전부 이자소득으로 봅니다. 계좌 화면의 예상 수익률은 그대로 보여줍니다.</span></section>`;}
-function render(){
+let renderDepth=0;
+function render(){const top=!renderDepth++;if(top)S.memo={};try{render0();}finally{if(!--renderDepth)S.memo=null;}}
+function render0(){
   document.querySelectorAll("nav.tabs button").forEach(b=>b.setAttribute("aria-current",b.dataset.tab===S.tab?"page":"false"));
   const f=freshness();document.getElementById("hdrSub").textContent=S.dbState==="ok"?(f?`가격 ${f}`:""):"";
   if(S.dbState==="loading"){app.innerHTML=`<div class="card empty">장부를 불러오는 중…</div>`;syncChip();return;}
@@ -2504,7 +2552,9 @@ function render(){
   const v={home:vHome,accounts:vAccounts,plan:vPlan,alloc:vAlloc,prices:vPrices,settings:vSettings}[S.tab]||vHome;
   // 다시 그려도 가로로 스크롤한 표(data-keep)는 그 자리를 유지한다
   const keep={};app.querySelectorAll("[data-keep]").forEach(e=>{keep[e.dataset.keep]=e.scrollLeft;});
+  app.classList.toggle("narrow",["home","accounts","prices","settings"].includes(S.tab));   // 넓은 화면에서 목록 위주 탭은 가운데로 좁게
   app.innerHTML=(S.tab==="home"?pwaStart():"")+v();
+  postRender();
   app.querySelectorAll("[data-keep]").forEach(e=>{const x=keep[e.dataset.keep];if(x)e.scrollLeft=x;});
   if(S.tab==="plan"&&S.planView==="result")drawChart();
   syncChip();navSync();
@@ -2530,7 +2580,21 @@ const root=document.getElementById("sheetRoot");
 function openSheet(html,onMount){const had=!!root.firstChild;root.innerHTML=`<div class="sheet-bg"><div class="sheet" role="dialog" aria-modal="true">${html}</div></div>`;
   if(NAV&&!had&&!navBack&&!(history.state&&history.state.sheet))history.pushState({...(history.state||{kf:1,...navKey(),d:0}),sheet:true},"");   // 뒤로 가기로 시트를 닫게
   const bg=root.firstChild;bg.addEventListener("click",e=>{if(e.target===bg)closeSheet();});
-  const first=bg.querySelector("input,select");if(first)setTimeout(()=>first.focus(),50);onMount&&onMount(bg);}
+  const first=bg.querySelector("input,select");if(first)setTimeout(()=>first.focus(),50);onMount&&onMount(bg);
+  // 저장 버튼: 누른 뒤 끝날 때까지 다시 눌리지 않게 하고, 늦어지면 ‘저장 중…’으로
+  bg.querySelectorAll("button.btn.primary").forEach(b=>{const f=b.onclick;if(!f)return;b.onclick=async function(e){if(b.getAttribute("aria-busy")==="true")return;
+    b.setAttribute("aria-busy","true");const t0=b.textContent,busy=/저장/.test(t0)?"저장 중…":"처리 중…";const tm=setTimeout(()=>{if(b.isConnected&&b.getAttribute("aria-busy")==="true")b.textContent=busy;},250);
+    try{return await f.call(this,e);}finally{clearTimeout(tm);if(b.isConnected){b.removeAttribute("aria-busy");if(b.textContent===busy)b.textContent=t0;}}};});}
+// 그린 뒤 손질: 오른쪽으로 넘치는 표 표시, 긴 설명은 두 줄로 접기(누르면 펼침)
+S.hintOpen=new Set();
+function markMore(w){w.classList.toggle("more",w.scrollWidth-w.clientWidth-w.scrollLeft>4);}
+function postRender(){
+  app.querySelectorAll(".hint").forEach(h=>{const t=h.textContent.trim();if(t.length<110||h.querySelector("a,button,input,select"))return;
+    const key=t.slice(0,60);if(S.hintOpen.has(key))return;h.classList.add("clamp");h.dataset.hk=key;if(!h.closest(".card,.hero,.sheet"))h.classList.add("on-bg");});
+  requestAnimationFrame(()=>app.querySelectorAll(".tbl-wrap").forEach(markMore));}
+app.addEventListener("scroll",e=>{const w=e.target;if(w&&w.classList&&w.classList.contains("tbl-wrap"))markMore(w);},true);
+window.addEventListener("resize",()=>app.querySelectorAll(".tbl-wrap").forEach(markMore));
+app.addEventListener("click",e=>{const h=e.target.closest(".hint.clamp");if(!h)return;h.classList.remove("clamp","on-bg");S.hintOpen.add(h.dataset.hk);});
 function closeSheet(){root.innerHTML="";if(NAV&&history.state&&history.state.sheet&&!navBack){navBack=true;history.back();}}
 /* ---------- 뒤로 가기 (PC·안드로이드 앱): 화면 이동과 시트를 브라우저 기록에 남겨, 뒤로 가기가 앱을 닫지 않고 앞 화면으로 가게 한다 ---------- */
 const NAV=PWA&&!!(window.history&&history.pushState);
@@ -2690,6 +2754,8 @@ app.addEventListener("click",async e=>{const t=e.target.closest("button");if(!t)
   if(t.dataset.mv){const d=num(t.dataset.dir);if(t.dataset.mv==="acct")moveAcct(t.dataset.id,d);else if(t.dataset.mv==="asset")moveAsset(t.dataset.id,d);else moveHold(t.dataset.id,d);return;}
   if(t.dataset.rscen){await saveRet({retScenario:t.dataset.rscen},`수익률을 ‘${RET_SCEN[t.dataset.rscen][0]}’으로 계산합니다`);return;}
   if(t.dataset.gd){gdRun(t.dataset.gd);return;}
+  if(t.dataset.warnall){S.warnAll=t.dataset.warnall==="1";render();return;}
+  if(t.dataset.flowall){S.flowAll=t.dataset.flowall==="1";try{localStorage.setItem("rf.flowall",S.flowAll?"1":"0");}catch(e){}render();return;}
   if(t.dataset.sync){const k=t.dataset.sync;
     if(k==="start"||k==="now")syncRun(false);
     else if(k==="off")syncOff();
@@ -2726,6 +2792,7 @@ const PLAN_VIEWS = [["result", "결과"], ["family", "가족"], ["income", "수�
 const WD_MODES = [["fixed", "연 금액"], ["even", "잔액 균등"], ["limit", "연금수령한도"], ["pct", "잔액의 %"], ["all", "전액"]];
 const TAXKIND = [["domestic", "국내 주식·국내주식형 ETF (매매차익 비과세)"], ["dividend", "국내 상장 해외·채권형 ETF (차익도 배당소득 15.4%)"], ["foreign", "해외 상장 주식·ETF (양도세 22%, 250만원 공제)"]];
 const PENSION_T = new Set(["연금저축", "IRP"]);
+S.warnAll = false; S.flowAll = false; try { S.flowAll = localStorage.getItem("rf.flowall") === "1"; } catch (e) {}
 S.planView = "result"; S.real = true; S.resGroup = "main"; S.planMember = null; S.simCache = { key: null, val: null };
 S.planSel = null; try { const ps = localStorage.getItem("rf.psel"); if (ps) S.planSel = ps; } catch (e) {}
 try { const v = localStorage.getItem("rf.pv"); if (v) S.planView = v; const r = localStorage.getItem("rf.real"); if (r) S.real = r === "1"; } catch (e) {}
@@ -2733,7 +2800,7 @@ try { const v = localStorage.getItem("rf.pv"); if (v) S.planView = v; const r = 
 function has(v) { return v !== null && v !== undefined && v !== "" && isFinite(Number(v)); }
 function blankPlan() { return { members: [], incomes: [], expenses: [], events: [], transfers: [], properties: [], loans: [], futureAccounts: [], accountPlans: {}, surplusOrder: [], drawOrder: [], assumptions: {} }; }
 function PL() { if (!S.plan) S.plan = blankPlan(); const b = blankPlan(); for (const k in b) if (S.plan[k] == null) S.plan[k] = b[k]; return S.plan; }
-function AS() { return RE.deepMerge(RE.DEFAULT_ASSUMPTIONS, PL().assumptions || {}); }
+function AS() { return memo("AS", () => RE.deepMerge(RE.DEFAULT_ASSUMPTIONS, PL().assumptions || {})); }
 function mem(id) { return PL().members.find(m => m.id === id); }
 function memName(id) { if (id === "household") return "가구 공통"; const m = mem(id); return m ? m.name : "–"; }
 function primaryM() { const ms = PL().members; return ms.find(m => m.relation === "본인") || ms[0]; }
@@ -2777,6 +2844,9 @@ function planAcctExp(a, src) { src = src || retSrc(); const ap = (PL().accountPl
 function planMemberExp(mid, src) { let v = 0, rv = 0; for (const a of memberAccts(mid)) { const t = acctStats(a).total; if (!(t > 0)) continue; v += t; rv += t * planAcctExp(a, src).r; } return v > 0 ? { r: rv / v } : null; }
 function engineAccounts(src) {
   src = src || retSrc(); if (fixRet()) src = "current";   // 고정 수익률(검증용)이 켜져 있으면 계좌 수익률은 쓰지 않는다
+  return memo("ea:" + src, () => engineAccounts0(src)).map(a => ({ ...a }));
+}
+function engineAccounts0(src) {
   const as = AS(); const out = [];
   // r: 보유(또는 배분 후) 비중 가중평균 + 수익률 보정(설정). rAdj: 계좌 계획에서 수익률을 직접 넣은 경우 그 값에 더할 보정 (엔진이 더한다)
   for (const a of acctList()) {
@@ -2803,7 +2873,8 @@ function partialNote(sim) { const fr = sim.firstYearFraction; if (fr == null || 
 function minCash() { const v = parseFloat((S.settings || {}).minCash); return v > 0 ? v : 0; }
 function fixRet() { const s = S.settings || {}; if (!s.fixRet) return null; const r = parseFloat(s.fixRetR); if (!isFinite(r)) return null; const d = parseFloat(s.fixRetDy); return { r, dy: isFinite(d) ? d : 0 }; }
 function planRetLabel() { const fx = fixRet(); return fx ? `고정 ${expTxt(fx.r)} (검증용)` : scenLabel() + (retSrc() !== "current" ? ` · ${retSrc() === "allocAll" ? "가족 전체 배분 후" : "배분 후"}` : ""); }
-function simWith(src, cache) {
+function simWith(src, cache) { return memo("sim:" + src + ":" + cache, () => simWith0(src, cache)); }
+function simWith0(src, cache) {
   const uc = unitCfg(); const fx = fixRet();
   const input = { plan: PL(), accounts: engineAccounts(src), firstYearFraction: yearFrac(), amtFmt: { unit: uc.u, dec: uc.d }, fixedReturn: fx ? { r: fx.r / 100, dy: fx.dy / 100 } : null, minCash: minCash() };
   const key = JSON.stringify(input);
@@ -2943,7 +3014,10 @@ function vResult() {
   h += `<section class="card"><div class="row"><h2>연도별 자산</h2><span class="meta">${S.real ? "현재가치" : "명목"} · ${unitName()}</span></div>
     <div class="chart-wrap" id="chartWrap"><div class="chart-tip" id="chartTip" hidden></div></div>
     <div class="legend">${CAT_KEYS.map(([k, l, c]) => `<span><i style="background:var(${c})"></i>${l}</span>`).join("")}${sim.rows.some(r => r.debt > 5000) ? `<span><i style="background:var(--danger)"></i>생활비 통장 마이너스</span>` : ""}</div></section>`;
-  if (sim.warnings.length) h += `<section class="card"><h2>확인할 점 ${sim.warnings.length}</h2><div class="list">${sim.warnings.map(w => `<div class="item"><div class="row" style="align-items:flex-start"><span>${esc(w.msg)}</span><span class="chip ${w.type === "deficit" ? "bad" : "warn"}" style="flex-shrink:0">${w.from === w.to ? w.from : `${w.from}–${w.to}`}</span></div></div>`).join("")}</div></section>`;
+  // 확인할 점: 생활비 통장 마이너스를 먼저, 많으면 4개만 보이고 ‘모두 보기’
+  const wsAll = sim.warnings.slice().sort((a, b) => (b.type === "deficit") - (a.type === "deficit")); const WN = 4;
+  const ws = S.warnAll || wsAll.length <= WN + 1 ? wsAll : wsAll.slice(0, WN);
+  if (sim.warnings.length) h += `<section class="card"><div class="row"><h2>확인할 점 ${sim.warnings.length}</h2>${wsAll.length > WN + 1 ? `<button type="button" class="btn small" data-warnall="${S.warnAll ? 0 : 1}">${S.warnAll ? "접기" : `모두 보기 (${wsAll.length}개)`}</button>` : ""}</div><div class="list">${ws.map(w => `<div class="item"><div class="row" style="align-items:flex-start"><span>${esc(w.msg)}</span><span class="chip ${w.type === "deficit" ? "bad" : "warn"}" style="flex-shrink:0">${w.from === w.to ? w.from : `${w.from}–${w.to}`}</span></div></div>`).join("")}</div></section>`;
   const mNames = ageMembers(sim).map(m => m.name).join("·");
   h += `<section class="card"><div class="row"><h2>연도별 현금흐름</h2><span class="meta">${S.real ? "현재가치" : "명목"} · 행을 누르면 상세</span></div>
   ${flowTable(sim.rows, HH_COLS.concat([rateCol(sim)]), d, r => ageStr(r, sim), { ageLabel: mNames, partialYear: sim.firstYearFraction < 0.999 ? sim.rows[0].year : null, rowClass: r => `${r.overdraft > 5000 ? "bad" : ""}${r.events.length ? " ev" : ""}` })}
@@ -2959,8 +3033,8 @@ function memberTaxSection(sim, d) {
   sim.rows.forEach(r => { const k = d(r); ms.forEach(m => { const t = (r.taxByPerson || {})[m.id]; if (!t) return; life[m.id].total += t.total * k; life[m.id].credit += t.credit * k; const ch = (r.taxB.choice || {})[m.id]; if (ch === "sep" || ch === "comp") life[m.id].over++; if (ch === "comp-low") life[m.id].low = (life[m.id].low || 0) + 1; }); });
   let h = `<section class="card"><div class="row"><h2>구성원별 세금</h2><span class="meta">계획 기간 합계 · ${S.real ? "현재가치" : "명목"}</span></div><div class="list">${ms.map(m => `<div class="item"><div class="row"><div class="l"><span class="name">${esc(m.name)}</span><span class="meta">${life[m.id].credit > 1 ? `세액공제 ${eok(life[m.id].credit)} 차감 후` : "세액공제 없음"}${life[m.id].over ? ` · 사적연금 1,500만원 초과 ${life[m.id].over}년` : ""}${life[m.id].low ? ` · 1,500만원 이하지만 종합과세 신고가 유리 ${life[m.id].low}년` : ""}</span></div><b>${eok(life[m.id].total)}</b></div></div>`).join("")}</div>
   <div class="tbl-wrap"><table class="tbl"><thead><tr><th>연도</th>${ms.map(m => `<th>${esc(m.name)}</th>`).join("")}<th>합계</th></tr></thead><tbody>
-  ${sim.rows.map(r => { const k = d(r); let sum = 0; const cells = ms.map(m => { const t = (r.taxByPerson || {})[m.id]; const v = t ? t.total * k : 0; sum += v; return `<td>${sh(v)}</td>`; }).join(""); return `<tr data-year="${r.year}"><td>${r.year}</td>${cells}<td><b>${sh(sum)}</b></td></tr>`; }).join("")}
-  </tbody></table></div><p class="hint" style="margin:0">세금은 계좌 명의자와 수입을 받는 사람 기준으로 계산합니다. 세액공제는 근로소득이 있는 명의자만 받습니다. 건강보험료는 세대 단위로 매겨져 가계 전체로 계산합니다.</p></section>`;
+  ${flowRows(sim.rows, {}).map(r => { const k = d(r); let sum = 0; const cells = ms.map(m => { const t = (r.taxByPerson || {})[m.id]; const v = t ? t.total * k : 0; sum += v; return `<td>${sh(v)}</td>`; }).join(""); return `<tr data-year="${r.year}"><td>${r.year}</td>${cells}<td><b>${sh(sum)}</b></td></tr>`; }).join("")}
+  </tbody></table></div>${flowToggle(sim.rows.length)}<p class="hint" style="margin:0">세금은 계좌 명의자와 수입을 받는 사람 기준으로 계산합니다. 세액공제는 근로소득이 있는 명의자만 받습니다. 건강보험료는 세대 단위로 매겨져 가계 전체로 계산합니다.</p></section>`;
   return h;
 }
 function vMemberResult(sim, id) {
@@ -3015,10 +3089,21 @@ function wdStats(sim, r, mid) {
     : Object.values(r.acctFlow || {}).filter(x => !mid || x.owner === mid).reduce((s2, x) => s2 + (x.start || 0), 0);
   return { draw, base, rate: base > 0 ? draw / base : null };
 }
+// 연도별 표: 기본은 주요 연도(처음 3년, 5년마다, 사건·마이너스가 있는 해, 마지막 해)만. ‘매년 보기’로 전부
+function flowRows(rows, opts) {
+  if (S.flowAll || rows.length <= 15) return rows;
+  const last = rows.length - 1;
+  const fl = rows.map(r => !!(opts.rowClass && String(opts.rowClass(r)).trim()));   // 표시된 해(마이너스 등)는 이어지는 구간의 처음과 끝만
+  return rows.filter((r, i) => i < 3 || i === last || r.year % 5 === 0 || (r.events && r.events.length) || (fl[i] && (!fl[i - 1] || !fl[i + 1])));
+}
+function flowToggle(n) {
+  return n > 15 ? `<div class="btns" style="margin-top:-4px"><button type="button" class="btn small" data-flowall="${S.flowAll ? 0 : 1}">${S.flowAll ? "주요 연도만 보기" : `매년 보기 (${n}년)`}</button>${S.flowAll ? "" : `<span class="meta" style="align-self:center">처음 3년 · 5년마다 · 사건·마이너스가 있는 해 · 마지막 해</span>`}</div>` : "";
+}
 function flowTable(rows, cols, d, ageFn, opts = {}) {
+  const allRows = rows; rows = flowRows(rows, opts);
   const GL = { in: ["현금 증가", "g-in"], out: ["현금 감소", "g-out"], end: ["연말 자산", "g-end"], rt: ["비율", "g-rt"] };
   // pct 열은 금액이 아니라 비율(현재가치·명목과 무관): 값이 있는 해가 하나라도 있으면 보여 준다
-  const vis = cols.filter(c => c.always || rows.some(r => c.pct ? (c.get(r) || 0) > 0.00005 : Math.abs(c.get(r) * d(r)) >= 5000));
+  const vis = cols.filter(c => c.always || allRows.some(r => c.pct ? (c.get(r) || 0) > 0.00005 : Math.abs(c.get(r) * d(r)) >= 5000));
   const groups = ["in", "out", "end", "rt"].map(g => [g, vis.filter(c => c.g === g)]).filter(([, cs]) => cs.length);
   const pctTxt = v => v == null ? "–" : v > 0.00005 ? `${(Math.round(v * 1000) / 10).toLocaleString("ko-KR")}%` : "–";
   const head1 = `<tr><th rowspan="2">연도</th><th rowspan="2">나이${opts.ageLabel ? `<br><small>${esc(opts.ageLabel)}</small>` : ""}</th>${groups.map(([g, cs]) => `<th colspan="${cs.length}" class="gh ${GL[g][1]}">${GL[g][0]}</th>`).join("")}</tr>`;
@@ -3026,7 +3111,7 @@ function flowTable(rows, cols, d, ageFn, opts = {}) {
   const fy = opts.partialYear;
   const body = rows.map(r => { const k = d(r); return `<tr data-year="${r.year}"${opts.mid ? ` data-mid="${esc(opts.mid)}"` : ""} class="${opts.rowClass ? opts.rowClass(r) : ""}"><td>${r.year}${r.year === fy ? "*" : ""}</td><td>${ageFn(r)}</td>${groups.map(([, cs]) => cs.map((c, i) => { const cls = [i === 0 ? "gs" : "", c.warnAt && (c.get(r) || 0) > c.warnAt ? "hi" : ""].filter(Boolean).join(" "); const cl = cls ? ` class="${cls}"` : "";
     if (c.pct) return `<td${cl}>${pctTxt(c.get(r))}</td>`; const v = c.get(r) * k; return `<td${cl}>${c.bold ? `<b>${sh(v)}</b>` : sh(v)}</td>`; }).join("")).join("")}</tr>`; }).join("");
-  return `<div class="tbl-wrap"><table class="tbl ft"><thead>${head1}${head2}</thead><tbody>${body}</tbody></table></div>`;
+  return `<div class="tbl-wrap"><table class="tbl ft"><thead>${head1}${head2}</thead><tbody>${body}</tbody></table></div>${flowToggle(allRows.length)}`;
 }
 const CAT_KEYS = [["pension", "연금계좌", "--c1"], ["isa", "ISA", "--c2"], ["general", "일반·생활비", "--c3"], ["house", "주택 순가치", "--c4"]];
 
@@ -3647,7 +3732,8 @@ function alAcctPlanExp(c, aid) {
   const tk = Object.entries(kv).sort((x, y) => y[1] - x[1])[0];
   return { auto: rv / tv, adj: av / tv, dyAuto: dv / tv, taxKind: tk ? tk[0] : null, value: tv, parts: parts.map(q => ({ ...q, w: q.v / tv })).sort((x, y) => y.w - x.w) };
 }
-function alCompute(scope) {
+function alCompute(scope) { return memo("alc:" + scope, () => alCompute1(scope)); }
+function alCompute1(scope) {
   const cfg = alCfg(scope); const year = has(cfg.year) ? num(cfg.year) : yr() + 10;
   const dep = alDepMode(cfg) !== "none" ? alDeposits(scope, year) : null;
   const key = JSON.stringify([scope, cfg, alLocks(), dep, S.accounts, S.holdings, S.prices, S.assets, retScen(), AS(), yr(), PL().members, PL().accountPlans]);
@@ -3924,7 +4010,7 @@ app.addEventListener("change", e => {
 
 RE.DEFAULT_ASSUMPTIONS.baseYear=new Date().getFullYear();
 // 자동 테스트에서만 내부 계산 함수를 꺼내 쓴다 (평소에는 아무 일도 하지 않음)
-if(window.__KINFOLIO_TEST__)window.__kinfolio={S,fmtA,exportDoc,syncRun,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
+if(window.__KINFOLIO_TEST__)window.__kinfolio={S,fmtA,exportDoc,syncRun,gdRun,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
 document.getElementById("syncChip").addEventListener("click",()=>{
   if(PWA&&!KinfolioPWA.clientId()){setTab("settings");return;}
   if(PWA&&!KinfolioPWA.hasToken()){pwaConnect();return;}

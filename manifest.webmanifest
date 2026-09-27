@@ -1,0 +1,17 @@
+{
+  "id": "./",
+  "name": "Kinfolio",
+  "short_name": "Kinfolio",
+  "description": "가족 은퇴자금 장부와 계획",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#EEF2F1",
+  "theme_color": "#0E6655",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

@@ -2365,7 +2365,7 @@ function vPrices(){
     <div class="r"><b>${p?money(p.price,p.currency||r.currency):"–"}</b><span class="meta">${chg!==null?`<span class="${cls(chg)}">${pct(chg,2)}</span> `:""}${badge}</span></div></div></button>`;}).join("")}</div></section>
     <section class="card"><h2>가격 업데이트</h2>
     ${S.gdAvail?`<p style="margin:0">구글 시트(GOOGLEFINANCE)에서 관심 종목 전체의 현재가와 USD/KRW 환율을 가져옵니다. 최대 20분 늦을 수 있고, 장이 닫힌 날은 마지막 거래 가격입니다.</p>
-    <div class="btns"><button class="btn primary" data-gd="prices"${S.gdBusy?" disabled":""}>${S.gdBusy==="prices"?"가져오는 중…":"구글 시트에서 가격 가져오기"}</button></div>${gdMsgHtml("prices")}`:""}
+    <div class="btns"><button class="btn primary" data-gd="prices"${S.gdBusy?" disabled":""}>${S.gdBusy==="prices"?"가져오는 중…":"구글 시트에서 가격 가져오기"}</button></div>${gdMsgHtml("prices")}${pxAutoBox()}`:""}
     ${PWA?`<p class="hint" style="margin:0">구글 시트를 쓸 수 없을 때는 종목을 눌러 직접 입력합니다.</p></section>`:`<p class="hint" style="margin:0">${S.gdAvail?"구글 드라이브를 쓸 수 없을 때는 ":"이 앱은 보안상 외부 시세 사이트에 직접 접속할 수 없습니다. "}Claude와의 대화에서 “Kinfolio 가격 업데이트해줘”라고 하거나, 종목을 눌러 직접 입력합니다.${S.gdAvail===false?" claude.ai에 Google Drive를 연결하면 구글 시트로 가격을 가져올 수 있습니다.":""}</p>
     <div class="btns"><button class="btn" id="copyReq">요청 문구 복사</button></div></section>`}`;
   return h;}
@@ -2526,21 +2526,45 @@ async function gdBackupsIn(fid){if(!fid)return [];
   const r=await gdCall("search_files",{query:`parentId = '${fid}' and mimeType = 'application/json' and title contains 'Kinfolio 백업'`,excludeContentSnippets:true,pageSize:30});
   return ((r&&r.files)||[]).sort((a,b)=>String(b.createdTime).localeCompare(String(a.createdTime)));}
 function gdPriceMsg(r){return `가격 ${r.n}개${r.changed!=null&&r.changed<r.n?`(바뀐 것 ${r.changed}개)`:""}${r.fx?` · 환율 ${nf2.format(r.fx)}`:""}를 가져왔습니다.${r.miss.length?` 가격이 나오지 않은 종목: ${r.miss.join(", ")} (시트에서 종목 코드를 확인하세요).`:""}${(r.curBad||[]).length?` 통화가 달라 저장하지 않은 종목: ${r.curBad.join(", ")} (다른 거래소 가격일 수 있습니다. 종목 코드를 확인하세요).`:""}${r.fxBad?` 시트의 환율 ${nf2.format(r.fxBad)}이 ${r.fxOld?`지금 값 ${nf2.format(r.fxOld)}과 너무 달라`:"있을 수 없는 값이라"} 저장하지 않았습니다. 설정에서 직접 넣으세요.`:""}${(r.big||[]).length?` 전보다 30% 넘게 바뀐 종목: ${r.big.join(", ")} (분할·병합이 아니면 확인하세요).`:""}${(r.noDate||[]).length?` 기준 시각이 없어 오늘 날짜로 적은 종목: ${r.noDate.join(", ")}.`:""}${r.notIn.length?` 시트에 없는 종목: ${r.notIn.join(", ")} → ‘시트 다시 만들기’를 누르세요.`:""}`;}
-async function gdRun(kind){if(S.gdBusy)return;S.gdBusy=kind;gdSet(kind,null);const t0=performance.now();
+async function gdRun(kind,o){o=o||{};if(S.gdBusy)return false;S.gdBusy=kind;if(!o.auto)gdSet(kind,null);else render();const t0=performance.now();
+  if(o.auto&&PWA)KinfolioPWA.quiet=true;   // 자동 업데이트는 로그인 창을 띄우지 않는다
   try{
-    if(kind==="prices"){const r=await gdPrices();if(r){gdSet(kind,gdPriceMsg(r)+` (${secTxt(t0)})`,false);autoSnap(300);}}
-    else if(kind==="sheet"){if(await gdMakeSheet()){const n=((S.settings||{}).gSheetTickers||[]).length;const r=await gdPrices();
+    if(kind==="prices"){let r=await gdPrices();
+      // 자동: 관심 종목이 바뀌어 시트에 없는 종목이 있으면 시트를 새로 만들어 한 번 더 (다음부터는 그대로)
+      if(r&&o.auto&&r.notIn.length&&await gdMakeSheet())r=await gdPrices();
+      if(r){pxMark();gdSet(kind,(o.auto?`자동으로 가져옴 ${hhmm(Date.now())} · `:"")+gdPriceMsg(r)+` (${secTxt(t0)})`,false);autoSnap(300);}}
+    else if(kind==="sheet"){if(await gdMakeSheet()){const n=((S.settings||{}).gSheetTickers||[]).length;const r=await gdPrices();if(r)pxMark();
       gdSet(kind,`구글 드라이브 ‘Kinfolio’ 폴더에 시세 시트를 새로 만들었습니다 (종목 ${n}개). ${r?gdPriceMsg(r):""} (${secTxt(t0)})`);if(r)autoSnap(300);}}
     else if(kind==="backup"){const f=await gdBackup();gdSet(kind,`‘${f.title}’으로 백업했습니다 (${secTxt(t0)}).`);}
     else if(kind==="restore"){const list=await gdBackups();if(!list.length){gdSet(kind,"드라이브의 Kinfolio 폴더에 백업이 없습니다.",true);}else{S.gdBusy=null;render();gdPickSheet(list);return;}}
-  }catch(e){gdSet(kind,gdErrText(e),true);}
-  finally{S.gdBusy=null;render();}}
+  }catch(e){gdSet(kind,(o.auto?"가격 자동 업데이트 실패: ":"")+gdErrText(e),true);if(o.auto)S.pxFail=Date.now();return false;}
+  finally{S.gdBusy=null;if(o.auto&&PWA)KinfolioPWA.quiet=false;render();}
+  return true;}
+/* 가격 자동 업데이트: 시세 시트가 있으면 앱을 열 때, 다시 볼 때, 켜 둔 동안 30분마다 가져온다.
+   마지막으로 가져온 지(이 기기, 또는 다른 기기가 가져와 동기화된 가격) 30분이 안 됐으면 건너뛴다. 실패하면 10분 뒤에 다시 */
+const PX_EVERY=30*60e3,PX_RETRY=10*60e3;
+function pxAuto(){return (S.settings||{}).pxAuto!==false;}
+function pxMark(){S.pxAt=Date.now();try{localStorage.setItem("kf.pxAt",String(S.pxAt));}catch(e){}}
+function pxLast(){let v=S.pxAt||0;try{v=Math.max(v,+localStorage.getItem("kf.pxAt")||0);}catch(e){}
+  for(const p of Object.values(S.prices||{}))if(p&&/GOOGLEFINANCE/.test(p.source||"")){const t=Date.parse(p.updatedAt||"");if(t>v&&t<=Date.now()+60e3)v=t;}
+  return v;}
+function pxDue(){return Date.now()-pxLast()>=PX_EVERY&&Date.now()-(S.pxFail||0)>=PX_RETRY;}
+let pxT=null;
+async function pxAutoRun(){clearTimeout(pxT);pxT=null;
+  const s=S.settings||{};
+  if(!pxAuto()||!s.gSheetId||!S.gdAvail||S.dbState!=="ok"||document.visibilityState==="hidden"||!pxDue())return false;
+  if(PWA&&!KinfolioPWA.hasToken())return false;
+  if(S.gdBusy||S.sync.busy){pxT=setTimeout(pxAutoRun,5000);return false;}   // 동기화·다른 드라이브 작업이 끝난 뒤에
+  return gdRun("prices",{auto:true});}
 function gdPickSheet(list){openSheet(`<h3>드라이브에서 불러오기</h3><span class="meta">구글 드라이브 ‘Kinfolio’ 폴더의 백업 ${list.length}개 (최근 순)</span>
   <div class="list">${list.map(f=>`<button class="item" data-gdfile="${esc(f.id)}"><div class="row"><div class="l"><span class="name">${esc(f.title)}</span><span class="meta">${f.createdTime&&isFinite(Date.parse(f.createdTime))?esc(new Date(Date.parse(f.createdTime)+9*3600e3).toISOString().slice(0,16).replace("T"," ")):""}${f.fileSize?` · ${nf.format(Math.round(num(f.fileSize)/1024))}KB`:""}</span></div><span class="meta gdarr">›</span></div></button>`).join("")}</div>
   <div class="btns"><span class="grow"></span><button class="btn" id="pCancel">닫기</button></div>`,bg=>{bg.querySelector("#pCancel").onclick=closeSheet;
     bg.querySelectorAll("[data-gdfile]").forEach(b=>b.onclick=async()=>{const f=list.find(x=>x.id===b.dataset.gdfile);b.disabled=true;b.querySelector(".gdarr").textContent="불러오는 중…";
       try{const r=await gdCall("download_file_content",{fileId:f.id});closeSheetOf(bg);await importText(b64utf8(r&&r.content),f.title);}
       catch(e){b.disabled=false;b.querySelector(".gdarr").textContent="›";toast(gdErrText(e));}});});}
+function pxAutoBox(){const s=S.settings||{};const on=pxAuto();const t=pxLast();
+  return `<label class="check"><input type="checkbox" id="pxAutoChk"${on?" checked":""}> 가격 자동으로 가져오기</label>
+   <span class="hint">${on?(s.gSheetId?`앱을 열 때, 다시 볼 때, 켜 둔 동안 30분마다 가져옵니다.${t?` 마지막으로 가져온 때 ${esc(whenTxt(t))}.`:""}`:"시세 시트가 아직 없습니다. ‘가격 가져오기’를 한 번 누르면 시트를 만들고, 그 뒤로 자동으로 가져옵니다."):"끄면 ‘가격 가져오기’를 누를 때만 가져옵니다."}</span>`;}
 function gdSection(){const s=S.settings||{};
   if(S.gdAvail===false)return `<section class="card"><h2>구글 드라이브</h2><p class="meta" style="margin:0">이 화면에서는 Google Drive를 쓸 수 없습니다. claude.ai에 Google Drive 커넥터를 연결하고 이 페이지를 다시 열면 구글 시트로 가격을 가져오고 드라이브에 백업할 수 있습니다.</p></section>`;
   if(S.gdAvail==null)return `<section class="card"><h2>구글 드라이브</h2><p class="meta" style="margin:0">연결을 확인하는 중…</p></section>`;
@@ -2551,7 +2575,7 @@ function gdSection(){const s=S.settings||{};
    ${syncSection()}
    <h4 style="margin:4px 0 0">시세 (구글 시트 GOOGLEFINANCE)</h4>
    <span class="meta">${s.gSheetId?`시트 ‘Kinfolio 시세’ · 종목 ${(s.gSheetTickers||[]).length}개 · ${esc(String(s.gSheetAt||"").slice(0,10))} 만듦${s.gSheetUrl?` · <a href="${esc(s.gSheetUrl)}" target="_blank" rel="noopener">시트 열기</a>`:""}`:"아직 시세 시트가 없습니다. ‘가격 가져오기’를 누르면 관심 종목으로 시트를 만들어 가져옵니다."}</span>
-   <div class="btns">${b("prices","가격 가져오기","primary")}${b("sheet",s.gSheetId?"시트 다시 만들기":"시세 시트 만들기")}</div>${gdMsgHtml("prices")}${gdMsgHtml("sheet")}
+   <div class="btns">${b("prices","가격 가져오기","primary")}${b("sheet",s.gSheetId?"시트 다시 만들기":"시세 시트 만들기")}</div>${gdMsgHtml("prices")}${gdMsgHtml("sheet")}${pxAutoBox()}
    <span class="hint">관심 종목마다 GOOGLEFINANCE 수식을 넣은 시트를 만들고, 계산된 현재가·전일 종가·환율을 읽어 옵니다. 최대 20분 늦을 수 있습니다. 종목을 추가하거나 뺐으면 ‘시트 다시 만들기’를 누르세요. 새 시트를 만들고 가격까지 가져오며, 예전 시트는 휴지통으로 갑니다.</span>
    <h4 style="margin:4px 0 0">백업</h4>
    <div class="btns">${b("backup","드라이브에 백업")}${b("restore","드라이브에서 불러오기")}</div>${gdMsgHtml("backup")}${gdMsgHtml("restore")}
@@ -2790,12 +2814,14 @@ function render0(){
   if(S.tab==="trend")drawTrend();
   syncChip();navSync();
   if(!S.snapBoot&&snapReady()&&S.gdAvail!==null&&(!syncOn()||!S.gdAvail||S.sync.at||S.sync.err||(PWA&&!KinfolioPWA.hasToken()))){S.snapBoot=true;autoSnap(1500);}
+  if(!S.pxBoot&&S.gdAvail&&syncLoaded()&&(!syncOn()||S.sync.at||S.sync.err||(PWA&&!KinfolioPWA.hasToken()))){S.pxBoot=true;pxT=setTimeout(pxAutoRun,800);}   // 가격 자동 업데이트 (동기화가 켜져 있으면 첫 동기화 뒤)
   if(!S.sync.boot&&syncOn()&&S.gdAvail&&syncLoaded()){S.sync.boot=true;setTimeout(()=>syncRun(true),400);}
 }
 
 function saveRet(data,msg){const q=writeSettings({...S.settings,...data},msg);S.simCache.key=null;render();return q;}
 app.addEventListener("change",async e=>{const id=e.target.id;
   if(id==="sMonthMan"){await saveRet({monthMan:e.target.checked},e.target.checked?"월 금액을 만원으로 보여 줍니다":"월 금액도 억원으로 보여 줍니다");return;}
+  if(id==="pxAutoChk"){const on=e.target.checked;await saveRet({pxAuto:on},on?"가격을 자동으로 가져옵니다":"가격 자동 업데이트를 껐습니다");if(on)pxAutoRun();return;}
   if(id==="snapAutoChk"){const on=e.target.checked;await saveRet({snapAuto:on},on?"평가액을 자동으로 기록합니다":"자동 기록을 껐습니다");if(on)autoSnap(200);return;}
   if(id==="sMinCash"){const raw=String(e.target.value).replace(/,/g,"").trim();const v=raw===""?0:parseFloat(raw);if(!(v>=0&&v<1e7)){toast("금액을 만원 단위 숫자로 넣으세요");render();return;}await saveRet({minCash:Math.round(v)*1e4},v?`생활비 통장에 최소 ${fmtA(Math.round(v)*1e4)}을 남겨 둡니다`:"생활비 통장 최소 잔액을 없앴습니다");return;}
   if(id==="sFix"){await saveRet({fixRet:e.target.checked,fixRetR:parseFloat(document.getElementById("sFixR").value)||0,fixRetDy:parseFloat(document.getElementById("sFixD").value)||0},e.target.checked?"계획을 고정 수익률로 계산합니다":"고정 수익률을 껐습니다");return;}
@@ -4468,14 +4494,15 @@ function trendClick(t) {
 app.addEventListener("click",e=>{const tr=e.target.closest("tr[data-snap]");if(tr)snapSheet(tr.dataset.snap);});
 RE.DEFAULT_ASSUMPTIONS.baseYear=new Date().getFullYear();
 // 자동 테스트에서만 내부 계산 함수를 꺼내 쓴다 (평소에는 아무 일도 하지 않음)
-if(window.__KINFOLIO_TEST__)window.__kinfolio={S,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
+if(window.__KINFOLIO_TEST__)window.__kinfolio={S,pxAutoRun,pxLast,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
 document.getElementById("hdrSub").addEventListener("click",()=>{if(S.dbState==="ok"&&freshness())setTab("prices");});
 document.getElementById("syncChip").addEventListener("click",()=>{
   if(PWA&&!KinfolioPWA.clientId()){setTab("settings");return;}
   if(PWA&&!KinfolioPWA.hasToken()){pwaConnect();return;}
   if(S.sync.err){setTab("settings");return;}
   syncRun(false);});
-document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&syncOn()&&Date.now()-(S.sync.at||0)>(PWA?30e3:60e3))syncRun(true);});
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState!=="visible")return;if(syncOn()&&Date.now()-(S.sync.at||0)>(PWA?30e3:60e3))syncRun(true);if(S.pxBoot){clearTimeout(pxT);pxT=setTimeout(pxAutoRun,2500);}});
+setInterval(()=>{if(S.pxBoot&&!pxT)pxAutoRun();},5*60e3);   // 켜 둔 동안: 5분마다 확인해 30분이 지났으면 가져온다
 if(PWA){KinfolioPWA.onChange(()=>render());setInterval(()=>{if(document.visibilityState==="visible"&&syncOn())syncRun(true);},5*60e3);}
 render();initDb();gdInit();
 })();

@@ -32,24 +32,33 @@
     return new Promise((ok, no) => {
       let r; try { r = indexedDB.open(IDB_NAME, 1); } catch (e) { no(e); return; }
       r.onupgradeneeded = () => r.result.createObjectStore(IDB_STORE);
-      r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error);
+      r.onsuccess = () => { const d = r.result; d.onversionchange = () => d.close(); ok(d); }; r.onerror = () => no(r.error);
     });
   }
   let idb = null;
-  const idbReq = (mode, fn) => new Promise((ok, no) => { const tx = idb.transaction(IDB_STORE, mode); const q = fn(tx.objectStore(IDB_STORE)); tx.oncomplete = () => ok(q && q.result); tx.onerror = () => no(tx.error); tx.onabort = () => no(tx.error); });
+  // 문서마다 따로 저장한다 (키 "d:" + 경로). 쓰기는 바로, 저장이 끝날 때까지 기다린다 (앱이 곧 닫혀도 잃지 않게)
+  const K = p => "d:" + p;
+  const tx = (mode, fn) => new Promise((ok, no) => { const t = idb.transaction(IDB_STORE, mode); const r = fn(t.objectStore(IDB_STORE)); t.oncomplete = () => ok(r && r.result); t.onerror = () => no(t.error); t.onabort = () => no(t.error || new Error("abort")); });
+  function readAll() {
+    return new Promise((ok, no) => { const t = idb.transaction(IDB_STORE, "readonly"); const st = t.objectStore(IDB_STORE); const out = {}; let legacy = null;
+      const c = st.openCursor(); c.onsuccess = () => { const cur = c.result; if (!cur) return; const k = String(cur.key); if (k.startsWith("d:")) out[k.slice(2)] = cur.value; else if (k === "docs") legacy = cur.value; cur.continue(); };
+      t.oncomplete = () => ok({ docs: out, legacy }); t.onerror = () => no(t.error); });
+  }
   let docs = {};                 // "col/id" → 문서
   const colL = {}, docL = {};    // 구독
-  let saveT = null, saving = Promise.resolve();
-  function persist(now) {
-    clearTimeout(saveT);
-    const run = () => { if (!idb) return; const snap = docs; saving = saving.then(() => idbReq("readwrite", st => st.put(snap, "docs"))).catch(e => console.warn("저장 실패", e)); };
-    if (now) run(); else saveT = setTimeout(run, 120);
+  let seq = 0, pendingW = 0;
+  function storageFail(e) { console.warn("이 기기 저장 실패", e); if (!PWA.storageError) { PWA.storageError = "write"; changed(); } }
+  // 이 기기 저장소에 쓴다. 다른 창에서 받은 변경(fromOther)은 그 창이 이미 썼으므로 쓰지 않는다
+  function persist(p, v) {
+    if (!idb) return Promise.reject(new Error("no-idb"));
+    pendingW++;
+    return tx("readwrite", st => v === undefined ? st.delete(K(p)) : st.put(v, K(p))).then(() => { pendingW--; }, e => { pendingW--; storageFail(e); throw { code: "storage_error", message: "이 기기에 저장하지 못했습니다" }; });
   }
-  window.addEventListener("pagehide", () => persist(true));
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") persist(true); });
   const colOf = p => p.slice(0, p.lastIndexOf("/"));
   function colSnap(col, q) {
     let list = Object.keys(docs).filter(p => colOf(p) === col).map(p => ({ id: p.slice(col.length + 1), d: docs[p] }));
+    const OPS = { "==": (a, b) => a === b, "!=": (a, b) => a !== b, "<": (a, b) => a < b, "<=": (a, b) => a <= b, ">": (a, b) => a > b, ">=": (a, b) => a >= b };
+    for (const [f, op, v] of (q && q.where) || []) { const t = OPS[op]; if (t) list = list.filter(x => x.d[f] !== undefined && t(x.d[f], v)); }
     if (q && q.order) { const [f, dir] = q.order; list.sort((a, b) => { const x = a.d[f], y = b.d[f]; const c = x < y ? -1 : x > y ? 1 : 0; return dir === "desc" ? -c : c; }); }
     if (q && q.limit) list = list.slice(0, q.limit);
     return { size: list.length, empty: !list.length, docs: list.map(x => ({ id: x.id, exists: true, data: () => clone(x.d) })) };
@@ -65,25 +74,53 @@
     return {
       orderBy: (f, dir) => query(col, { ...q, order: [f, dir || "asc"] }),
       limit: n => query(col, { ...q, limit: n }),
-      where() { return this; },
+      where: (f, op, v) => query(col, { ...q, where: [...((q && q.where) || []), [f, op, v]] }),
       onSnapshot(fn) { const l = { fn, q }; (colL[col] = colL[col] || []).push(l); setTimeout(() => fn(colSnap(col, q)), 0); return () => { colL[col] = (colL[col] || []).filter(x => x !== l); }; },
       get: async () => colSnap(col, q)
     };
   }
+  let bc = null; try { bc = new BroadcastChannel("kinfolio-db"); } catch (e) { bc = null; }
+  const tell = (p, v) => { if (bc) try { bc.postMessage({ p, v: v === undefined ? null : v, del: v === undefined }); } catch (e) {} };
+  function setMem(p, v) { if (v === undefined) { if (!(p in docs)) return false; const n = { ...docs }; delete n[p]; docs = n; } else docs = { ...docs, [p]: v }; notify(p); return true; }
+  function put(p, v, fromOther) {
+    const had = p in docs, prev = docs[p];
+    if (!setMem(p, v)) return Promise.resolve(); if (fromOther) return Promise.resolve();
+    seq++; if (!idb) { tell(p, v); return Promise.resolve(); }   // 저장소를 못 열었으면 메모리에만 (배너로 알림)
+    return persist(p, v).then(() => tell(p, v), e => {
+      if (docs[p] === v) setMem(p, had ? prev : undefined);   // 저장하지 못한 변경은 화면에서도 되돌린다 (그사이 더 새로 쓴 것이 없을 때)
+      throw e; });   // 다른 창에는 저장이 끝난 뒤 알린다 (그 창이 저장소를 다시 읽어도 같은 값)
+  }
+  // 다른 창·다른 실행이 이 기기 저장소를 바꿨을 수 있으면 다시 읽어 맞춘다 (BroadcastChannel이 없거나 앱이 멈춰 있던 동안)
+  async function reconcile() {
+    if (!idb || pendingW || PWA.storageError) return;
+    const s0 = seq; let got; try { got = (await readAll()).docs; } catch (e) { return; }
+    if (seq !== s0 || pendingW) return;   // 읽는 사이 이 창에서 썼으면 다음에
+    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    for (const p in got) if (!eq(got[p], docs[p])) put(p, clone(got[p]), true);
+    for (const p of Object.keys(docs)) if (!(p in got)) put(p, undefined, true);
+  }
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") dbReady.then(reconcile); });
+  if (bc) bc.onmessage = e => { const m = e.data || {}; if (typeof m.p !== "string") return; dbReady.then(() => put(m.p, m.del ? undefined : clone(m.v), true)); };
   const LocalDB = Object.freeze({
     collection: col => query(col, {}),
     doc: p => ({
       onSnapshot(fn) { (docL[p] = docL[p] || []).push(fn); setTimeout(() => fn(docSnap(p)), 0); return () => { docL[p] = (docL[p] || []).filter(x => x !== fn); }; },
       get: async () => docSnap(p),
-      set: async v => { docs = { ...docs, [p]: clone(v) }; notify(p); persist(); },
-      update: async v => { docs = { ...docs, [p]: { ...(docs[p] || {}), ...clone(v) } }; notify(p); persist(); },
-      delete: async () => { if (!(p in docs)) return; const n = { ...docs }; delete n[p]; docs = n; notify(p); persist(); }
+      set: async v => put(p, clone(v)),
+      update: async v => { if (!(p in docs)) return; return put(p, { ...docs[p], ...clone(v) }); },   // 없는 문서는 만들지 않는다 (지운 문서에 순서만 남는 일이 없게)
+      delete: async () => put(p, undefined)
     })
   });
   const dbReady = (async () => {
-    try { idb = await idbOpen(); const v = await idbReq("readonly", st => st.get("docs")); if (v && typeof v === "object") docs = v; }
-    catch (e) { console.warn("IndexedDB를 쓸 수 없어 이번에만 메모리에 둡니다", e); }
+    try {
+      idb = await idbOpen(); const r = await readAll(); docs = r.docs;
+      // 예전 형식(모든 문서를 "docs" 한 키에)에서 옮긴다. 새 형식에 없는 문서만 가져오고 예전 키는 지운다
+      if (r.legacy && typeof r.legacy === "object") { const add = Object.keys(r.legacy).filter(p => !(p in docs)); for (const p of add) docs[p] = r.legacy[p];
+        await tx("readwrite", st => { for (const p of add) st.put(r.legacy[p], K(p)); st.delete("docs"); }); }
+    }
+    catch (e) { console.warn("IndexedDB를 쓸 수 없어 이번에만 메모리에 둡니다", e); idb = null; PWA.storageError = "open"; }
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+    setTimeout(reconcile, 1500);
     return LocalDB;
   })();
 
@@ -103,7 +140,10 @@
   const listeners = [];
   const changed = () => listeners.forEach(f => { try { f(); } catch (e) {} });
   let tok = null; try { tok = JSON.parse(ls.get("kf.tok") || "null"); } catch (e) { tok = null; }
-  const tokValid = () => !!(tok && tok.t && tok.exp > Date.now() + 60e3);
+  // 다른 창(탭)이 받은 토큰이 더 늦게 끝나면 그것을 쓴다
+  function adoptTok() { try { const t = JSON.parse(ls.get("kf.tok") || "null"); if (t && t.t && t.exp > ((tok && tok.exp) || 0)) tok = t; } catch (e) {} }
+  const tokValid = () => { if (!(tok && tok.t && tok.exp > Date.now() + 60e3)) adoptTok(); return !!(tok && tok.t && tok.exp > Date.now() + 60e3); };
+  window.addEventListener("storage", e => { if (e.key === "kf.tok") { adoptTok(); changed(); } });
   const clientId = () => String(CFG.googleClientId || ls.get("kf.cid") || "").trim() || null;
   let gisP = null;
   function loadGis() {
@@ -129,22 +169,26 @@
         error_callback: e => { const p = pending; pending = null; if (p) p.no({ code: e && e.type === "popup_failed_to_open" ? "popup_blocked" : "declined", message: e && e.type }); }
       });
     }
-    if (pending) pending.no({ code: "declined", message: "다시 요청함" });
-    return new Promise((ok, no) => { pending = { ok, no }; tc.requestAccessToken({ prompt: "" }); });
+    if (pending) return pending.p;   // 이미 로그인 창을 띄웠으면 그 결과를 같이 기다린다 (먼저 요청한 쪽을 취소하지 않게)
+    let ok, no; const p = new Promise((a, b) => { ok = a; no = b; });
+    const cur = pending = { ok: v => { clearTimeout(cur.to); ok(v); }, no: e => { clearTimeout(cur.to); no(e); }, p };
+    cur.to = setTimeout(() => { if (pending === cur) { pending = null; no({ code: "declined", message: "응답 없음" }); } }, 180e3);
+    tc.requestAccessToken({ prompt: "" }); return p;
   }
   async function token() {
     if (tokValid()) return tok.t;
     if (PWA.quiet) throw { code: "needs_reauth", message: "연결이 끊겼습니다" };
     return requestToken();
   }
-  function dropToken() { tok = null; ls.set("kf.tok", null); changed(); }
+  // 내 토큰만 지운다 (다른 창이 그사이 받은 새 토큰은 남긴다)
+  function dropToken() { const mine = tok && tok.t; tok = null; try { const t = JSON.parse(ls.get("kf.tok") || "null"); if (!t || !mine || t.t === mine) ls.set("kf.tok", null); } catch (e) { ls.set("kf.tok", null); } changed(); }
 
   /* ---------- 구글 드라이브 API → 커넥터와 같은 도구 ---------- */
   async function api(method, url, { body, headers, raw } = {}) {
     let t = await token(), res;
     const go = () => fetch(url, { method, headers: { Authorization: "Bearer " + t, ...(headers || {}) }, body });
     try { res = await go(); } catch (e) { throw { code: "server_unavailable", message: "네트워크 오류" }; }
-    if (res.status === 401) { dropToken(); if (PWA.quiet) throw { code: "needs_reauth", message: "연결이 끊겼습니다" }; t = await requestToken(); try { res = await go(); } catch (e) { throw { code: "server_unavailable", message: "네트워크 오류" }; } }
+    if (res.status === 401) { dropToken(); if (tokValid()) t = tok.t; else { if (PWA.quiet) throw { code: "needs_reauth", message: "연결이 끊겼습니다" }; t = await requestToken(); } try { res = await go(); } catch (e) { throw { code: "server_unavailable", message: "네트워크 오류" }; } }
     if (!res.ok) {
       let msg = "", reason = ""; try { const j = await res.json(); msg = (j.error && j.error.message) || ""; reason = (j.error && j.error.errors && j.error.errors[0] && j.error.errors[0].reason) || (j.error && j.error.status) || ""; } catch (e) {}
       if (res.status === 401) { dropToken(); throw { code: "needs_reauth", message: msg }; }
@@ -213,6 +257,7 @@
   /* ---------- 앱에 드러내는 것 ---------- */
   const PWA = window.KinfolioPWA = {
     quiet: false,   // true면 로그인 창을 띄우지 않는다(자동 동기화)
+    storageError: null,   // "open": 저장소를 못 열어 메모리에만 / "write": 저장 실패
     clientId,
     setClientId(id) { ls.set("kf.cid", String(id || "").trim() || null); tc = null; dropToken(); },
     hasToken: tokValid,
@@ -221,7 +266,7 @@
     onChange(fn) { listeners.push(fn); }
   };
   // 토큰이 곧 끝나면 화면의 연결 표시를 바꾼다
-  setInterval(() => { if (tok && !tokValid()) { tok = null; ls.set("kf.tok", null); changed(); } }, 30e3);
+  setInterval(() => { if (tok && !tokValid()) dropToken(); }, 30e3);
   if (clientId()) setTimeout(() => loadGis().catch(() => {}), 1500);   // 로그인 창이 바로 뜨도록 미리 불러 둔다
   window.claude = Object.freeze({ use: async name => name === "db" ? dbReady : name === "downloads" ? Downloads : name === "mcp" ? DriveMcp : null });
   if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
@@ -498,7 +543,7 @@ b.accent{color:var(--accent)}
 // 지운 문서는 파일의 tombs(지운 기록)로 알린다. 기록 없이 빠진 문서는 예전 파일이 덮어쓴 것으로 보고 지우지 않는다.
 const KSync = (() => {
   const COLS = ["accounts", "holdings", "prices", "assets", "snapshots"];
-  const TOMB_DAYS = 180;
+  const TOMB_DAYS = 180, SEEN_MAX = 100;
   // 설정·계획은 한 문서에 여러 항목이 있어, 양쪽이 고쳤으면 항목별로 합친다 (지난 동기화 내용을 기준으로)
   const FIELD = new Set(["settings/main", "plan/main"]);
   const clone = v => v === undefined ? undefined : JSON.parse(JSON.stringify(v));
@@ -569,7 +614,7 @@ const KSync = (() => {
       else if (b && hr === hash(bv)) v = lv;            // 드라이브는 그대로 → 이 기기에서 고친 것
       else if (!b && lv === undefined) v = rv;          // 기준이 없으면 한쪽에만 있는 항목은 살린다
       else if (!b && rv === undefined) v = lv;
-      else if (isObj(lv) && isObj(rv) && depth < 3) v = merge3(lv, rv, isObj(bv) ? bv : null, localWins, depth + 1);
+      else if (isObj(lv) && isObj(rv) && depth < 8) v = merge3(lv, rv, isObj(bv) ? bv : null, localWins, depth + 1);
       else if (idArr(lv) && idArr(rv) && (bv === undefined || idArr(bv))) v = mergeArr(lv, rv, bv || null, localWins, depth + 1);
       else v = localWins ? lv : rv;
       if (v !== undefined) out[k] = v;
@@ -577,6 +622,9 @@ const KSync = (() => {
     if (depth === 0) { const u = [upd(l), upd(r)].filter(Boolean).sort().pop(); if (u) out.updatedAt = u; }
     return out;
   }
+  // 이 기기에서 지운 문서의 지운 시각: 기록해 둔 시각(opt.delAt), 모르면 지난 동기화 시각(opt.delFloor, 그 뒤에 지웠으므로 가장 이른 때), 그것도 없으면 지금.
+  // 지운 시각을 동기화 시각으로 잡으면, 지운 뒤 동기화 전에 다른 기기에서 고친 것이 ‘지운 것보다 먼저’로 보여 사라진다
+  const tombTime = (opt, nowIso) => p => (opt.delAt && typeof opt.delAt[p] === "string" && opt.delAt[p] <= nowIso ? opt.delAt[p] : null) || (typeof opt.delFloor === "string" && opt.delFloor <= nowIso ? opt.delFloor : null) || nowIso;
   // L: 이 기기, R: 드라이브 파일, B: 지난 동기화 {path: [hash, updatedAt, (설정·계획은 내용)]}, T: 드라이브의 지운 기록 {path: ISO}
   // opt.preferRemote: 처음 연결한 빈 기기처럼 이 기기 내용을 믿을 수 없을 때, 양쪽이 다르면 드라이브 쪽을 고른다
   // opt.regress: 드라이브 파일이 지난번에 본 것보다 새 판이 아니면(다른 곳이 예전 파일에서 만들어 덮음) 옛날 내용을 받지 않는다
@@ -584,6 +632,9 @@ const KSync = (() => {
     L = L || {}; R = R || {}; B = B || {}; const T0 = T || {}; T = { ...T0 };
     const K0 = opt.knownTombs || {}; for (const p in K0) if (!T[p] || T[p] < K0[p]) T[p] = K0[p];   // 이 기기가 아는 지운 기록 (드라이브 파일에서 사라졌어도 다시 알린다)
     const now = opt.now || Date.now(), nowIso = new Date(now).toISOString();
+    const tombAt = tombTime(opt, nowIso);
+    // 이 기기에서 지운 시각을 아는 경우만 (기록한 시각, 또는 지난 동기화 시각 = 지운 때보다 이르거나 같은 때). 모르면 null
+    const tombKnown = p => (opt.delAt && typeof opt.delAt[p] === "string" && opt.delAt[p] <= nowIso ? opt.delAt[p] : null) || (typeof opt.delFloor === "string" && opt.delFloor <= nowIso ? opt.delFloor : null);
     const first = !Object.keys(B).length;
     const M = {}, localOps = [], picks = {};
     const paths = new Set([...Object.keys(L), ...Object.keys(R), ...Object.keys(B), ...Object.keys(T)]);
@@ -606,14 +657,15 @@ const KSync = (() => {
         const localWins = opt.preferRemote ? false : !(ur && (!ul || ur > ul));
         if (l !== undefined && r !== undefined && FIELD.has(p)) { pick = "m"; mv = merge3(l, r, b && b[2] ? b[2] : null, localWins, 0); }
         else if (opt.preferRemote) pick = (r !== undefined || T[p]) ? "r" : "l";
-        else if (l === undefined) pick = "r";                    // 여기서 지웠지만 다른 곳에서 고침 → 고친 것 유지
-        else if (r === undefined) pick = "l";                    // 다른 곳에서 지웠지만 여기서 고침 → 유지
+        // 한쪽은 지우고 한쪽은 고침: 고친 시각이 지운 시각보다 뒤면(또는 둘 중 하나를 모르면) 고친 것을 살리고, 지운 것이 더 나중이면 지운다
+        else if (l === undefined) { const tl = tombKnown(p); pick = tl && ur && tl > ur ? "l" : "r"; }
+        else if (r === undefined) pick = T[p] && ul && T[p] > ul ? "r" : "l";
         else pick = localWins ? "l" : "r";                       // 수정 시각이 새로운 쪽 (한쪽에만 있으면 그쪽, 같으면 이 기기)
       }
       const v = pick === "m" ? mv : pick === "r" ? r : l;
       picks[p] = pick;
       if (v !== undefined) { M[p] = v; delete T[p]; }
-      else if (b || T[p]) T[p] = T[p] || nowIso;                 // 지운 문서는 기록을 남긴다
+      else if (b || T[p]) T[p] = T[p] || tombAt(p);              // 지운 문서는 기록을 남긴다 (지운 시각)
       if (hash(v) !== hl) localOps.push([p, v === undefined ? null : v]);
     }
     const cut = new Date(now - TOMB_DAYS * 864e5).toISOString();
@@ -626,25 +678,34 @@ const KSync = (() => {
   function mergeLocal(L, B, T, opt = {}) {
     L = L || {}; B = B || {}; const T0 = T || {}; T = { ...T0 };
     const now = opt.now || Date.now(), nowIso = new Date(now).toISOString();
+    const tombAt = tombTime(opt, nowIso);
     let changed = false;
     for (const p of new Set([...Object.keys(L), ...Object.keys(B)])) {
       if (hash(L[p]) === (B[p] ? B[p][0] : "")) continue;
-      changed = true; if (L[p] === undefined) T[p] = T[p] || nowIso; else delete T[p];
+      changed = true; if (L[p] === undefined) T[p] = T[p] || tombAt(p); else delete T[p];
     }
     const cut = new Date(now - TOMB_DAYS * 864e5).toISOString();
     for (const p in T) if (T[p] < cut || L[p] !== undefined) delete T[p];
     return { docs: { ...L }, tombs: T, localOps: [], remoteChanged: changed || stable(T) !== stable(T0), picks: {}, first: false };
   }
-  function serialize(docs, tombs, device, now, rev) {
-    return JSON.stringify({ app: "Kinfolio", format: 1, kind: "sync", rev: rev || 1, exportedAt: new Date(now || Date.now()).toISOString(), device: device || "", data: unflatten(docs), tombs: tombs || {} });
+  // seen: 이 파일에 들어 있는 업로드 id (최근 것부터). 다음에 내려받은 파일에 내 마지막 업로드가 없으면 다른 기기가 덮어쓴 것
+  // 기준(sync/base)을 저장할 때 평가액 기록 항목을 짧게: 문서 한 개 크기 한도(256KiB) 안에 오래 들어가도록
+  function packBase(h) { const o = {}, s = {}; let n = 0;
+    for (const p in h || {}) { const e = h[p]; if (p.startsWith("snapshots/") && Array.isArray(e) && e.length === 2 && !e[1]) { s[p.slice(10)] = e[0]; n++; } else o[p] = e; }
+    if (n) o["~snapshots"] = s; return o; }
+  function unpackBase(h) { if (!h || !h["~snapshots"]) return h; const o = { ...h }; const s = o["~snapshots"]; delete o["~snapshots"]; for (const d in s) o["snapshots/" + d] = [s[d], null]; return o; }
+  function serialize(docs, tombs, device, now, rev, seen) {
+    const o = { app: "Kinfolio", format: 1, kind: "sync", rev: rev || 1, exportedAt: new Date(now || Date.now()).toISOString(), device: device || "", data: unflatten(docs), tombs: tombs || {} };
+    if (Array.isArray(seen)) o.seen = seen.slice(0, SEEN_MAX);
+    return JSON.stringify(o);
   }
   function parse(text) {
     let d; try { d = JSON.parse(text); } catch (e) { return null; }
     if (!d || d.app !== "Kinfolio" || !d.data || typeof d.data !== "object") return null;
     const tombs = d.tombs && typeof d.tombs === "object" ? d.tombs : {};
-    return { docs: flatten(d.data), tombs, rev: Number(d.rev) || 0, exportedAt: d.exportedAt || null, device: d.device || "" };
+    return { docs: flatten(d.data), tombs, rev: Number(d.rev) || 0, exportedAt: d.exportedAt || null, device: d.device || "", seen: Array.isArray(d.seen) ? d.seen.filter(x => typeof x === "string") : null };
   }
-  return { COLS, FIELD, stable, hash, flatten, unflatten, baseOf, merge, merge3, mergeLocal, serialize, parse };
+  return { COLS, FIELD, SEEN_MAX, stable, hash, flatten, unflatten, baseOf, merge, merge3, mergeLocal, serialize, parse, packBase, unpackBase };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = KSync;
 </script>
@@ -718,6 +779,16 @@ function deepMerge(base, over) {
   return out;
 }
 
+// 기본값이 숫자인 가정 항목에 숫자가 아닌 값("1,000", "abc")이 들어오면 숫자로 바꾸거나 기본값을 쓴다 (손으로 고친 백업 파일 등)
+function numify(a, d) {
+  for (const k in d) {
+    const dv = d[k];
+    if (typeof dv === "number") { if (typeof a[k] !== "number" || !isFinite(a[k])) { const t = String(a[k] ?? "").replace(/,/g, "").trim(); const n = Number(t); a[k] = t !== "" && isFinite(n) ? n : dv; } }
+    else if (dv && typeof dv === "object" && !Array.isArray(dv) && a[k] && typeof a[k] === "object" && !Array.isArray(a[k])) numify(a[k], dv);
+  }
+  return a;
+}
+
 /**
  * input = { plan, accounts:[{id,name,type,balance,basis,r,dy,openYear?}] }
  * r, dy: 연 기대수익률·배당수익률 (소수)
@@ -735,7 +806,7 @@ function simulate(input) {
 }
 function simulateGroup(input, G) {
   const plan = input.plan || {};
-  const A = deepMerge(DEFAULT_ASSUMPTIONS, plan.assumptions || {});
+  const A = numify(deepMerge(DEFAULT_ASSUMPTIONS, plan.assumptions || {}), DEFAULT_ASSUMPTIONS);
   const H = A.health;
   const Y0 = num(A.baseYear, 2026);
   const FR = Math.min(1, Math.max(0, num(input.firstYearFraction, 1))); // 올해 남은 기간 비율 (남은 달 수 / 12)
@@ -758,6 +829,9 @@ function simulateGroup(input, G) {
   const horizonMembers = G === "main" ? gMembers.filter(m => m.inHorizon !== false && (m.inHorizon || ["본인", "배우자"].includes(m.relation))) : gMembers;
   const hm = horizonMembers.length ? horizonMembers : [primary];
   const Yend = Math.max(...hm.map(m => m.birthYear + m.deathAge));
+  // 우리 가계의 계획이 끝나는 해: 별도 가계로 보내는 우리 가계 구성원의 이체는 그 뒤로 멈춘다 (우리 가계 계산이 끝나 보낼 돈이 없다)
+  const mainM = members.filter(m => grpOfM(m) === "main"), mainHm = mainM.filter(m => m.inHorizon !== false && (m.inHorizon || ["본인", "배우자"].includes(m.relation)));
+  const mainYend = Math.max(...(mainHm.length ? mainHm : [mainPrimary]).map(m => m.birthYear + m.deathAge));
   const ageOf = (id, y) => byId[id] ? y - byId[id].birthYear : null;
   // deathAge = 계획 끝 나이: 이 나이까지 그 사람의 생활비·수입·이체·계좌를 계산한다
   const activeIn = (id, y) => byId[id] && (y - byId[id].birthYear) <= byId[id].deathAge;
@@ -822,7 +896,7 @@ function simulateGroup(input, G) {
   /* ---------- 부동산·대출 ---------- */
   const props = (G === "main" ? plan.properties || [] : []).map(p => ({ ...p, value0: num(p.value), g: has(p.growth) ? num(p.growth) / 100 : infl,
     offR: has(p.officialRatio) ? num(p.officialRatio) / 100 : num(H.officialRatio, 69) / 100 }));
-  const loans = (G === "main" ? plan.loans || [] : []).map(l => ({ ...l, bal: has(l.startYear) && num(l.startYear) > Y0 ? 0 : num(l.balance), rate: num(l.rate) / 100, endYear: num(l.endYear, Y0 + 10), started: !(has(l.startYear) && num(l.startYear) > Y0) }));
+  const loans = (G === "main" ? plan.loans || [] : []).map(l => ({ ...l, bal: has(l.startYear) && num(l.startYear) >= Y0 ? 0 : num(l.balance), rate: num(l.rate) / 100, endYear: num(l.endYear, Y0 + 10), started: !(has(l.startYear) && num(l.startYear) >= Y0) }));
   let debt = 0; // 부족분 누적
 
   const incomes = (plan.incomes || []).filter(i => inG(i.ownerId));
@@ -838,8 +912,10 @@ function simulateGroup(input, G) {
     if (!anyHorizonAlive(y)) break;
     if (y === Y0) freezeEnded();
     const F = inflF(y); const PR = y === Y0 ? FR : 1;
-    const row = { year: y, ages: {}, events: [], eventWho: [], infl: F };
-    const evt = (text, ...ids) => { row.events.push(text); row.eventWho.push([...new Set(ids.filter(Boolean))]); }; // 이벤트와 관련된 구성원
+    const row = { year: y, ages: {}, events: [], eventWho: [], eventTpl: [], eventAmt: [], infl: F };
+    const evt = (text, ...ids) => { row.events.push(text); row.eventTpl.push(null); row.eventAmt.push(null); row.eventWho.push([...new Set(ids.filter(Boolean))]); }; // 이벤트와 관련된 구성원
+    // 금액이 든 이벤트: 글 안의 {A} 자리에 금액(명목)을 넣고, 금액을 따로 남긴다 (화면에서 현재가치로 바꿔 보여 줄 수 있게)
+    const evtA = (tpl, amt, ...ids) => { row.events.push(tpl.replace("{A}", fmtW(amt))); row.eventTpl.push(tpl); row.eventAmt.push(amt); row.eventWho.push([...new Set(ids.filter(Boolean))]); };
     const BPo = {}; const BPf = id => BPo[id] || (BPo[id] = { salary: 0, npension: 0, basic: 0, other: 0, transferIn: 0, transferOut: 0, living: 0, lump: 0, shared: 0, health: 0, pensionDraw: 0, otherDraw: 0, cashDraw: 0, contrib: 0, toCash: 0, tax: 0, taxCash: 0, credit: 0, pension: 0, isa: 0, general: 0, cash: 0, assets: 0, inherit: 0, acctClose: 0, unfunded: 0 , neg: 0, overdraft: 0 });
     members.forEach(m => { row.ages[m.id] = activeIn(m.id, y) ? y - m.birthYear : null; });
     const primAge = y - primary.birthYear;
@@ -860,7 +936,7 @@ function simulateGroup(input, G) {
     const payer = payerOf(y);
     const flow = { salary: 0, npension: 0, basic: 0, other: 0, living: 0, lump: 0, loanPay: 0, housing: 0, propSale: 0, transfer: 0, transferIn: 0, inherit: 0, propSaleCash: 0, acctClose: 0, loanIn: 0 }; const tDetail = [];
     const baseTax = { isa: 0, closeGain: 0, pOut: 0, pRet: 0 }; const baseTaxP = {}; const BT = id => baseTaxP[id] || (baseTaxP[id] = { isa: 0, fin: 0, out: 0, ret: 0 });
-    const person = {}; const P = id => person[id] || (person[id] = { pub: 0, priv: 0, privOut: 0, retTax: 0, fin: 0, finLump: 0, finWithheldCash: 0, foreign: 0, foreignLump: 0, salary: 0, isaCredit: 0 });
+    const person = {}; const P = id => person[id] || (person[id] = { pub: 0, priv: 0, privOut: 0, retTax: 0, fin: 0, finLump: 0, finWithheldCash: 0, foreign: 0, foreignLump: 0, salary: 0 });
     const xferPen = {}; // 연금계좌가 아닌 계좌에서 연금계좌로 옮긴 돈 (납입한도 점검용)
     members.forEach(m => P(m.id));
 
@@ -899,20 +975,20 @@ function simulateGroup(input, G) {
         if (isPension(dest)) {
           if (isPension(a)) addIn(dest.id, { amt: net, free: a.free, ret: a.ret, retTax: a.retTaxDef }, `${a.name} 해지 이전`);
           else {
-            const eligible = a.type === "ISA" && y - a.isaOpen >= 3 ? Math.min(net * A.isaTransferCreditPct / 100, A.isaTransferCreditMax) : 0; // 만기(3년) ISA만 전환 공제
-            const credit = eligible > 0 && salaryActive(dest.owner, y) ? eligible * A.creditRate / 100 : 0;
-            addIn(dest.id, { amt: net, free: net - (credit > 0 ? eligible : 0) }, `${a.name} 해지 이전`);
-            if (credit > 0) { P(dest.owner).isaCredit += credit; }
-            if (a.type !== "ISA") { xferPen[dest.owner] = (xferPen[dest.owner] || 0) + net; warn("xfer", y, `${a.name}→${dest.name}: 연금계좌로 옮긴 돈은 그해 연금 납입한도(연 1,800만원)에 들어갑니다.`); }
+            const isaConv = a.type === "ISA" && y - a.isaOpen >= 3;   // 만기(3년) ISA 전환금액
+            const extra = isaConv ? Math.min(net * A.isaTransferCreditPct / 100, A.isaTransferCreditMax) : 0;
+            addIn(dest.id, { amt: net, free: 0 }, `${a.name} 해지 이전`);   // 세액공제 받지 못한 부분은 세액공제 계산에서 비과세 원금으로 돌린다
+            (P(dest.owner).penX || (P(dest.owner).penX = [])).push([dest.id, net, dest.type, extra]);
+            if (!isaConv) { xferPen[dest.owner] = (xferPen[dest.owner] || 0) + net; warn("xfer", y, `${a.name}→${dest.name}: 연금계좌로 옮긴 돈은 그해 연금 납입한도(연 1,800만원)에 들어갑니다.`); }
           }
         } else {
           addIn(dest.id, { amt: net, basis: net }, `${a.name} 해지 이전`);
           if (dest.type === "ISA") { const room = isaRoom(dest); dest.isaTotal += net; isaIn[dest.id] = (isaIn[dest.id] || 0) + net;
             if (net > room + 1) warn("ilimit", y, `${byId[dest.owner].name}의 ${dest.name}: ${a.name}에서 옮겨 넣는 #AMT#이 납입 가능 한도 ${fmtW(room)}을 넘습니다 (${isaLimitTxt(dest)} − 이미 넣은 원금 ${fmtW(isaStart[dest.id] || 0)}).`, net); }
         }
-        evt(`${a.name} 해지 → ${dest.name} ${fmtW(net)}`, a.owner, dest.owner);
+        evtA(`${a.name} 해지 → ${dest.name} {A}`, net, a.owner, dest.owner);
       } else {
-        bump(a.owner, net); flow.acctClose += net; BPf(a.owner).acctClose += net; evt(`${a.name} 해지 → 현금 ${fmtW(net)}`, a.owner);
+        bump(a.owner, net); flow.acctClose += net; BPf(a.owner).acctClose += net; evtA(`${a.name} 해지 → 현금 {A}`, net, a.owner);
       }
       closeLog[a.id] = { start: bal, tax, net, to: dest ? dest.name : "생활비 통장", why: "계획한 해지" };
       a.balance = 0; a.closed = true; B0[a.id] = 0;
@@ -942,7 +1018,7 @@ function simulateGroup(input, G) {
           const dest = acctById[it.destAccountId];
           if (dest && isPension(dest) && canReceive(dest)) {
             if (!dest.open) { dest.open = true; evt(`${dest.name} 개설`, dest.owner); }
-            addIn(dest.id, { amt: v, ret: v, retTax: v * rt }, "퇴직금 입금"); evt(`퇴직금 ${fmtW(v)} → ${dest.name}`, o.id, dest.owner);
+            addIn(dest.id, { amt: v, ret: v, retTax: v * rt }, "퇴직금 입금"); evtA(`퇴직금 {A} → ${dest.name}`, v, o.id, dest.owner);
           } else { bump(o.id, v * (1 - rt)); flow.other += v * (1 - rt); BPf(o.id).other += v * (1 - rt); evt(`퇴직금 수령 (현금)`, o.id); }
         }
       } else if (it.type === "basic") {
@@ -968,7 +1044,7 @@ function simulateGroup(input, G) {
       const at = num(ev.atAge), every = num(ev.every), times = Math.max(1, num(ev.times, 1));
       const d = age - at;
       const hit = d === 0 || (every > 0 && d > 0 && d % every === 0 && d / every < times);
-      if (hit) { const v = num(ev.amount) * F; flow.lump += v; if (byId[ev.memberId]) { bump(ev.memberId, -v); BPf(ev.memberId).lump += v; } else { bump(payer, -v); BPf(payer).shared += v; } evt(`${ev.name || "목돈 지출"} ${fmtW(v)}`, byId[ev.memberId] ? ev.memberId : payer); }
+      if (hit) { const v = num(ev.amount) * F; flow.lump += v; if (byId[ev.memberId]) { bump(ev.memberId, -v); BPf(ev.memberId).lump += v; } else { bump(payer, -v); BPf(payer).shared += v; } evtA(`${ev.name || "목돈 지출"} {A}`, v, byId[ev.memberId] ? ev.memberId : payer); }
     }
 
     /* 4-1. 가족 간 이체 (생활비 지급) */
@@ -977,6 +1053,7 @@ function simulateGroup(input, G) {
     for (const t of transfers) {
       const fm = byId[t.fromId], tm = byId[t.toId]; if (!fm || !tm || fm.id === tm.id) continue;
       const fIn = inG(fm.id), tIn = inG(tm.id); if (!fIn && !tIn) continue;
+      if (!fIn && grpOfM(fm) === "main" && y > mainYend) continue;
       if (!activeIn(fm.id, y) || !activeIn(tm.id, y)) continue;
       const ref = t.basis === "from" ? fm : tm; const age = y - ref.birthYear;
       if (age < num(t.fromAge, 0) || age > (has(t.toAge) ? num(t.toAge) : 200)) continue;
@@ -1002,13 +1079,13 @@ function simulateGroup(input, G) {
       const v = p.value0 * Math.pow(1 + p.g, y - Y0);
       const bought = !has(p.buyYear) || num(p.buyYear) <= y;
       const sold = has(p.sellYear) && num(p.sellYear) <= y;
-      if (has(p.buyYear) && num(p.buyYear) === y) { bump(payer, -v); BPf(payer).shared += v; flow.housing += v; evt(`${p.name} 매입 ${fmtW(v)}`, payer); }
+      if (has(p.buyYear) && num(p.buyYear) === y) { bump(payer, -v); BPf(payer).shared += v; flow.housing += v; evtA(`${p.name} 매입 {A}`, v, payer); }
       if (has(p.sellYear) && num(p.sellYear) === y && bought) {
         const net = v * (1 - num(p.sellCostPct, 1) / 100);
         const dest = acctById[p.proceedsTo];
         if (canReceive(dest) && !isPension(dest)) { if (!dest.open) dest.open = true; addIn(dest.id, { amt: net, basis: net }, `${p.name} 매각 대금`); }
         else { bump(payer, net); BPf(payer).acctClose += net; flow.propSaleCash += net; }
-        flow.propSale += net; evt(`${p.name} 매각 ${fmtW(net)}`, canReceive(dest) && !isPension(dest) ? dest.owner : payer);
+        flow.propSale += net; evtA(`${p.name} 매각 {A}`, net, canReceive(dest) && !isPension(dest) ? dest.owner : payer);
       }
       p.cur = bought && !sold ? v : 0;
       if (p.cur > 0) heldProps.push(p);
@@ -1070,7 +1147,7 @@ function simulateGroup(input, G) {
     function evaluate(draws, contribs, od) {
       od = od || {};
       const ps = {}; for (const id in person) ps[id] = { ...person[id], privDetail: [] };
-      const Q = id => ps[id] || (ps[id] = { pub: 0, priv: 0, privOut: 0, retTax: 0, fin: 0, finWithheldCash: 0, foreign: 0, salary: 0, isaCredit: 0, privDetail: [] });
+      const Q = id => ps[id] || (ps[id] = { pub: 0, priv: 0, privOut: 0, retTax: 0, fin: 0, finLump: 0, finWithheldCash: 0, foreign: 0, foreignLump: 0, salary: 0, privDetail: [] });
       const end = {}; let cashIn = 0, cashOut = 0, wdTaxCash = 0;
       const pensionContrib = {}; // owner -> {sav, irp, list}
       let drawTotal = 0, pensionDraw = 0, otherDraw = 0, contribTotal = 0;
@@ -1083,12 +1160,16 @@ function simulateGroup(input, G) {
         const t = tIn[a.id] || { amt: 0, free: 0, ret: 0, retTax: 0, basis: 0 };
         const c = contribs[a.id] || 0;
         const inflow = t.amt + c;
-        const avail = B0[a.id] + inflow;
+        let avail = B0[a.id] + inflow;
+        if (!isCash(a)) { // 연중 손실(수익률·배당세)이 나면 꺼낼 수 있는 돈도 그만큼 줄어든다: 끝 잔액이 0이 되는 인출액까지만
+          const kk = (a.r - (!isPension(a) && a.type !== "ISA" ? Math.max(0, a.dy) * 0.154 : 0)) * PR;
+          if (kk < 0) avail = Math.max(0, (avail + (B0[a.id] + t.amt + c / 2) * kk) / (1 + kk / 2));
+        }
         let w = Math.max(0, Math.min(draws[a.id] || 0, avail)) + (od[a.id] || 0); if (w > 0) { drawn[a.id] = w; addM(drawP, a.owner, w); }
         if (c) addM(contribP, a.owner, c);
         let free = a.free + t.free, ret = a.ret + t.ret, retTaxDef = a.retTaxDef + t.retTax, basis = a.basis + t.basis;
         let firstWd = a.firstWd;
-        if (isPension(a) && c > 0) { const o = pensionContrib[a.owner] || (pensionContrib[a.owner] = { sav: 0, irp: 0, list: [] }); if (a.type === "연금저축") o.sav += c; else o.irp += c; o.list.push([a.id, c, a.type]); }
+        if (isPension(a) && c > 0) { const o = pensionContrib[a.owner] || (pensionContrib[a.owner] = { sav: 0, irp: 0, list: [], extra: 0 }); if (a.type === "연금저축") o.sav += c; else o.irp += c; o.list.push([a.id, c, a.type]); }
         if (a.type === "ISA" || !isPension(a)) basis += c;
         contribTotal += c;
         // 인출
@@ -1109,7 +1190,7 @@ function simulateGroup(input, G) {
             const rr = take(ret); if (rr > 0) { const rate = ret > 0 ? retTaxDef / ret : 0; const [i, o] = split(rr); const tx = i * rate * retFactor(k) + o * rate; Q(own).retTax += tx; retTaxDef -= rr * rate; ret -= rr; }
             const taxable = rem; rem = 0; // 운용수익·세액공제 받은 납입금
             if (taxable > 0) { const [i, o] = split(taxable); Q(own).priv += i; Q(own).privOut += o; }
-            if (!eligible && w > 1e4) Q(own).earlyWd = (Q(own).earlyWd || 0) + w;
+            if (!eligible && w - f > 1e4) Q(own).earlyWd = (Q(own).earlyWd || 0) + (w - f);   // 세금 없는 원금만 꺼낸 것은 경고하지 않는다
             if (eligible && limit !== Infinity && w > limit + 1e4) Q(own).overLimit = (Q(own).overLimit || 0) + (w - limit);
           } else if (a.type === "ISA") {
             otherDraw += w;
@@ -1120,8 +1201,8 @@ function simulateGroup(input, G) {
             const bal = B0[a.id] + inflow; const gainRatio = bal > 0 ? Math.max(0, 1 - basis / bal) : 0;
             const g = w * gainRatio; basis = Math.max(0, basis - (w - g));
             if (!isCash(a)) {
-              if (a.taxKind === "dividend") { Q(own).fin += g; const tx = g * 0.154; wdTaxCash += tx; T(own).fin += tx; addM(taxCashP, own, tx); }
-              else if (a.taxKind === "foreign") Q(own).foreign += g;
+              if (a.taxKind === "dividend") { Q(own).fin += g; Q(own).finLump = (Q(own).finLump || 0) + g; const tx = g * 0.154; wdTaxCash += tx; T(own).fin += tx; addM(taxCashP, own, tx); }
+              else if (a.taxKind === "foreign") { Q(own).foreign += g; Q(own).foreignLump = (Q(own).foreignLump || 0) + g; }
             }
           }
         }
@@ -1132,7 +1213,7 @@ function simulateGroup(input, G) {
         let growth = avg * a.r * PR; let divTax = 0; const gBase = growth; let odInt = 0, div = 0;
         if (isCash(a) && avgRaw < 0) { odInt = avgRaw * num(A.overdraftRate) / 100 * PR; growth += odInt; } // 마이너스 잔액 이자
         if (!isPension(a) && a.type !== "ISA") {
-          div = avg * (isCash(a) ? a.r : a.dy) * PR;
+          div = Math.max(0, avg * (isCash(a) ? a.r : a.dy) * PR);
           divTax = div * 0.154; Q(a.owner).fin += div; divWithheld += divTax; T(a.owner).finW += divTax;
           basis += div - divTax;
         }
@@ -1150,7 +1231,7 @@ function simulateGroup(input, G) {
       // 올해 남은 달만 계산하는 해에는 반복되는 소득을 1년치로 늘려 누진·기준금액을 적용한 뒤 남은 달 비율만큼만 잡는다.
       // 해지 차익처럼 한 번뿐인 돈은 늘리지도 줄이지도 않는다.
       const AN = PR > 0 && PR < 1 ? PR : 1;
-      const compOwn = {}; // 사람별 종합소득세 (연금 세액공제 한도)
+      const compOwn = {}, incAmt = {}; // 사람별 종합소득세 (연금 세액공제 한도), 종합소득금액
       for (const id in ps) {
         const q = ps[id]; if (!byId[id]) continue;
         const age = y - byId[id].birthYear; const employed = q.salary > 0; const mr = A.workMarginal / 100;
@@ -1159,23 +1240,27 @@ function simulateGroup(input, G) {
         t += q.privOut * 0.165; taxB.outside += q.privOut * 0.165; R.outside += q.privOut * 0.165;
         t += q.retTax; taxB.ret += q.retTax; R.ret += q.retTax;
         const pub = q.pub / AN, priv = q.priv / AN;
-        const nfBase = x => x > 0 ? Math.max(0, x - pensionDeduction(x) - 1.5e6) : 0; // 연금소득공제·기본공제 뒤 과세표준
+        const pDed = 1.5e6 + (age >= 70 ? 1e6 : 0);                                     // 인적공제: 기본 150만원 + 70세 이상 경로우대 100만원
+        const pAmt = x => x > 0 ? x - pensionDeduction(x) : 0;                           // 연금소득금액 (연금소득공제 뒤)
+        const nfBase = x => Math.max(0, pAmt(x) - pDed);                                 // 금융소득 없이 본 과세표준
         const empBase = x => x > 0 ? Math.max(0, x - pensionDeduction(x)) : 0;        // 근로소득에 더해질 때 (기본공제는 근로소득에서 이미 씀)
         const calc = (fin, foreign) => {
           const fg = Math.max(0, foreign - 2.5e6) * 0.22;
-          const finExtra = (baseNF) => {
+          // 금융소득 2,000만원 초과: 종합과세(비교과세). 인적공제는 연금소득에서 다 못 쓰면 금융소득에서 뺀다
+          const finExtra = (x) => {
             if (fin <= 2e7) return 0;
             if (employed) return (fin - 2e7) * Math.max(0, mr - 0.154);
-            const natA = progressiveTax(baseNF + (fin - 2e7)) + 2e7 * 0.14;
-            const natB = progressiveTax(baseNF) + fin * 0.14;
+            const TB = Math.max(0, pAmt(x) + fin - pDed);                                // 종합소득 과세표준 (금융소득 포함)
+            const natA = progressiveTax(Math.max(0, TB - 2e7)) + Math.min(TB, 2e7) * 0.14;
+            const natB = progressiveTax(Math.max(0, TB - fin)) + fin * 0.14;
             const tot = Math.max(0, Math.max(natA, natB) - 7e4) * 1.1;
-            return Math.max(0, tot - compTax(baseNF) - fin * 0.154);
+            return Math.max(0, tot - compTax(nfBase(x)) - fin * 0.154);
           };
           const over = priv > A.pensionSepLimit + 1;
           const sepP = over ? priv * 0.165 : priv * ageRate(age);          // 분리과세: 1,500만원 이하 3.3~5.5%, 넘으면 16.5%
           let comp, fx, alt;
           if (employed) { comp = empBase(pub) * mr; fx = finExtra(0); alt = empBase(pub + priv) * mr - comp; }
-          else { const b1 = nfBase(pub); comp = compTax(b1); fx = finExtra(b1); const b2 = nfBase(pub + priv); alt = compTax(b2) + finExtra(b2) - comp - fx; }
+          else { comp = compTax(nfBase(pub)); fx = finExtra(pub); alt = compTax(nfBase(pub + priv)) + finExtra(pub + priv) - comp - fx; }
           const useComp = priv > 0 && alt < sepP;                          // 종합과세로 신고하는 게 더 적으면 그쪽 (늘어난 세금은 사적연금 몫)
           return { fg, p: useComp ? alt : sepP, comp, fx, kind: useComp ? (over ? "comp" : "comp-low") : (over ? "sep" : "low") };
         };
@@ -1190,27 +1275,38 @@ function simulateGroup(input, G) {
         if (best.kind === "low") { taxB.pensionLow += best.p; R.pensionLow += best.p; } else { taxB.pensionHigh += best.p; R.pensionHigh += best.p; }
         taxB.comp += best.comp; taxB.fin += best.fx; R.comp += best.comp; R.fin += best.fx;
         compOwn[id] = best.comp + best.fx + (best.kind.startsWith("comp") ? best.p : 0);
+        // 종합소득금액 (연금계좌 세액공제율 판단용, 1년치): 연금소득금액(종합과세를 고르면 사적연금 포함) + 2,000만원 넘는 금융소득
+        const finY = finRec + finL; incAmt[id] = pAmt(pub + (best.kind.startsWith("comp") ? priv : 0)) + (finY > 2e7 ? finY : 0);
         if (priv > 0) taxB.choice[id] = best.kind;
         taxTotal += t; addM(taxCashP, id, t);
       }
       // 연금 세액공제: 연금저축 600만원, IRP 합쳐 900만원까지. 종합소득이 있는 사람만, 그 사람의 종합소득세를 넘지 않게
       // (근로소득자는 근로소득세가 충분하다고 본다). 공제받지 못한 납입액은 나중에 세금 없이 꺼낸다.
+      // 연금계좌가 아닌 곳에서 옮겨 넣은 돈도 그해 납입액 (만기 ISA 전환금액은 10%·300만원까지 한도를 더 준다)
+      for (const id in ps) for (const [did, amt, type, extra] of ps[id].penX || []) {
+        if (!end[did]) continue;
+        const o = pensionContrib[id] || (pensionContrib[id] = { sav: 0, irp: 0, list: [], extra: 0 }); if (type === "연금저축") o.sav += amt; else o.irp += amt; o.list.push([did, amt, type]); o.extra = (o.extra || 0) + extra;
+      }
+      // 공제율: 근로소득이 있는 해는 가정의 공제율, 없는 해는 종합소득금액 4,500만원 이하 16.5%, 넘으면 13.2%
+      const crRate = own => salaryActive(own, y) ? A.creditRate : ((incAmt[own] || 0) <= 4.5e7 ? 16.5 : 13.2);
       let credits = 0;
       for (const own in pensionContrib) {
         const o = pensionContrib[own];
         const dS = Math.min(o.sav, A.creditLimitSavings);
         const dI = Math.min(o.irp, Math.max(0, A.creditLimitTotal - dS));
-        const full = (dS + dI) * A.creditRate / 100;
+        const pool = o.sav + o.irp, base = dS + dI;
+        const dX = Math.min(Math.min(o.extra || 0, A.isaTransferCreditMax), Math.max(0, pool - base));   // ISA 전환 추가 한도
+        const full = (base + dX) * crRate(own) / 100;
         const cr = salaryActive(own, y) ? full : Math.min(full, Math.max(0, compOwn[own] || 0));
         const sc = full > 0 ? cr / full : 0;
         credits += cr; T(own).credit += cr;
         for (const [id, amt, type] of o.list) {
           const tot = type === "연금저축" ? o.sav : o.irp; const d = type === "연금저축" ? dS : dI;
-          const ded = tot > 0 ? amt * d / tot * sc : 0;
-          end[id].free += amt - ded;
+          const inB = tot > 0 ? amt * d / tot : 0;                                 // 기본 한도 안에서 공제되는 몫
+          const inX = pool > base ? (amt - inB) * dX / (pool - base) : 0;           // 추가 한도로 공제되는 몫
+          end[id].free += amt - (inB + inX) * sc;                                  // 공제받지 못한 납입액은 나중에 세금 없이 꺼낸다
         }
       }
-      for (const id in ps) { credits += ps[id].isaCredit || 0; if (ps[id].isaCredit) T(id).credit += ps[id].isaCredit; }
       // 건강보험료
       // 건보료도 1년치 소득 기준으로 월 보험료를 구한 뒤 남은 달만큼만 낸다
       const psH = PR > 0 && PR < 1 ? Object.fromEntries(Object.entries(ps).map(([id, q]) => [id, { ...q, pub: q.pub / PR, priv: q.priv / PR, fin: (q.fin - (q.finLump || 0)) / PR + (q.finLump || 0), foreign: q.foreign / PR, salary: q.salary / PR }])) : ps;
@@ -1258,15 +1354,17 @@ function simulateGroup(input, G) {
       const single = heldP.length === 1;
       let b = 0;
       for (const p of heldP) { const off = p.cur * p.offR; const r = single ? (off <= 3e8 ? 0.43 : off <= 6e8 ? 0.44 : 0.45) : 0.6; b += off * r; }
-      return Math.max(0, b - loanDed);
+      // 주택금융부채공제: 1세대 1주택·재산과표 3억원 이하일 때 실거주 주택 구입 대출 잔액의 60%(5,000만원까지)
+      const ded = single && b <= 3e8 ? Math.min(loanDed * 0.6, 5e7) : 0;
+      return Math.max(0, b - ded);
     }
     function regional(ps, heldP, loanDed) {
       const rate = H.rate / 100, ltc = 1 + H.ltc / 100;
       let inc = 0; for (const id in ps) { if (!activeIn(id, y)) continue; const q = ps[id]; inc += q.pub * 0.5 + (q.fin > 1e7 ? q.fin : 0); }
       const pb = propTaxBase(heldP, loanDed);
       const points = propPoints(pb - H.propDeduct);
-      let m = inc / 12 * rate + points * H.pointWon;
-      m = Math.min(Math.max(m, H.minMonthly), H.maxMonthly) * ltc;
+      let m = Math.max(inc / 12 * rate, H.minMonthly) + points * H.pointWon;   // 소득보험료(최저보험료 적용) + 재산보험료
+      m = Math.min(m, H.maxMonthly) * ltc;
       return { annual: m * 12, status: "지역", monthly: m, points };
     }
 
@@ -1291,7 +1389,9 @@ function simulateGroup(input, G) {
       const k = limitYear(a, y, tIn[id] && tIn[id].ret > 0);
       return { eligible, limit: eligible ? (k <= 10 ? ((B0[id] || 0) + (tIn[id] ? tIn[id].amt : 0)) / (11 - k) * 1.2 : Infinity) : 0 };
     };
-    const ownerPenDraw = own => accts.filter(b => b.owner === own && isPension(b)).reduce((s2, b) => s2 + (draws[b.id] || 0), 0);
+    // 연금계좌에서 w를 꺼낼 때 과세 대상 사적연금이 되는 몫: 세금 없는 원금 → 이연퇴직소득 → 나머지 순서로 꺼낸다
+    const penNonTax = b => b.free + b.ret + (tIn[b.id] ? tIn[b.id].free + tIn[b.id].ret : 0);
+    const ownerPrivDraw = own => accts.filter(b => b.owner === own && isPension(b)).reduce((s2, b) => s2 + Math.max(0, (draws[b.id] || 0) - penNonTax(b)), 0);
     // 세금이 적은 순서로 단계를 나눠 꺼낸다
     // 1: 현금·일반·ISA  2: 연금수령 요건을 채운 연금계좌 (한도 안, 사적연금 1,500만원 이하)  3: 한도 안 1,500만원 초과
     // 4: 연금수령한도 초과 (16.5%)  5: 55세 전·가입 5년 전 연금계좌 (16.5%)
@@ -1303,7 +1403,7 @@ function simulateGroup(input, G) {
       if (!isPension(a)) { if (t === 1) return Math.max(0, av - reserveOf(a)); return t === 6 && isCash(a) ? av : 0; } // 6: 최소 잔액까지 쓰기
       const pi = penInfo(id);
       if (!pi.eligible) return t === 5 ? av : 0;
-      if (t === 2) return Math.max(0, Math.min(av, pi.limit - cur, A.pensionSepLimit * PR - ownerPenDraw(a.owner)));
+      if (t === 2) return Math.max(0, Math.min(av, pi.limit - cur, Math.max(0, penNonTax(a) - cur) + Math.max(0, A.pensionSepLimit * PR - ownerPrivDraw(a.owner))));
       if (t === 3) return Math.max(0, Math.min(av, pi.limit - cur));
       if (t === 4) return av;
       return 0;
@@ -1483,7 +1583,7 @@ function simulateGroup(input, G) {
       const own = accts.filter(a => a.owner === m.id && !a.closed && !a.frozen); // 아직 개설 전인 계좌도 함께 멈춘다
       const left = own.reduce((s2, a) => s2 + (a.open ? a.balance : 0), 0);
       own.forEach(a => { a.frozen = true; });
-      evt(`${m.name} 계획 끝 (${m.deathAge}세) · 남은 금융자산 ${fmtW(left)}`, m.id);
+      evtA(`${m.name} 계획 끝 (${m.deathAge}세) · 남은 금융자산 {A}`, left, m.id);
       row.ended = (row.ended || []).concat([{ id: m.id, age: m.deathAge, left }]);
     }
   }
@@ -1577,6 +1677,9 @@ function presentTargetsFlow(total, targets, years, flows = [], mode = "target", 
     const alloc = S => {
       const y = {}; let used = 0;
       for (const k of keys) { const need = W[k] * S / G[k]; y[k] = Math.max(minNow[k] || 0, Math.min(cur[k] || 0, need)); used += y[k]; }
+      // 고정(최소 보유)이 지금 가진 것보다 많으면 그 돈은 다른 종목을 팔아 마련한다 (합계가 총액을 넘지 않게)
+      if (used > total + 1e-6) { const fx = keys.map(k => [k, y[k] - (minNow[k] || 0)]).filter(e => e[1] > 0); const fs = fx.reduce((s2, e) => s2 + e[1], 0);
+        if (fs > 0) { const f = Math.min(1, (used - total) / fs); for (const [k, v] of fx) y[k] -= v * f; used -= fs * f; } }
       let L = Math.max(0, total - used);
       const gap = Object.fromEntries(keys.map(k => [k, Math.max(0, W[k] * S / G[k] - y[k])])); const gs = keys.reduce((s, k) => s + gap[k], 0);
       if (gs > 0) { const f = Math.min(1, L / gs); for (const k of keys) y[k] += gap[k] * f; L -= gs * f; }
@@ -1927,9 +2030,16 @@ function fmtA(n,o){o=o||{};const c=unitCfg();const v=(+n||0)/(c.u==="eok"?1e8:1e
 function eok(n){return fmtA(n);}
 // 월 금액처럼 작은 금액: 억원 단위 설정이어도 1억 미만은 만원으로 (월 0.005억원 → 월 50만원)
 function monthMan(){return (S.settings||{}).monthMan!==false;}   // 설정: 억원 단위일 때 월 금액은 만원으로 (기본 켬)
-function fmtM(n,o){o=o||{};const c=unitCfg();const x=+n||0;if(c.u!=="eok"||!monthMan()||Math.abs(x)>=1e8)return fmtA(n,o);
+function fmtM(n,o){o=o||{};const c=unitCfg();const x=+n||0;if(c.u!=="eok"||Math.abs(x)>=1e8)return fmtA(n,o);
+  if(!monthMan()){const t=fmtA(n,o);if(/[1-9]/.test(t)||Math.abs(x)<500)return t;}   // 억원으로 0처럼 보이는 작은 금액은 만원으로
   const v=x/1e4,a=Math.abs(v);const s=a<10&&a%1>0.05?a.toLocaleString("ko-KR",{maximumFractionDigits:1}):nf.format(Math.round(a));
   if(!/[1-9]/.test(s)&&o.dash)return "–";return (v<=-0.05?"-":o.plus&&v>=0.05?"+":"")+s+"만"+(o.bare?"":"원");}
+// 화면에 0이 아닌 값으로 보이는 금액인지 (단위·소수 자리 설정 기준): 0으로 보일 줄은 빼고, 보이는 줄은 빼지 않는다
+function shows(n){return /[1-9]/.test(fmtA(n));}
+// 표시된 금액 문자열을 원으로 되돌림 (예: "1,234만원" → 12,340,000)
+function wonOf(t){const m=String(t).replace(/[,+원\s]/g,"").match(/^(-?[\d.]+)(억|만)/);return m?+m[1]*(m[2]==="억"?1e8:1e4):NaN;}
+// "월 X × N개월": 반올림한 월 금액에 개월 수를 곱해 합계와 다르게 보이면 ‘약’을 붙인다
+function monthX(total,mN){const s=fmtM(total/mN);return `월 ${fmtA(wonOf(s)*mN)===fmtA(total)?"":"약 "}${s} × ${mN}개월`;}
 // 입력 칸에 넣는 숫자: 천 단위 쉼표 (소수점은 그대로)
 const fmtIn=v=>v==null||v===""?"":isFinite(+v)?(+v).toLocaleString("ko-KR",{maximumFractionDigits:6}):esc(v);
 function pct(x,d=1){if(!isFinite(x))return "–";return (x>0?"+":"")+(x*100).toFixed(d)+"%";}
@@ -1938,11 +2048,16 @@ function money(n,cur){return cur==="USD"?"$"+nf2.format(n||0):nf.format(Math.rou
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function today(){const d=new Date();const k=new Date(d.getTime()+9*3600e3);return k.toISOString().slice(0,10);}
 function daysAgo(iso){if(!iso)return Infinity;const a=new Date(iso.slice(0,10)+"T00:00:00+09:00"),b=new Date(today()+"T00:00:00+09:00");return Math.round((b-a)/864e5);}
-function num(v){const n=parseFloat(String(v).replace(/,/g,""));return isFinite(n)?n:0;}
+function numStr(v){return String(v??"").replace(/[,\s₩$€¥£]|원$/g,"");}
+function num(v){const n=parseFloat(numStr(v));return isFinite(n)?n:0;}
+// 입력칸 값이 비어 있지 않은데 숫자로 읽을 수 없으면 true
+function badNum(v){const t=numStr(v);return t!==""&&!isFinite(parseFloat(t));}
 function tkey(t){return String(t||"").trim().toUpperCase();}
 
 /* ---------- computation ---------- */
-function fx(){return num(S.settings.usdkrw)||0;}
+const FX_MIN=500,FX_MAX=3000;   // USD/KRW로 받아들일 범위 (이 밖이면 잘못 읽은 값으로 본다)
+// 환율: 받아들일 범위 밖의 값(예전 버전·다른 기기에서 잘못 들어온 값)은 없는 것으로 본다 → 환율 안내가 뜨고 기록·배분을 멈춘다
+function fx(){const v=num(S.settings.usdkrw);return v>=FX_MIN&&v<=FX_MAX?v:0;}
 function priceInfo(h){const p=S.prices[tkey(h.ticker)];
   if(p&&num(p.price)>0)return{price:num(p.price),asOf:p.asOf,src:p.source,missing:false,prevClose:num(p.prevClose)};
   return{price:num(h.avgPrice),missing:true};}
@@ -2011,14 +2126,29 @@ async function initDb(){
   if(!db){S.dbState="none";render();return;}
   S.dbRaw=db;S.db=hookDb(db);S.dbState="ok";
   const onErr=e=>{if(e&&e.code==="revoked"){S.dbState="none";render();}};
-  const sub=(col,key)=>db.collection(col).onSnapshot(snap=>{const o={};snap.docs.forEach(d=>{o[d.id]={...d.data(),id:d.id};});S[key]=o;S.loaded[key]=true;if(key==="holdingsRaw"||key==="assets")hydrate();render();},onErr);
+  const sub=(col,key)=>db.collection(col).onSnapshot(snap=>{const o={};snap.docs.forEach(d=>{o[d.id]={...d.data(),id:d.id};});applyOrdPend(col,o);S[key]=o;S.loaded[key]=true;if(key==="holdingsRaw"||key==="assets")hydrate();render();},onErr);
   S.loaded={};
   sub("accounts","accounts");sub("holdings","holdingsRaw");sub("prices","prices");sub("assets","assets");
-  db.doc("settings/main").onSnapshot(d=>{S.settings=d.exists?{...d.data()}:{};S.loaded.settings=true;render();},onErr);
-  db.doc("plan/main").onSnapshot(d=>{S.plan=d.exists?JSON.parse(JSON.stringify(d.data())):null;S.planExists=!!d.exists;S.planLoaded=true;S.simCache.key=null;render();},onErr);
+  db.doc("settings/main").onSnapshot(d=>{const v=d.exists?{...d.data()}:{};S.settingsServer=v;
+    if(S.setPend>0&&docHash(v)!==S.setLastHash)return;   // 저장 중에 도착한 앞선 저장의 메아리: 무시 (마지막 저장 내용과 같은 것만 받는다)
+    S.settings=v;S.loaded.settings=true;render();},onErr);
+  db.doc("plan/main").onSnapshot(d=>{const v=d.exists?JSON.parse(JSON.stringify(d.data())):null;S.planServer=v;S.planServerExists=!!d.exists;
+    if(S.planPend>0&&(v?docHash(v):"")!==S.planLastHash)return;
+    S.plan=v?JSON.parse(JSON.stringify(v)):null;if(S.plan)PL();S.planExists=!!d.exists;S.planLoaded=true;S.simCache.key=null;render();},onErr);
   db.collection("snapshots").orderBy("date","desc").limit(1000).onSnapshot(snap=>{S.snapshots=snap.docs.map(d=>d.data()).sort((a,b)=>String(a.date).localeCompare(String(b.date)));const first=!S.loaded.snapshots;S.loaded.snapshots=true;if(first||S.tab==="home"||S.tab==="trend")render();},onErr);   // 기록을 보여 주는 화면일 때만 다시 그린다
-  db.doc("sync/base").onSnapshot(d=>{S.syncBase=d.exists?d.data():null;render();},onErr);
+  db.doc("sync/base").onSnapshot(d=>{const v=d.exists?d.data():null;S.syncBase=v&&v.h?{...v,h:KSync.unpackBase(v.h)}:v;render();},onErr);
 }
+// 수정 시각을 뺀 내용 비교용
+function docHash(v){if(!v)return "";const {updatedAt:_u,...r}=v;return KSync.hash(r);}
+// 목록 순서 바꾸기: 저장이 끝날 때까지 이 기기에서 정한 순서를 지킨다
+S.ordPend={accounts:{},holdings:{},assets:{}};
+function applyOrdPend(col,o){const pend=S.ordPend[col];if(!pend)return;for(const id in pend){const d=o[id];if(!d){delete pend[id];continue;}if(d.order===pend[id])delete pend[id];else o[id]={...d,order:pend[id]};}}
+// 설정 문서는 한 번에 하나씩 순서대로 쓴다. 실패하면 화면을 저장소 내용으로 되돌린다
+S.setPend=0;S.setLastHash="";let setQ=Promise.resolve();
+function writeSettings(obj,msg){S.settings=obj;S.setPend++;S.setLastHash=docHash(obj);const snap={...obj,updatedAt:new Date().toISOString()};
+  const q=setQ.then(async()=>{const ok=await write(db=>db.doc("settings/main").set(snap),msg);S.setPend--;
+    if(!ok&&!S.setPend&&S.settingsServer){S.settings={...S.settingsServer};S.simCache.key=null;render();toast("설정을 저장하지 못해 되돌렸습니다. 다시 시도하세요",5000);}return ok;});
+  setQ=q.catch(()=>{});return q;}
 async function write(fn,okMsg){if(!S.db){toast("저장소에 연결되지 않았습니다");return false;}
   try{await fn(S.db);if(okMsg)toast(okMsg);return true;}
   catch(e){const c=e&&e.code;
@@ -2027,9 +2157,21 @@ async function write(fn,okMsg){if(!S.db){toast("저장소에 연결되지 않았
 function newId(p){return p+Date.now().toString(36)+Math.random().toString(36).slice(2,6);}
 
 /* ---------- UI helpers ---------- */
+// 입력 중인 값 지키기: 가격·동기화 등으로 화면을 다시 그려도 사용자가 쓰고 있던 값과 커서를 되살린다.
+// 저장되면(값이 같아지면) 버린다. 곧바로 저장되는 칸은 바꾸기(change) 때 버리고, 버튼으로 저장하는 양식(가정·환율 등)은 그 버튼에서 버린다
+S.draft={};
+const DRAFT_BTN=/^#(as|sFx|sGcid)/;
+function inKey(e){if(!e||!e.matches||!e.matches("input,textarea,select")||/^(checkbox|radio|file|button|submit)$/.test(e.type))return null;
+  if(e.id)return "#"+CSS.escape(e.id);for(const a of e.attributes)if(a.name.startsWith("data-"))return `[${a.name}="${CSS.escape(a.value)}"]`;return null;}
+function clearDraft(prefix){for(const k in S.draft)if(k.startsWith(prefix))delete S.draft[k];}
+function restoreDrafts(actKey,sel){
+  for(const k in S.draft){const el=app.querySelector(k);if(!el)continue;if(el.value===S.draft[k]){delete S.draft[k];continue;}el.value=S.draft[k];}
+  if(actKey){const el=app.querySelector(actKey);if(el&&document.activeElement!==el){try{el.focus({preventScroll:true});if(sel)el.setSelectionRange(sel[0],sel[1]);}catch(e){}}}}
 const app=document.getElementById("app");
-let toastT;function toast(m){let t=document.querySelector(".toast");if(!t){t=document.createElement("div");t.className="toast";t.setAttribute("role","status");document.body.appendChild(t);}t.textContent=m;t.hidden=false;clearTimeout(toastT);toastT=setTimeout(()=>{t.hidden=true;},2200);}
-function setTab(t){S.tab=t;S.openAcct=null;S.reorder=null;S.memberView=null;try{localStorage.setItem("rf.tab",t);}catch(e){}render();window.scrollTo(0,0);}
+app.addEventListener("input",e=>{const k=inKey(e.target);if(k)S.draft[k]=e.target.value;},true);
+app.addEventListener("change",e=>{const k=inKey(e.target);if(k&&!DRAFT_BTN.test(k))delete S.draft[k];},true);
+let toastT;function toast(m,ms){let t=document.querySelector(".toast");if(!t){t=document.createElement("div");t.className="toast";t.setAttribute("role","status");document.body.appendChild(t);}t.textContent=m;t.hidden=false;clearTimeout(toastT);toastT=setTimeout(()=>{t.hidden=true;},ms||2200);}
+function setTab(t){S.draft={};S.tab=t;S.openAcct=null;S.reorder=null;S.memberView=null;try{localStorage.setItem("rf.tab",t);}catch(e){}render();window.scrollTo(0,0);}
 document.querySelectorAll("nav.tabs button").forEach(b=>b.addEventListener("click",()=>setTab(b.dataset.tab)));
 
 function sparkline(points){if(points.length<2)return "";
@@ -2042,8 +2184,12 @@ function sparkline(points){if(points.length<2)return "";
    <path d="${d}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/>
    <circle cx="${last[0]}" cy="${last[1]}" r="3.5" fill="var(--accent)"/></svg>`;}
 
-function freshness(){const ps=Object.values(S.prices).filter(p=>p.asOf);if(!ps.length)return null;
-  return ps.map(p=>p.asOf).sort().pop();}
+// 가격 날짜: 지금 보유한 종목의 가격 중 가장 오래된 날과 가장 최근 날 (보유가 없으면 모든 가격). 같은 날이면 한 날짜
+function priceDates(){const held=new Set(Object.values(S.holdings).filter(h=>num(h.qty)>0).map(h=>tkey(h.ticker)));
+  let ps=Object.entries(S.prices).filter(([k,p])=>p&&p.asOf&&held.has(k)).map(([,p])=>p.asOf);if(!ps.length)ps=Object.values(S.prices).filter(p=>p&&p.asOf).map(p=>p.asOf);
+  if(!ps.length)return null;ps.sort();return{old:ps[0],now:ps[ps.length-1]};}
+function freshness(){const d=priceDates();return d?d.now:null;}
+function priceDateTxt(){const d=priceDates();if(!d)return "";return d.old===d.now?d.now:`${d.old}~${d.now.slice(d.old.slice(0,4)===d.now.slice(0,4)?5:0)}`;}
 
 /* ---------- views ---------- */
 function vHome(){
@@ -2051,14 +2197,15 @@ function vHome(){
   if(!accts.length)return vOnboard();
   const pl=t.invested-t.cost;const plr=t.cost>0?pl/t.cost:0;
   let h=`<section class="hero" aria-label="총 자산">
-    <span class="label">총 평가액${freshness()?` · ${esc(freshness())} 가격 기준`:""}</span>
+    <span class="label">총 평가액${priceDates()?` · ${esc(priceDateTxt())} 가격 기준`:""}</span>
     <span class="total">${eok(t.total)}</span>
     <span class="pl ${cls(pl)}">평가손익 ${fmtA(pl,{plus:true})} (${pct(plr,2)})</span>
     ${(()=>{const fe=memberExp("__all");return fe?`<span class="meta">예상 연수익률 <b>${expTxt(fe.r)}</b> · 배당·분배 ${expTxt(fe.dy)} · 수익률 ${esc(scenLabel())}</span>`:"";})()}
+    ${fx()&&Object.values(S.holdings).some(h=>h.currency==="USD"&&num(h.qty)>0)?`<span class="meta">달러 종목 손익은 환율 변동분을 빼고 계산합니다 (매입가도 지금 환율로 환산)</span>`:""}
     ${S.snapshots.length>1?`<button type="button" class="spark-btn" data-go="trend" aria-label="평가액 추이 보기">${sparkline(S.snapshots.slice(-120))}</button>`:""}
     </section>`;
   h+=planSummaryCard();
-  if(needsFx())h+=`<div class="banner">달러 자산이 있는데 환율이 비어 있습니다. <button class="btn small" data-go="settings">환율 입력</button></div>`;
+  if(needsFx())h+=`<div class="banner">달러 자산이 있는데 환율이 ${num(S.settings.usdkrw)?"맞지 않습니다(":"비어 있습니다"}${num(S.settings.usdkrw)?`${esc(S.settings.usdkrw)})`:""}. 달러 자산을 0원으로 계산하고 있습니다. <button class="btn small" data-go="settings">환율 입력</button></div>`;
   const missing=Object.values(S.holdings).filter(x=>priceInfo(x).missing).length;
   if(missing)h+=`<div class="banner">${missing}개 종목에 현재가가 없어 매입가로 계산했습니다. <button class="btn small" data-go="prices">가격 확인</button></div>`;
 
@@ -2158,8 +2305,8 @@ function vMemberView(){
     ${(()=>{const e=memberExp(mv);return e?`<span class="meta">예상 연수익률 <b>${expTxt(e.r)}</b> · 배당·분배 ${expTxt(e.dy)} · 계좌 평가액 가중평균 · 수익률 ${esc(scenLabel())}</span>`:"";})()}</section>`;
   if(!con.list.length&&!con.cash)return h+`<div class="card empty">보유 종목이 없습니다.</div>`;
   const top=con.list.slice(0,TK_COLORS.length);const restV=con.list.slice(TK_COLORS.length).reduce((s,x)=>s+x.value,0)+con.cash;
-  h+=`<section class="card"><h2>종목 비중</h2><div class="bar">${top.map((x,i)=>`<span style="width:${con.total?x.value/con.total*100:0}%;background:${TK_COLORS[i]}"></span>`).join("")}${restV>0?`<span style="width:${restV/con.total*100}%;background:var(--line)"></span>`:""}</div>
-    <div class="legend">${top.map((x,i)=>`<span><i style="background:${TK_COLORS[i]}"></i>${esc(x.name||x.ticker)} ${(x.value/con.total*100).toFixed(1)}%</span>`).join("")}${restV>0?`<span><i style="background:var(--line)"></i>${con.list.length>TK_COLORS.length?"그 외·":""}예수금 ${(restV/con.total*100).toFixed(1)}%</span>`:""}</div>
+  h+=`<section class="card"><h2>종목 비중</h2><div class="bar">${top.map((x,i)=>`<span style="width:${con.total?x.value/con.total*100:0}%;background:${TK_COLORS[i]}"></span>`).join("")}${restV>0?`<span style="width:${con.total?restV/con.total*100:0}%;background:var(--line)"></span>`:""}</div>
+    <div class="legend">${top.map((x,i)=>`<span><i style="background:${TK_COLORS[i]}"></i>${esc(x.name||x.ticker)} ${con.total?(x.value/con.total*100).toFixed(1)+"%":"–"}</span>`).join("")}${restV>0?`<span><i style="background:var(--line)"></i>${con.list.length>TK_COLORS.length?"그 외·":""}예수금 ${con.total?(restV/con.total*100).toFixed(1)+"%":"–"}</span>`:""}</div>
     <div class="list">${con.list.map(x=>conRow(x,con.total,true)).join("")}${con.cash?`<div class="item conrow"><div class="row"><div class="l"><span class="name">예수금</span><span class="meta">계좌 안 현금</span></div><div class="r"><b>${(con.cash/con.total*100).toFixed(1)}%</b><span class="meta">${eok(con.cash)}</span></div></div><div class="wbar"><span style="width:${(con.cash/con.total*100).toFixed(2)}%;background:var(--muted)"></span></div></div>`:""}</div></section>`;
   const classes=CLASSES.filter(c=>con.byClass[c]>0);
   h+=`<section class="card"><h2>자산군 배분</h2><div class="bar">${classes.map(c=>`<span style="width:${con.byClass[c]/con.total*100}%;background:${CLASS_COLOR[c]}"></span>`).join("")}</div>
@@ -2186,6 +2333,7 @@ function vAccountDetail(a){const st=acctStats(a);const pl=st.value-st.cost;const
   <span class="total">${eok(st.total)}</span>
   <div class="kv"><div><span>평가손익</span><b class="${cls(pl)}">${fmtA(pl,{plus:true})}</b></div><div><span>수익률</span><b class="${cls(r)}">${pct(r,2)}</b></div><div><span>${a.type==="생활비"?"현금 잔액":"예수금"}</span><b>${eok(st.cash)}</b></div></div>
   ${(()=>{const e=acctExp(a);return `<span class="meta">예상 연수익률 <b>${expTxt(e.r)}</b> · 배당·분배 ${expTxt(e.dy)} · ${e.override?`계좌 계획에서 직접 넣은 값 ${expTxt(e.base)}`:`종목 가중평균 ${expTxt(e.auto)}`}${Math.abs(e.adj)>=0.005?` · ${esc(retScen().name)} 보정 ${adjTxt(e.adj)}`:""}</span>`;})()}
+  ${st.hs.some(h=>h.currency==="USD")&&fx()?`<span class="meta">달러 종목은 매입가도 지금 환율(${nf2.format(fx())}원${S.settings.fxAsOf?`, ${esc(S.settings.fxAsOf)}`:""})로 바꿔 계산해, 평가손익·수익률에 환율 변동분은 들어 있지 않습니다.</span>`:""}
   ${a.memo?`<span class="meta">${esc(a.memo)}</span>`:""}</section>
   <section class="card"><div class="row"><h2>보유 종목</h2><div class="btns">${st.hs.length>1?`<button class="btn small${S.reorder==="holds"?" primary":""}" id="reorderHolds">${S.reorder==="holds"?"완료":"순서 변경"}</button>`:""}${S.reorder==="holds"?"":`<button class="btn small primary" id="addHold">종목 추가</button>`}</div></div>
   ${st.hs.length?`<div class="list">${st.hs.map((x,i)=>S.reorder==="holds"?`<div class="item"><div class="row"><div class="l"><span class="name">${esc(x.name||x.ticker)}</span><span class="meta">${esc(x.ticker)} · ${eok(hVal(x))}</span></div><div class="mvb"><button class="btn small" data-mv="hold" data-id="${esc(x.id)}" data-dir="-1" aria-label="${esc(x.name||x.ticker)} 위로"${i===0?" disabled":""}>↑</button><button class="btn small" data-mv="hold" data-id="${esc(x.id)}" data-dir="1" aria-label="${esc(x.name||x.ticker)} 아래로"${i===st.hs.length-1?" disabled":""}>↓</button></div></div></div>`:holdingRow(x,hVal(x),false)).join("")}</div>`:`<div class="empty">아직 종목이 없습니다.</div>`}</section>`;
@@ -2208,7 +2356,7 @@ function vPrices(){
   if(!rows.length)return h+`<section class="card empty">관심 있는 ETF와 종목을 추가하세요. 계좌에 종목을 넣을 때 이 목록에서 고릅니다.<button class="btn primary" id="addAsset2">첫 종목 추가</button></section>`;
   h+=`<p class="hint" style="margin:0">${ro?"화살표로 순서를 바꿉니다.":`종목을 누르면 현재가와 은퇴 계획에 쓸 예상 수익률을 정합니다. 계좌에 보유 중인 종목은 삭제할 수 없습니다.${fx()?` · USD/KRW ${nf2.format(fx())}`:""}`}</p>`;
   h+=`<section class="card"><div class="list">${rows.map((r,i)=>{const p=S.prices[r.ticker];const age=p?daysAgo(p.asOf):Infinity;
-    const badge=!p?'<span class="chip warn">가격 없음</span>':age<=0?'<span class="chip acc">오늘</span>':age<=3?`<span class="chip">${age}일 전</span>`:`<span class="chip warn">${age}일 전</span>`;
+    const badge=!p?'<span class="chip warn">가격 없음</span>':!isFinite(age)?'<span class="chip warn">날짜 없음</span>':age<=0?'<span class="chip acc">오늘</span>':age<=3?`<span class="chip">${age}일 전</span>`:`<span class="chip warn">${age}일 전</span>`;
     const chg=p&&num(p.prevClose)>0?(num(p.price)-num(p.prevClose))/num(p.prevClose):null;
     const ex=expOf(r.ticker,r.assetClass);
     const left=`<div class="l"><span class="name">${esc(r.name||r.ticker)} ${r.held?`<span class="chip acc">보유 ${nf2.format(r.held.qty)}주</span>`:""}</span><span class="meta">${esc(r.ticker)} · ${esc(r.assetClass||"기타")} · ${esc(r.currency||"KRW")}</span><span class="meta">예상 수익률 <b class="${ex.autoR?"":"accent"}">${nf2.format(ex.r)}%</b>${ex.autoR?" (기본값)":""} · 배당 ${nf2.format(ex.dy)}%${r.assetClass==="주식"||r.assetClass==="혼합"?` · ${esc(RET_STYLE[styleOf(r)][0])}`:""}</span></div>`;
@@ -2232,7 +2380,7 @@ function vSettings(){const s=S.settings;const uc=unitCfg();const ex=1234567890;
    ${minCashSection()}
    ${retSection()}
    <section class="card"><h2>환율</h2>
-   <div class="field"><label for="sFx">USD/KRW 환율</label><input id="sFx" inputmode="decimal" value="${s.usdkrw?esc(s.usdkrw):""}" placeholder="예: 1,385.5"><span class="hint">달러 ETF 평가액을 원화로 환산할 때 씁니다. 매입 원가도 같은 환율로 환산하므로 환차손익은 수익률에 반영되지 않습니다.</span></div>
+   <div class="field"><label for="sFx">USD/KRW 환율</label><input id="sFx" inputmode="decimal" value="${s.usdkrw?esc(s.usdkrw):""}" placeholder="예: 1,385.5"><span class="hint">${s.fxAsOf?`<b${daysAgo(s.fxAsOf)>7?' class="up"':""}>${esc(s.fxAsOf)} 기준</b>${daysAgo(s.fxAsOf)>7?` (${daysAgo(s.fxAsOf)}일 전)`:""}. `:""}달러 ETF 평가액을 원화로 환산할 때 씁니다. 매입 원가도 같은 환율로 환산하므로 환차손익은 수익률에 반영되지 않습니다.</span></div>
    <button class="btn primary" id="saveSettings">저장</button></section>
    ${gdSection()}
    ${dataSection()}`;}
@@ -2309,9 +2457,18 @@ function sheetCsv(list){const rows=["symbol,price,closeyest,tradetime,currency,n
   list.forEach((w,i)=>{const r=i+2;const f=a=>`"=GOOGLEFINANCE(A${r}${a?`,""${a}""`:""})"`;rows.push([gfSymbol(w),f(""),f("closeyest"),f("tradetime"),f("currency"),f("name")].join(","));});
   rows.push(`CURRENCY:USDKRW,"=GOOGLEFINANCE(A${list.length+2})",,,,`);return rows.join("\n");}
 // "2026. 9. 23 오후 3:30:06"(한국어) 또는 "9/23/2026 15:30:06"(영어) → 2026-09-23
-function gfDate(s){s=String(s||"");let m=s.match(/(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})/);if(m)return `${m[1]}-${m[2].padStart(2,"0")}-${m[3].padStart(2,"0")}`;
-  m=s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);if(m)return `${m[3]}-${m[1].padStart(2,"0")}-${m[2].padStart(2,"0")}`;m=s.match(/(\d{4})-(\d{2})-(\d{2})/);return m?m[0]:null;}
-function gfNum(s){const v=parseFloat(String(s||"").replace(/,/g,""));return isFinite(v)?v:null;}
+// 날짜 문자열 → YYYY-MM-DD. 없는 날짜(13월 등)는 버린다. 일/월 순서가 모호하면(둘 다 12 이하) 오늘에 가까운 지난 날짜로
+function ymd(y,mo,d){y=+y;mo=+mo;d=+d;if(y<100)y+=2000;if(!(mo>=1&&mo<=12&&d>=1&&d<=31))return null;const dt=new Date(Date.UTC(y,mo-1,d));if(dt.getUTCMonth()!==mo-1)return null;return dt.toISOString().slice(0,10);}
+function gfDate(s){s=String(s||"");let m=s.match(/(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})/);if(m)return ymd(m[1],m[2],m[3]);
+  m=s.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);if(m)return ymd(m[1],m[2],m[3]);
+  m=s.match(/(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})/);if(!m)return null;
+  const cands=[ymd(m[3],m[1],m[2]),ymd(m[3],m[2],m[1])].filter(Boolean);if(!cands.length)return null;
+  const t=Date.parse(today()+"T00:00:00Z"),score=d=>{const x=(t-Date.parse(d+"T00:00:00Z"))/864e5;return x<-1?1e9:Math.abs(x);};
+  return cands.sort((a,b)=>score(a)-score(b))[0];}
+// 시트 숫자 읽기: 1,234.5(영미식)·1.234,5 / 510,50(유럽식)·통화 기호·공백
+function gfNum(s){let t=String(s??"").replace(/[\s₩$€£¥원]/g,"");if(!t)return null;
+  if(/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(t)||/^-?\d+,\d{1,2}$/.test(t))t=t.replace(/\./g,"").replace(",",".");else t=t.replace(/,/g,"");
+  if(!/^-?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(t))return null;const v=parseFloat(t);return isFinite(v)?v:null;}
 async function gdFolder(){const id=(S.settings||{}).gFolderId;if(id)return id;
   const f0=await gdFindFolder();if(f0){await saveRet({gFolderId:f0});return f0;}
   const f=await gdCall("create_file",{title:"Kinfolio",contentMimeType:"application/vnd.google-apps.folder"});
@@ -2339,27 +2496,36 @@ async function gdPrices(){let sid=(S.settings||{}).gSheetId;
   let rows;try{rows=await gdSheetRows(sid);}
   catch(e){if(e&&e.code==="tool_error"){await gdMakeSheet();sid=(S.settings||{}).gSheetId;rows=await gdSheetRows(sid);}else throw e;}
   const wl=watchList();const bySym=Object.fromEntries(wl.map(w=>[gfSymbol(w),w]));
-  let n=0,fxv=null;const miss=[];const now=new Date().toISOString();const writes=[];
+  let n=0,fxv=null,fxBad=null;const miss=[],curBad=[],noDate=[],big=[];const now=new Date().toISOString();const writes=[];const seen=new Set();
   for(const [sym,price,prev,tt,cur,gname] of rows){
-    if(sym==="CURRENCY:USDKRW"){fxv=gfNum(price);continue;}
+    if(sym==="CURRENCY:USDKRW"){const f=gfNum(price);if(f>0)fxv=f;continue;}
     const w=bySym[sym]||wl.find(x=>tkey(x.ticker)===String(sym).split(":").pop());if(!w)continue;
-    const t=tkey(w.ticker),v=gfNum(price);if(!(v>0)){miss.push(w.name||t);continue;}
+    const t=tkey(w.ticker);if(seen.has(t))continue;seen.add(t);   // 같은 종목이 두 줄이면 첫 줄만
+    const v=gfNum(price);if(!(v>0)){miss.push(w.name||t);continue;}
+    // 시트가 알려 준 통화가 종목 통화와 다르면(다른 거래소 상장분을 읽음 등) 저장하지 않는다
+    const sc=String(cur||"").trim().toUpperCase();const wc=w.currency||"KRW";
+    if(/^[A-Z]{3}$/.test(sc)&&sc!==wc){curBad.push(`${w.name||t}(시트 ${sc}, 종목 ${wc})`);continue;}
     const p0=S.prices[t]||{};const {id:_i,...keep}=p0;const pv=gfNum(prev);
-    const data={...keep,name:p0.name||w.name||gname||t,price:v,currency:cur||w.currency||"KRW",asOf:gfDate(tt)||today(),source:"구글 시트 (GOOGLEFINANCE)",updatedAt:now};
-    if(pv>0)data.prevClose=pv;n++;
+    let asOf=gfDate(tt);if(!asOf){if(v===num(p0.price)&&p0.asOf)asOf=p0.asOf;else{asOf=today();noDate.push(w.name||t);}}   // 기준 시각이 없으면: 값이 그대로면 예전 기준일, 바뀌었으면 오늘로 적고 알린다
+    const data={...keep,name:p0.name||w.name||gname||t,price:v,currency:wc,asOf,source:"구글 시트 (GOOGLEFINANCE)",updatedAt:now};
+    if(pv>0)data.prevClose=pv;else delete data.prevClose;   // 전일 종가를 못 읽으면 예전 값을 남기지 않는다 (틀린 등락률 방지)
+    if(num(p0.price)>0&&Math.abs(v/num(p0.price)-1)>0.3)big.push(`${w.name||t} ${pct(v/num(p0.price)-1,0)}`);
+    n++;
     const k=o=>[o.price,o.prevClose,o.asOf,o.currency,o.name,o.source].join("|");if(k(p0)!==k(data))writes.push(["prices/"+t,data]);}   // 그대로인 가격은 다시 쓰지 않는다
   const fail=await pool(writes,8,([p,v])=>S.db.doc(p).set(v));if(fail)throw{code:"tool_error",message:`가격 ${fail}건을 저장하지 못했습니다`};
-  const fx2=fxv>0?Math.round(fxv*100)/100:null;
-  if(fx2&&(fx2!==num((S.settings||{}).usdkrw)||(S.settings||{}).fxAsOf!==today()))await saveRet({usdkrw:fx2,fxAsOf:today()});
+  let fx2=fxv>0?Math.round(fxv*100)/100:null;const fx0=fx();   // 저장된 값이 범위 밖이면 비교 기준으로 쓰지 않는다 (시트의 올바른 값으로 고칠 수 있게)
+  // 환율 확인: 있을 수 없는 값이거나 저장된 값에서 15% 넘게 달라지면 저장하지 않는다 (시트 형식 오류 등)
+  if(fx2&&(!(fx2>=FX_MIN&&fx2<=FX_MAX)||(fx0>0&&Math.abs(fx2/fx0-1)>0.15))){fxBad=fx2;fx2=null;}
+  if(fx2&&(fx2!==fx0||(S.settings||{}).fxAsOf!==today()))await saveRet({usdkrw:fx2,fxAsOf:today()});
   const sheetT=(S.settings||{}).gSheetTickers||[];const notIn=wl.filter(w=>!sheetT.includes(tkey(w.ticker))&&!bySym[gfSymbol(w)]&&!rows.some(x=>x[0]===gfSymbol(w)));
-  return {n,changed:writes.length,fx:fxv,miss,notIn:notIn.map(w=>w.name||w.ticker)};}
-async function gdBackup(){const f=await gdCreate({title:`Kinfolio 백업 ${today()} ${new Date(Date.now()+9*3600e3).toISOString().slice(11,16).replace(":","-")}.json`,contentMimeType:"application/json",disableConversionToGoogleType:true,textContent:JSON.stringify(exportDoc())});
+  return {n,changed:writes.length,fx:fx2,fxBad,fxOld:fx0,miss,curBad,noDate,big,notIn:notIn.map(w=>w.name||w.ticker)};}
+async function gdBackup(){const f=await gdCreate({title:`Kinfolio 백업 ${today()} ${new Date(Date.now()+9*3600e3).toISOString().slice(11,16).replace(":","-")}.json`,contentMimeType:"application/json",disableConversionToGoogleType:true,textContent:JSON.stringify(await exportDocFull())});
   if(!f||!f.id)throw{code:"tool_error",message:"백업 파일을 만들지 못했습니다"};saveRet({gLastBackup:new Date().toISOString()});return f;}
 async function gdBackups(){return gdBackupsIn((S.settings||{}).gFolderId);}
 async function gdBackupsIn(fid){if(!fid)return [];
   const r=await gdCall("search_files",{query:`parentId = '${fid}' and mimeType = 'application/json' and title contains 'Kinfolio 백업'`,excludeContentSnippets:true,pageSize:30});
   return ((r&&r.files)||[]).sort((a,b)=>String(b.createdTime).localeCompare(String(a.createdTime)));}
-function gdPriceMsg(r){return `가격 ${r.n}개${r.changed!=null&&r.changed<r.n?`(바뀐 것 ${r.changed}개)`:""}${r.fx?` · 환율 ${nf2.format(r.fx)}`:""}를 가져왔습니다.${r.miss.length?` 가격이 나오지 않은 종목: ${r.miss.join(", ")} (시트에서 종목 코드를 확인하세요).`:""}${r.notIn.length?` 시트에 없는 종목: ${r.notIn.join(", ")} → ‘시트 다시 만들기’를 누르세요.`:""}`;}
+function gdPriceMsg(r){return `가격 ${r.n}개${r.changed!=null&&r.changed<r.n?`(바뀐 것 ${r.changed}개)`:""}${r.fx?` · 환율 ${nf2.format(r.fx)}`:""}를 가져왔습니다.${r.miss.length?` 가격이 나오지 않은 종목: ${r.miss.join(", ")} (시트에서 종목 코드를 확인하세요).`:""}${(r.curBad||[]).length?` 통화가 달라 저장하지 않은 종목: ${r.curBad.join(", ")} (다른 거래소 가격일 수 있습니다. 종목 코드를 확인하세요).`:""}${r.fxBad?` 시트의 환율 ${nf2.format(r.fxBad)}이 ${r.fxOld?`지금 값 ${nf2.format(r.fxOld)}과 너무 달라`:"있을 수 없는 값이라"} 저장하지 않았습니다. 설정에서 직접 넣으세요.`:""}${(r.big||[]).length?` 전보다 30% 넘게 바뀐 종목: ${r.big.join(", ")} (분할·병합이 아니면 확인하세요).`:""}${(r.noDate||[]).length?` 기준 시각이 없어 오늘 날짜로 적은 종목: ${r.noDate.join(", ")}.`:""}${r.notIn.length?` 시트에 없는 종목: ${r.notIn.join(", ")} → ‘시트 다시 만들기’를 누르세요.`:""}`;}
 async function gdRun(kind){if(S.gdBusy)return;S.gdBusy=kind;gdSet(kind,null);const t0=performance.now();
   try{
     if(kind==="prices"){const r=await gdPrices();if(r){gdSet(kind,gdPriceMsg(r)+` (${secTxt(t0)})`,false);autoSnap(300);}}
@@ -2373,7 +2539,7 @@ function gdPickSheet(list){openSheet(`<h3>드라이브에서 불러오기</h3><s
   <div class="list">${list.map(f=>`<button class="item" data-gdfile="${esc(f.id)}"><div class="row"><div class="l"><span class="name">${esc(f.title)}</span><span class="meta">${f.createdTime&&isFinite(Date.parse(f.createdTime))?esc(new Date(Date.parse(f.createdTime)+9*3600e3).toISOString().slice(0,16).replace("T"," ")):""}${f.fileSize?` · ${nf.format(Math.round(num(f.fileSize)/1024))}KB`:""}</span></div><span class="meta gdarr">›</span></div></button>`).join("")}</div>
   <div class="btns"><span class="grow"></span><button class="btn" id="pCancel">닫기</button></div>`,bg=>{bg.querySelector("#pCancel").onclick=closeSheet;
     bg.querySelectorAll("[data-gdfile]").forEach(b=>b.onclick=async()=>{const f=list.find(x=>x.id===b.dataset.gdfile);b.disabled=true;b.querySelector(".gdarr").textContent="불러오는 중…";
-      try{const r=await gdCall("download_file_content",{fileId:f.id});closeSheet();await importText(b64utf8(r&&r.content),f.title);}
+      try{const r=await gdCall("download_file_content",{fileId:f.id});closeSheetOf(bg);await importText(b64utf8(r&&r.content),f.title);}
       catch(e){b.disabled=false;b.querySelector(".gdarr").textContent="›";toast(gdErrText(e));}});});}
 function gdSection(){const s=S.settings||{};
   if(S.gdAvail===false)return `<section class="card"><h2>구글 드라이브</h2><p class="meta" style="margin:0">이 화면에서는 Google Drive를 쓸 수 없습니다. claude.ai에 Google Drive 커넥터를 연결하고 이 페이지를 다시 열면 구글 시트로 가격을 가져오고 드라이브에 백업할 수 있습니다.</p></section>`;
@@ -2396,6 +2562,11 @@ function gdSection(){const s=S.settings||{};
 const SYNC_NAME="Kinfolio 데이터.json";
 S.sync={busy:false,at:null,msg:null,err:false,again:false,timer:null,boot:false};
 S.syncBase=undefined;   // undefined: 아직 모름, null: 동기화 안 함
+// 이 기기에서 지운 문서와 지운 시각: 동기화할 때 지운 기록의 시각으로 쓴다 (지운 뒤 다른 기기에서 고친 것은 살리고, 고친 뒤 지운 것은 지운 채로)
+S.delAt={};try{S.delAt=JSON.parse(localStorage.getItem("kf.delAt")||"{}")||{};}catch(e){S.delAt={};}
+function delSave(){try{localStorage.setItem("kf.delAt",JSON.stringify(S.delAt));}catch(e){}}
+function noteDel(p){S.delAt[p]=new Date().toISOString();delSave();}
+function clearDel(upTo){let n=0;for(const p in S.delAt)if(S.delAt[p]<=upTo){delete S.delAt[p];n++;}if(n)delSave();}
 function syncOn(){return !!(S.syncBase&&S.syncBase.h&&!S.syncBase.off);}
 function syncLoaded(){const l=S.loaded||{};return S.dbState==="ok"&&!!(l.accounts&&l.holdingsRaw&&l.prices&&l.assets&&l.settings&&l.snapshots)&&!!S.planLoaded&&S.syncBase!==undefined;}
 function syncSchedule(ms){clearTimeout(S.sync.timer);S.sync.timer=setTimeout(()=>syncRun(true),ms);}
@@ -2405,7 +2576,7 @@ function syncDirty(){if(syncOn())syncSchedule(PWA?4000:10000);}
 function hookDb(db){const own=p=>String(p).startsWith("sync/");
   const stamp=(p,v)=>own(p)||!v||typeof v!=="object"?v:{...v,updatedAt:new Date().toISOString()};
   const w=(p,f)=>async(...a)=>{const r=await f(...a);if(!own(p))syncDirty();return r;};
-  return {collection:(...a)=>db.collection(...a),doc:p=>{const d=db.doc(p);return {onSnapshot:(...a)=>d.onSnapshot(...a),get:(...a)=>d.get(...a),set:w(p,v=>d.set(stamp(p,v))),update:w(p,v=>d.update(stamp(p,v))),delete:w(p,()=>d.delete())};}};}
+  return {collection:(...a)=>db.collection(...a),doc:p=>{const d=db.doc(p);return {onSnapshot:(...a)=>d.onSnapshot(...a),get:(...a)=>d.get(...a),set:w(p,v=>d.set(stamp(p,v))),update:w(p,v=>d.update(stamp(p,v))),delete:w(p,()=>{if(!own(p))noteDel(p);return d.delete();})};}};}
 // 저장·드라이브 요청을 한 번에 n개씩 동시에 (하나씩 기다리면 느리다)
 async function pool(items,n,fn){let i=0,fail=0;const work=async()=>{while(i<items.length){const k=i++;try{await fn(items[k],k);}catch(e){fail++;}}};
   await Promise.all(Array.from({length:Math.min(n,items.length)},work));return fail;}
@@ -2429,49 +2600,70 @@ async function syncRun(auto){
   try{
     for(let round=0;;round++){
       const fid=await syncFolder();const list=await syncFiles(fid);
-      const B=first?{}:S.syncBase.h,brev=first?0:(S.syncBase.rev||0);
+      const B=first?{}:S.syncBase.h,brev=first?0:(S.syncBase.rev||0),head=first?null:(S.syncBase.head||null);
       // 드라이브 파일이 지난 동기화 뒤 그대로면 내려받지 않는다 (이 기기에서 고친 것만 올리면 된다)
       const same=!first&&!!list[0]&&!!S.syncBase.fk&&syncKey(list)===S.syncBase.fk;
-      let R={},T={},from=null,rrev=0,res;
-      const L=KSync.flatten(exportDoc().data);
-      if(same){res=KSync.mergeLocal(L,B,S.syncBase.t||{});rrev=brev;}
+      let R={},T={},from=null,rrev=0,res,rseen=same?(S.syncBase.seen||null):null;
+      const t1=new Date().toISOString();
+      // 평가액 기록이 1000개를 넘으면 앞 기록도 읽어 함께 맞춘다 (못 읽은 기록을 ‘지운 것’으로 보지 않게)
+      const oldSn={};for(const x of await olderSnaps())oldSn["snapshots/"+x.date]=x;
+      const flat=()=>{const o=KSync.flatten(exportDoc().data);for(const p in oldSn)if(!(p in o))o[p]=oldSn[p];return o;};
+      // 이 기기 내용은 깊은 복사로 떠 둔다: 계획·설정은 화면이 제자리에서 고치므로, 참조로 두면 동기화하는 사이의 수정이 ‘맞출 때 내용’에 섞인다
+      const L=JSON.parse(JSON.stringify(flat()));const dopt={delAt:S.delAt,delFloor:first?null:(S.syncBase.at||null)};
+      if(same){res=KSync.mergeLocal(L,B,S.syncBase.t||{},dopt);rrev=brev;}
       else{
         if(list[0]){const r=await gdCall("download_file_content",{fileId:list[0].id});const doc=KSync.parse(b64utf8(r&&r.content));
-          if(!doc)throw{code:"tool_error",message:"드라이브의 동기화 파일을 읽을 수 없습니다"};R=doc.docs;T=doc.tombs;rrev=doc.rev;}
+          if(!doc)throw{code:"tool_error",message:"드라이브의 동기화 파일을 읽을 수 없습니다"};R=doc.docs;T=doc.tombs;rrev=doc.rev;rseen=doc.seen;}
         else if(first&&PWA&&!acctList().length){   // 앱을 처음 연결했는데 동기화 파일이 없으면 가장 최근 백업에서 시작
           const b=(await gdBackupsIn(fid))[0];
           if(b){const r=await gdCall("download_file_content",{fileId:b.id});const doc=KSync.parse(b64utf8(r&&r.content));if(doc){R=doc.docs;from=b.title;}}}
-        // 평가액 기록이 읽기 한도(1000개)에 걸렸으면, 못 읽은 기록을 ‘지운 것’으로 보지 않는다
-        if((S.snapshots||[]).length>=1000)for(const p in R)if(p.startsWith("snapshots/")&&!(p in L))L[p]=R[p];
-        res=KSync.merge(L,R,B,T,{knownTombs:(!first&&S.syncBase.t)||{},preferRemote:first&&!acctList().length,regress:!first&&!!list[0]&&rrev<=brev});}
-      const upload=res.remoteChanged||!list[0];let rev=Math.max(rrev,brev),fk=syncKey(list),old=[];
+        // 내 마지막 업로드가 이 파일에 들어 있나: 없으면 다른 기기가 예전 내용으로 덮어쓴 것 → 예전 내용을 받지 않고, 내가 아는 지운 기록도 다시 알린다.
+        // 들어 있으면 파일이 내 것 뒤에 이어진 것이라, 다른 기기가 지운 기록을 없앤 것(다시 추가)도 그대로 따른다. 예전 형식 파일은 판 번호로 판단
+        const lost=!first&&head&&Array.isArray(rseen)?!rseen.includes(head):null;
+        res=KSync.merge(L,R,B,T,{...dopt,knownTombs:lost===false?{}:((!first&&S.syncBase.t)||{}),preferRemote:first&&!acctList().length,regress:!first&&!!list[0]&&(lost!==null?lost:rrev<=brev)});}
+      const upload=res.remoteChanged||!list[0];let rev=Math.max(rrev,brev),fk=syncKey(list),old=[],up=null,seenOut=Array.isArray(rseen)?rseen:[];
       if(upload){
         let now2=list;
         if(!same&&list[0]){now2=await syncFiles(fid);if(syncKey(now2)!==syncKey(list)&&round<2)continue;}   // 내려받는 사이 다른 기기가 올렸으면 처음부터 다시 맞춘다
-        rev=Math.max(rrev,brev)+1;
-        const text=KSync.serialize(res.docs,res.tombs,PWA?"앱":"아티팩트",Date.now(),rev);
+        rev=Math.max(rrev,brev)+1;up=Date.now().toString(36)+Math.random().toString(36).slice(2,8);seenOut=[up,...(Array.isArray(rseen)?rseen:[])].slice(0,KSync.SEEN_MAX);
+        const text=KSync.serialize(res.docs,res.tombs,PWA?"앱":"아티팩트",Date.now(),rev,seenOut);
         if(PWA&&now2[0]){const f=await gdCall("update_file",{fileId:now2[0].id,textContent:text,contentMimeType:"application/json"});fk=fileKey(f&&f.id?f:null)||"";old=now2.slice(1);}
         else{const f=await gdCall("create_file",{title:SYNC_NAME,contentMimeType:"application/json",disableConversionToGoogleType:true,textContent:text,parentId:fid});
           if(!f||!f.id)throw{code:"tool_error",message:"동기화 파일을 만들지 못했습니다"};fk=fileKey(f);old=now2.filter(o=>o.id!==f.id);}   // 커넥터는 내용을 고칠 수 없어 새로 만들고 예전 것은 휴지통으로
         if(old.length)pool(old,4,o=>gdCall("trash_file",{fileId:o.id}));   // 휴지통 옮기기는 기다리지 않는다
       }
       // 이 기기에 반영: 동기화하는 사이에 사용자가 고친 문서는 건드리지 않고 다음 동기화에 맡긴다
-      const cur=KSync.flatten(exportDoc().data);const ops=res.localOps.filter(([p])=>KSync.hash(cur[p])===KSync.hash(L[p]));const skip=res.localOps.length-ops.length;
-      const fail=await pool(ops,8,([p,v])=>v==null?S.dbRaw.doc(p).delete():S.dbRaw.doc(p).set(v));
+      // 문서마다 쓰기 직전에 이 기기 내용이 맞출 때와 같은지 다시 본다 (적용하는 동안 사용자가 고친 문서는 건드리지 않는다)
+      const curOf=p=>{if(p==="settings/main")return S.settings&&Object.keys(S.settings).length?S.settings:undefined;if(p==="plan/main")return S.planExists&&S.plan?S.plan:undefined;
+        const i=p.indexOf("/"),c=p.slice(0,i),id=p.slice(i+1);if(c==="snapshots")return (S.snapshots||[]).find(x=>x.date===id)||oldSn[p];
+        const m={accounts:S.accounts,holdings:S.holdingsRaw,prices:S.prices,assets:S.assets}[c];const v=m&&m[id];if(!v)return undefined;const {id:_x,...rest}=v;return rest;};
+      const ops=[],skipped=[];
+      const fail=await pool(res.localOps,8,async([p,v])=>{if(KSync.hash(curOf(p))!==KSync.hash(L[p])||(p==="plan/main"&&S.planPend)||(p==="settings/main"&&S.setPend)){skipped.push(p);return;}
+        ops.push([p,v]);
+        // 계획·설정은 화면이 이 상태(S.plan·S.settings)를 고쳐 저장하므로, 쓰기를 보내는 순간 화면 상태도 맞춘다 (저장 알림을 기다리는 사이 고친 것이 예전 내용 위에 만들어지지 않게)
+        if(p==="plan/main"&&v){S.plan=JSON.parse(JSON.stringify(v));S.planExists=true;PL();S.simCache.key=null;}
+        else if(p==="settings/main"&&v)S.settings=JSON.parse(JSON.stringify(v));
+        if(v==null)await S.dbRaw.doc(p).delete();else await S.dbRaw.doc(p).set(v);});
+      const skip=skipped.length;
+      for(const [p,v] of ops)if(p in oldSn){if(v==null)delete oldSn[p];else oldSn[p]=v;}
       if(fail)throw{code:"tool_error",message:`이 기기에 ${fail}건을 저장하지 못했습니다`};
       const done=ops.length;
       // 저장소가 화면 상태(S)에 반영할 때까지 잠깐 기다린다: 다음 동기화가 예전 상태를 ‘이 기기 변경’으로 오해하지 않게
-      for(let i=0;i<30&&done;i++){const nowD=KSync.flatten(exportDoc().data);if(ops.every(([p,v])=>KSync.hash(nowD[p])===KSync.hash(v==null?undefined:v)))break;await new Promise(ok=>setTimeout(ok,100));}
-      const base={h:KSync.baseOf(res.docs),t:res.tombs,rev,fk,fid,at:new Date().toISOString(),n:Object.keys(res.docs).length};
-      if(upload||done||fk!==S.syncBase?.fk||fid!==S.syncBase?.fid||first)await S.dbRaw.doc("sync/base").set(base);else base.at=S.syncBase.at;   // 아무것도 안 바뀌었으면 기준도 다시 쓰지 않는다
-      S.syncBase=base;
+      for(let i=0;i<30&&done;i++){const nowD=flat();if(ops.every(([p,v])=>KSync.hash(nowD[p])===KSync.hash(v==null?undefined:v)))break;await new Promise(ok=>setTimeout(ok,100));}
+      // 동기화하는 사이에 고친 문서는 기준을 ‘고치기 전 이 기기 내용’으로 두고 다음에 파일을 내려받아 다시 합친다
+      // (합친 내용을 기준으로 두면, 다음 동기화가 이 기기의 예전 값을 ‘새로 고친 것’으로 보고 다른 기기의 변경을 되돌린다)
+      const h=KSync.baseOf(res.docs);for(const p of skipped){if(L[p]===undefined)delete h[p];else h[p]=KSync.baseOf({[p]:L[p]})[p];}
+      const base={h,t:res.tombs,rev,fk:skip?"":fk,fid,at:new Date().toISOString(),n:Object.keys(res.docs).length,seen:seenOut,head:up||seenOut[0]||null};
+      if(upload||done||skip||fk!==S.syncBase?.fk||fid!==S.syncBase?.fid||first)await S.dbRaw.doc("sync/base").set(baseDoc(base));else base.at=S.syncBase.at;   // 아무것도 안 바뀌었으면 기준도 다시 쓰지 않는다
+      S.syncBase=base;clearDel(t1);
       S.sync.at=Date.now();S.sync.msg=`${from?`‘${from}’에서 시작했습니다. `:""}받은 변경 ${done}건 · ${upload?"드라이브에 저장했습니다":"드라이브는 그대로입니다"} (${secTxt(t0)}).`;
       if(skip)S.sync.again=true;
       if(done){S.simCache.key=null;autoSnap(1000);}
       break;}
   }catch(e){S.sync.err=true;S.sync.msg=gdErrText(e);}
   finally{S.sync.busy=false;if(PWA)KinfolioPWA.quiet=false;render();if(S.sync.again){S.sync.again=false;syncSchedule(1500);}}}
-async function syncOff(){const b={...(S.syncBase||{}),off:true};try{await S.dbRaw.doc("sync/base").set(b);}catch(e){}S.syncBase=b;S.sync.at=null;S.sync.msg="동기화를 껐습니다. 드라이브의 파일은 그대로 둡니다.";S.sync.err=false;render();}
+const baseDoc=b=>b&&b.h?{...b,h:KSync.packBase(b.h)}:b;   // 저장할 때만 짧게 (화면 상태는 풀어 둔 모양)
+async function syncOff(){const b={...(S.syncBase||{}),off:true};try{await S.dbRaw.doc("sync/base").set(baseDoc(b));}catch(e){toast("동기화를 끄지 못했습니다. 다시 누르세요",5000);return;}S.syncBase=b;S.sync.at=null;S.sync.msg="동기화를 껐습니다. 드라이브의 파일은 그대로 둡니다.";S.sync.err=false;render();}
 const hhmm=t=>{const d=new Date(t);return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");};
 const whenTxt=iso=>{const d=new Date(iso);return isFinite(d)?`${d.getMonth()+1}/${d.getDate()} ${hhmm(d)}`:"";};
 function syncSection(){const on=syncOn();const b=S.syncBase||{};
@@ -2511,14 +2703,30 @@ function dataSection(){return `<section class="card"><h2>데이터</h2>
    <div class="btns"><button class="btn" id="exportData">내보내기 (JSON 파일)</button><label class="btn" for="importFile" tabindex="0" role="button">가져오기…</label><input type="file" id="importFile" class="vh" accept=".json,application/json"></div>
    <span class="hint">내보낸 파일에 모든 데이터가 들어 있습니다. 따로 보관해 두었다가 ‘가져오기’로 되돌릴 수 있습니다. 드라이브에 바로 백업하려면 위 ‘구글 드라이브’ 카드를 쓰세요. 가져오기는 지금 데이터를 파일 내용으로 모두 바꿉니다(먼저 확인을 받습니다).</span></section>`;}
 // 지금 데이터를 한 파일로: 컬렉션은 {문서 id: 내용}, 설정·계획은 문서 하나
+// 평가액 기록이 화면 구독 한도(최근 1000개)를 넘으면 그 앞 기록을 따로 읽는다 (내보내기·백업·동기화에서 빠지지 않게)
+async function olderSnaps(){const sn=S.snapshots||[];if(sn.length<1000||!S.dbRaw)return [];let out=[],before=sn[0].date;
+  for(let i=0;i<20&&before;i++){const q=await S.dbRaw.collection("snapshots").where("date","<",before).orderBy("date","desc").limit(1000).get();
+    const ds=q.docs.map(d=>d.data()).filter(x=>x&&x.date&&x.date<before);out=out.concat(ds);if(ds.length<1000)break;before=ds[ds.length-1].date;}
+  return out;}
+async function exportDocFull(){const d=exportDoc();for(const x of await olderSnaps())if(!d.data.snapshots[x.date])d.data.snapshots[x.date]=x;return d;}
 function exportDoc(){const strip=o=>Object.fromEntries(Object.entries(o||{}).map(([id,v])=>{const {id:_x,...rest}=v||{};return [id,rest];}));
   return {app:"Kinfolio",format:1,exportedAt:new Date().toISOString(),data:{accounts:strip(S.accounts),holdings:strip(S.holdingsRaw),prices:strip(S.prices),assets:strip(S.assets),
     snapshots:Object.fromEntries((S.snapshots||[]).filter(x=>x&&x.date).map(x=>[x.date,x])),settings:S.settings||{},plan:S.planExists&&S.plan?S.plan:null}};}
 async function exportData(){let dl=null;try{dl=await window.claude.use("downloads");}catch(e){dl=null;}
   if(!dl){toast("이 화면에서는 파일로 내보낼 수 없습니다");return false;}
-  try{await dl.save({filename:`kinfolio-${today()}.json`,data:JSON.stringify(exportDoc(),null,1)});toast("내보냈습니다");return true;}
+  try{await dl.save({filename:`kinfolio-${today()}.json`,data:JSON.stringify(await exportDocFull(),null,1)});toast("내보냈습니다");return true;}
   catch(e){const c=e&&e.code;if(c!=="declined")toast(c==="rate_limited"?"저장 창이 이미 열려 있습니다. 잠시 뒤 다시 누르세요":"내보내지 못했습니다");return false;}}
 const DOC_ID_RE=/^[A-Za-z0-9_\-.~:@+]{1,200}$/;
+// 가져올 파일의 모양 검사: 앱이 읽다가 멈추는 파일(목록 자리에 다른 값 등)은 받지 않는다
+function importProblem(d){const isO=v=>!!v&&typeof v==="object"&&!Array.isArray(v);
+  for(const c of DATA_COLS){if(d[c]==null)continue;if(!isO(d[c]))return c;for(const id in d[c])if(!isO(d[c][id]))return c+"/"+id;}
+  if(d.settings!=null&&!isO(d.settings))return "settings";
+  if(d.plan!=null){if(!isO(d.plan))return "plan";const b=blankPlan();
+    for(const k in b){const v=d.plan[k];if(v==null)continue;
+      if(Array.isArray(b[k])){if(!Array.isArray(v))return "plan."+k;if(k!=="surplusOrder"&&k!=="drawOrder"&&v.some(x=>!isO(x)))return "plan."+k;}
+      else if(!isO(v))return "plan."+k;}
+    if(d.plan.members&&d.plan.members.some(m=>typeof m.id!=="string"||!m.id))return "plan.members";}
+  return null;}
 async function importFile(file){let txt;try{txt=await file.text();}catch(e){toast("파일을 읽을 수 없습니다");return;}return importText(txt,file.name);}
 async function importText(txt,fname){let doc;const file={name:fname||"backup.json"};
   try{doc=JSON.parse(txt);}catch(e){toast("JSON 파일을 읽을 수 없습니다");return;}
@@ -2526,6 +2734,7 @@ async function importText(txt,fname){let doc;const file={name:fname||"backup.jso
   if(!d){toast("Kinfolio에서 내보낸 파일이 아닙니다");return;}
   const bad=DATA_COLS.flatMap(c=>Object.keys(d[c]||{}).filter(id=>!DOC_ID_RE.test(id)));
   if(bad.length){toast("파일의 문서 이름이 올바르지 않습니다: "+bad.slice(0,3).join(", "));return;}
+  const prob=importProblem(d);if(prob){toast("파일 내용이 올바르지 않아 가져오지 않습니다 ("+prob+")");return;}
   const n=c=>Object.keys(d[c]||{}).length, now={accounts:acctList().length,holdings:Object.keys(S.holdingsRaw).length,prices:Object.keys(S.prices).length,assets:Object.keys(S.assets).length,snapshots:(S.snapshots||[]).length};
   const lab={accounts:"계좌",holdings:"보유 종목",prices:"가격",assets:"관심 종목",snapshots:"평가액 기록"};
   openSheet(`<h3>데이터 가져오기</h3><span class="meta">${esc(file.name)}${doc.exportedAt?` · ${esc(String(doc.exportedAt).slice(0,10))} 내보냄`:""}</span>
@@ -2539,12 +2748,12 @@ async function importText(txt,fname){let doc;const file={name:fname||"backup.jso
       if(!go.classList.contains("armed")){go.classList.add("armed");go.textContent="한 번 더 누르면 바꿉니다";setTimeout(()=>{if(!go.disabled){go.classList.remove("armed");go.textContent="바꾸기";}},4000);return;}
       go.disabled=true;go.textContent="바꾸는 중…";const r=await applyImport(d,(i,t)=>{go.textContent=`바꾸는 중… ${i}/${t}`;});
       if(r.fail){const e=bg.querySelector("#impErr");e.textContent=`${r.fail}개를 저장하지 못했습니다. 다시 가져오거나 먼저 내보낸 파일로 되돌리세요.`;e.hidden=false;go.disabled=false;go.textContent="다시 바꾸기";return;}
-      closeSheet();toast(r.done?`가져왔습니다 (바뀐 문서 ${nf.format(r.done)}건)`:"가져왔습니다 (지금과 같은 내용이라 바뀐 것이 없습니다)");});
+      closeSheetOf(bg);toast(r.done?`가져왔습니다 (바뀐 문서 ${nf.format(r.done)}건)`:"가져왔습니다 (지금과 같은 내용이라 바뀐 것이 없습니다)");});
   });}
 // 컬렉션마다 파일의 문서를 쓰고, 파일에 없는 지금 문서는 지운다. 설정·계획은 파일에 있을 때만 바꾼다
 async function applyImport(d,progress){if(!S.db)return{done:0,fail:1};
   const cur={accounts:S.accounts,holdings:S.holdingsRaw,prices:S.prices,assets:S.assets,snapshots:Object.fromEntries((S.snapshots||[]).filter(x=>x&&x.date).map(x=>[x.date,x]))};
-  const strip=o=>{const {id:_x,...r}=o||{};return r;};const same=(a,b)=>KSync.hash(strip(a))===KSync.hash(strip(b));   // 지금과 같은 문서는 다시 쓰지 않는다
+  const strip=o=>{const {id:_x,updatedAt:_u,...r}=o||{};return r;};const same=(a,b)=>KSync.hash(strip(a))===KSync.hash(strip(b));   // 지금과 같은 문서는 다시 쓰지 않는다 (수정 시각만 다르면 같은 것)
   const ops=[];for(const c of DATA_COLS){const src=d[c]&&typeof d[c]==="object"?d[c]:{};for(const id in src)if(!cur[c][id]||!same(cur[c][id],src[id]))ops.push(["set",c+"/"+id,src[id]]);for(const id in cur[c])if(!(id in src))ops.push(["del",c+"/"+id]);}
   // 구글 드라이브 연결 정보(폴더·시트)는 지금 것을 유지한다: 예전 백업에는 지워진 시트가 적혀 있을 수 있다
   if(d.settings&&typeof d.settings==="object"){const c0=S.settings||{};const link=Object.fromEntries(GD_KEYS.filter(k=>c0[k]!=null).map(k=>[k,c0[k]]));const {targetAmount:_t,startYear:_y,...st}=d.settings;const ns={...st,...link};if(!same(ns,S.settings))ops.push(["set","settings/main",ns]);}if(d.plan&&typeof d.plan==="object"&&!(S.planExists&&same(d.plan,S.plan)))ops.push(["set","plan/main",d.plan]);
@@ -2560,15 +2769,21 @@ let renderDepth=0;
 function render(){const top=!renderDepth++;if(top)S.memo={};try{render0();}finally{if(!--renderDepth)S.memo=null;}}
 function render0(){
   document.querySelectorAll("nav.tabs button").forEach(b=>b.setAttribute("aria-current",b.dataset.tab===S.tab?"page":"false"));
-  const f=freshness();const hs=document.getElementById("hdrSub");hs.textContent=S.dbState==="ok"?(f?`가격 ${f}`:""):"";
-  const old=f&&daysAgo(f)>3;hs.classList.toggle("stale",!!old);hs.title=f?(old?"가격이 오래되었습니다. 눌러서 가격을 업데이트하세요":"누르면 관심 종목·가격 화면으로"):"";   // 머리글 가격 날짜: 누르면 가격 화면
+  const pd=priceDates(),f=pd&&pd.old;const hs=document.getElementById("hdrSub");hs.textContent=S.dbState==="ok"?(pd?`가격 ${priceDateTxt()}`:""):"";
+  const old=f&&daysAgo(f)>3;   // 보유 종목 가격 중 가장 오래된 날 기준hs.classList.toggle("stale",!!old);hs.title=f?(old?"가격이 오래되었습니다. 눌러서 가격을 업데이트하세요":"누르면 관심 종목·가격 화면으로"):"";   // 머리글 가격 날짜: 누르면 가격 화면
   if(S.dbState==="loading"){app.innerHTML=`<div class="card empty">장부를 불러오는 중…</div>`;syncChip();return;}
   if(S.dbState==="none"){app.innerHTML=`<div class="banner">저장소에 연결할 수 없어 장부를 열 수 없습니다. 이 장부는 소유자 계정으로 로그인해야 볼 수 있습니다.</div>`;return;}
   const v={home:vHome,trend:vTrend,accounts:vAccounts,plan:vPlan,alloc:vAlloc,prices:vPrices,settings:vSettings}[S.tab]||vHome;
   // 다시 그려도 가로로 스크롤한 표(data-keep)는 그 자리를 유지한다
   const keep={};app.querySelectorAll("[data-keep]").forEach(e=>{keep[e.dataset.keep]=e.scrollLeft;});
+  const act=document.activeElement,actKey=act&&app.contains(act)?inKey(act):null;let sel=null;try{if(actKey&&act.selectionStart!=null)sel=[act.selectionStart,act.selectionEnd];}catch(e){}
   app.classList.toggle("narrow",["home","trend","accounts","prices","settings"].includes(S.tab));   // 넓은 화면에서 목록 위주 탭은 가운데로 좁게
-  app.innerHTML=(S.tab==="home"?pwaStart():"")+v();
+  // 환율이 비어 있으면 달러 자산을 0원으로 계산한다: 금액을 보여 주는 다른 탭에도 알린다 (요약은 자체 안내)
+  const fxB=["trend","accounts","plan","alloc"].includes(S.tab)&&needsFx()?`<div class="banner">달러 자산이 있는데 환율이 ${num(S.settings.usdkrw)?"맞지 않아":"비어 있어"} 달러 자산을 0원으로 계산하고 있습니다. <button class="btn small" data-go="settings">환율 입력</button></div>`:"";
+  const se=PWA&&KinfolioPWA.storageError;   // 앱: 이 기기 저장소 문제는 모든 탭에서 알린다 (고친 내용이 창을 닫으면 사라질 수 있다)
+  const seB=se?`<div class="banner">${se==="open"?"이 기기 저장소를 열 수 없어 이번에는 메모리에만 둡니다. 창을 닫으면 고친 내용이 사라지니":"이 기기에 저장하지 못한 변경이 있습니다(저장 공간 부족 등). 창을 닫기 전에"} 드라이브 동기화나 설정의 ‘데이터 → 내보내기’로 옮겨 두세요.</div>`:"";
+  app.innerHTML=seB+(S.tab==="home"?pwaStart():"")+fxB+v();
+  restoreDrafts(actKey,sel);
   postRender();
   app.querySelectorAll("[data-keep]").forEach(e=>{const x=keep[e.dataset.keep];if(x)e.scrollLeft=x;});
   if(S.tab==="plan"&&S.planView==="result")drawChart();
@@ -2578,8 +2793,7 @@ function render0(){
   if(!S.sync.boot&&syncOn()&&S.gdAvail&&syncLoaded()){S.sync.boot=true;setTimeout(()=>syncRun(true),400);}
 }
 
-function saveRet(data,msg){S.settings={...S.settings,...data};S.simCache.key=null;render();
-  return write(db=>db.doc("settings/main").set({...S.settings,updatedAt:new Date().toISOString()}),msg);}
+function saveRet(data,msg){const q=writeSettings({...S.settings,...data},msg);S.simCache.key=null;render();return q;}
 app.addEventListener("change",async e=>{const id=e.target.id;
   if(id==="sMonthMan"){await saveRet({monthMan:e.target.checked},e.target.checked?"월 금액을 만원으로 보여 줍니다":"월 금액도 억원으로 보여 줍니다");return;}
   if(id==="snapAutoChk"){const on=e.target.checked;await saveRet({snapAuto:on},on?"평가액을 자동으로 기록합니다":"자동 기록을 껐습니다");if(on)autoSnap(200);return;}
@@ -2591,8 +2805,7 @@ app.addEventListener("change",async e=>{const id=e.target.id;
   if(id==="importFile"){const f=e.target.files&&e.target.files[0];e.target.value="";if(f)await importFile(f);return;}
   if(id!=="sUnit"&&id!=="sDec")return;
   const data={amtUnit:document.getElementById("sUnit").value,amtDec:parseInt(document.getElementById("sDec").value,10)};
-  S.settings={...S.settings,...data};render();
-  await write(db=>db.doc("settings/main").set({...S.settings,updatedAt:new Date().toISOString()}),"표시 단위를 바꿨습니다");});
+  const q=writeSettings({...S.settings,...data},"표시 단위를 바꿨습니다");render();await q;});
 
 /* ---------- sheets ---------- */
 const root=document.getElementById("sheetRoot");
@@ -2614,6 +2827,7 @@ function postRender(){
 app.addEventListener("scroll",e=>{const w=e.target;if(w&&w.classList&&w.classList.contains("tbl-wrap"))markMore(w);},true);
 window.addEventListener("resize",()=>app.querySelectorAll(".tbl-wrap").forEach(markMore));
 app.addEventListener("click",e=>{const h=e.target.closest(".hint.clamp");if(!h)return;h.classList.remove("clamp","on-bg");S.hintOpen.add(h.dataset.hk);});
+function closeSheetOf(bg){if(root.firstChild===bg){closeSheet();return true;}return false;}
 function closeSheet(){root.innerHTML="";if(NAV&&history.state&&history.state.sheet&&!navBack){navBack=true;history.back();}}
 /* ---------- 뒤로 가기 (PC·안드로이드 앱): 화면 이동과 시트를 브라우저 기록에 남겨, 뒤로 가기가 앱을 닫지 않고 앞 화면으로 가게 한다 ---------- */
 const NAV=PWA&&!!(window.history&&history.pushState);
@@ -2623,6 +2837,7 @@ const NAV_K=["acct","mv","ps","pv"];
 const navSame=(a,b)=>!!a&&!!b&&a.tab===b.tab&&NAV_K.every(k=>(a[k]||null)===(b[k]||null));
 function navSync(){if(!NAV||navBack)return;const cur=history.state&&history.state.kf?history.state:null;const k=navKey();
   if(!cur){history.replaceState({kf:1,...k,d:0,sheet:false},"");return;}
+  if(cur.sheet&&!root.firstChild){history.replaceState({...cur,sheet:false},"");return navSync();}   // 닫힌 시트의 기록이 남아 있으면 화면 기록으로
   if(cur.sheet||navSame(cur,k))return;
   if(navRestoring){history.replaceState({...cur,...k},"");return;}
   if(cur.up&&navSame(cur.up,k)){navBack=true;history.back();return;}   // 바로 앞 화면으로 돌아간 것이면(‹ 계좌 목록, 앞 탭) 기록을 쌓지 않고 뒤로
@@ -2631,6 +2846,7 @@ function applyNav(st){navRestoring=true;try{S.tab=st.tab||"home";S.openAcct=st.a
   if(S.tab==="plan"){S.planSel=st.ps||null;if(st.pv)S.planView=st.pv;try{localStorage.setItem("rf.psel",S.planSel||"");localStorage.setItem("rf.pv",S.planView);}catch(e){}}
   try{localStorage.setItem("rf.tab",S.tab);}catch(e){}render();}finally{navRestoring=false;}window.scrollTo(0,0);}
 if(NAV){try{history.scrollRestoration="manual";}catch(e){}
+  if(history.state&&history.state.kf&&history.state.sheet&&!root.firstChild)history.replaceState({...history.state,sheet:false},"");   // 시트가 열린 채 새로 고친 경우
   window.addEventListener("popstate",e=>{const st=e.state&&e.state.kf?e.state:null;
     if(navBack){navBack=false;   // 코드가 부른 뒤로 가기(시트 닫기·앞 화면으로)가 끝남
       if(root.firstChild)history.pushState({...(st||{kf:1,...navKey(),d:0}),sheet:true},"");   // 그사이 새 시트가 열렸으면 다시 기록
@@ -2656,12 +2872,12 @@ function acctSheet(a,ownerId){const isNew=!a;a=a||{type:"연금저축",ownerId:o
   <div class="btns">${isNew?"":'<button class="btn danger" id="fDel">삭제</button>'}<span class="grow"></span><button class="btn" id="fCancel">취소</button><button class="btn primary" id="fSave">저장</button></div>`,bg=>{
     bg.querySelector("#fCancel").onclick=closeSheet;
     bg.querySelector("#fType").onchange=e=>{const lv=e.target.value==="생활비";bg.querySelector("#fTypeHint").hidden=!lv;bg.querySelector("#fCashL").textContent=lv?"잔액 (원)":"예수금 (원)";};
-    bg.querySelector("#fSave").onclick=async()=>{const name=bg.querySelector("#fName").value.trim();if(!name){const e=bg.querySelector("#fErr");e.textContent="계좌 이름을 입력하세요.";e.hidden=false;return;}
+    bg.querySelector("#fSave").onclick=async()=>{const name=bg.querySelector("#fName").value.trim();const fe=m=>{const e=bg.querySelector("#fErr");e.textContent=m;e.hidden=false;};if(!name)return fe("계좌 이름을 입력하세요.");if(badNum(bg.querySelector("#fCash").value))return fe("금액은 숫자로 입력하세요.");
       const id=a.id||newId("a_");const data={name,type:bg.querySelector("#fType").value,broker:bg.querySelector("#fBroker").value.trim(),cash:num(bg.querySelector("#fCash").value),memo:bg.querySelector("#fMemo").value.trim(),order:a.order??Object.keys(S.accounts).length,updatedAt:new Date().toISOString()};
       const fo=bg.querySelector("#fOwner");if(fo)data.ownerId=fo.value;else if(a.ownerId)data.ownerId=a.ownerId;
-      if(await write(db=>db.doc("accounts/"+id).set(data),"저장했습니다")){closeSheet();if(isNew){S.tab="accounts";S.openAcct=id;render();}}};
+      if(await write(db=>db.doc("accounts/"+id).set(data),"저장했습니다")){if(closeSheetOf(bg)&&isNew){S.tab="accounts";S.openAcct=id;render();}}};
     const del=bg.querySelector("#fDel");if(del)armDelete(del,async()=>{const hs=acctHoldings(a.id);
-      if(await write(async db=>{for(const h of hs)await db.doc("holdings/"+h.id).delete();await db.doc("accounts/"+a.id).delete();},"계좌를 삭제했습니다")){closeSheet();S.openAcct=null;render();}});
+      if(await write(async db=>{for(const h of hs)await db.doc("holdings/"+h.id).delete();await db.doc("accounts/"+a.id).delete();},"계좌를 삭제했습니다")){closeSheetOf(bg);if(S.openAcct===a.id)S.openAcct=null;render();}});
   });}
 
 function holdSheet(h,accountId){const isNew=!h;h=h||{accountId};
@@ -2692,10 +2908,11 @@ function holdSheet(h,accountId){const isNew=!h;h=h||{accountId};
     bg.querySelector("#hSave").onclick=async()=>{const e=bg.querySelector("#hErr");const ticker=sel.value;const qty=num(bg.querySelector("#hQty").value);
       if(!ticker){e.textContent="종목을 고르세요.";e.hidden=false;return;}
       if(!(qty>0)){e.textContent="수량을 0보다 크게 입력하세요.";e.hidden=false;return;}
+      if(badNum(bg.querySelector("#hAvg").value)){e.textContent="평균 매입가는 숫자로 입력하세요.";e.hidden=false;return;}
       const a=aOf(ticker);
       const id=h.id||newId("h_");const data={accountId:bg.querySelector("#hAcct").value,ticker,name:a.name||ticker,currency:a.currency||"KRW",assetClass:a.assetClass||"기타",qty,avgPrice:num(bg.querySelector("#hAvg").value),risky:rk.checked,note:bg.querySelector("#hNote").value.trim(),order:h.order??null,expReturn:(S.holdingsRaw[h.id]||{}).expReturn??null,updatedAt:new Date().toISOString()};
-      if(await write(db=>db.doc("holdings/"+id).set(data),"저장했습니다"))closeSheet();};
-    const del=bg.querySelector("#hDel");if(del)armDelete(del,async()=>{if(await write(db=>db.doc("holdings/"+h.id).delete(),"종목을 계좌에서 뺐습니다"))closeSheet();});
+      if(await write(db=>db.doc("holdings/"+id).set(data),"저장했습니다"))closeSheetOf(bg);};
+    const del=bg.querySelector("#hDel");if(del)armDelete(del,async()=>{if(await write(db=>db.doc("holdings/"+h.id).delete(),"종목을 계좌에서 뺐습니다"))closeSheetOf(bg);});
   });}
 
 function priceSheet(ticker){assetSheet(ticker);}
@@ -2723,6 +2940,7 @@ function assetSheet(ticker){const isNew=!ticker;const wl=watchList();const w=(ti
     const nmI=bg.querySelector("#aName");const syncSt=()=>{const o=bg.querySelector('#aStyle option[value=""]');if(o)o.textContent=`자동: ${RET_STYLE[autoStyle({ticker:tkey(tk.value),name:nmI.value})][0]}`;};nmI.addEventListener("input",syncSt);tk.addEventListener("input",syncSt);
     const upd=()=>{const c=cl.value;bg.querySelector("#pExp").placeholder=`기본 ${nf2.format(num(A0.returns[c]))}`;bg.querySelector("#pDiv").placeholder=`기본 ${nf2.format(num(A0.divYield[c]))}`;};
     cl.onchange=()=>{rk.checked=!!RISKY_DEFAULT[cl.value];upd();};
+    const pPr=bg.querySelector("#pPrice"),pDt=bg.querySelector("#pDate");if(pPr&&pDt&&p.asOf)pPr.addEventListener("input",()=>{if(pDt.value===p.asOf)pDt.value=today();});   // 가격을 새로 넣으면 기준일은 오늘로
     if(isNew)tk.onchange=()=>{const v=tkey(tk.value);if(/^[A-Z]{1,5}$/.test(v))cur.value="USD";else if(/\d/.test(v))cur.value="KRW";};
     bg.querySelector("#pCancel").onclick=closeSheet;
     bg.querySelector("#pSave").onclick=async()=>{const err=m=>{const e=bg.querySelector("#pErr");e.textContent=m;e.hidden=false;};
@@ -2736,15 +2954,22 @@ function assetSheet(ticker){const isNew=!ticker;const wl=watchList();const w=(ti
       const es=bg.querySelector("#pExp").value.trim(),ds=bg.querySelector("#pDiv").value.trim();
       if((es&&!isFinite(num(es)))||(ds&&!isFinite(num(ds))))return err("수익률은 숫자로 입력하세요.");
       const stv=bg.querySelector("#aStyle").value;const asset={ticker:t,name,currency:cur.value,assetClass:cl.value,riskyDefault:rk.checked,retStyle:RET_STYLE[stv]?stv:null,expReturn:es===""?null:num(es),expDiv:ds===""?null:num(ds),order:as0.order??w.order??null,updatedAt:new Date().toISOString()};
-      const priceChanged=price>0&&(price!==num(p.price)||date!==p.asOf||cur.value!==p.currency||name!==p.name);
+      // 가격 칸을 고쳤는지는 시트를 열 때 값과 비교하고, 쓰는 내용은 지금 저장된 가격(pc)을 기준으로 한다: 시트를 연 사이 가격을 새로 가져왔으면 그 값을 지키려고
+      const pc=S.prices[t]||{};const priceEdited=price>0&&(price!==num(p.price)||date!==(p.asOf||today()));
+      const metaOnly=!priceEdited&&num(pc.price)>0&&(name!==pc.name||cur.value!==pc.currency);
+      const oldName=(S.assets[t]||{}).name;
       const ok=await write(async db=>{
         await db.doc("assets/"+t).set(asset);
-        if(priceChanged){const data={name,price,currency:cur.value,asOf:date,source:price!==num(p.price)||!p.source?"직접 입력":p.source,updatedAt:new Date().toISOString()};if(p.prevClose)data.prevClose=p.prevClose;await db.doc("prices/"+t).set(data);}
+        // 종목명을 바꾸면 보유 종목에 적힌 예전 이름도 바꾼다 (예전 이름이 메모처럼 보이지 않게)
+        if(!isNew&&oldName&&oldName!==name)for(const [hid,h] of Object.entries(S.holdingsRaw||{}))if(tkey(h.ticker)===t&&h.name===oldName)await db.doc("holdings/"+hid).update({name});
+        // 직접 넣은 가격: 같은 날 값을 고친 것이면 전일 종가를 두고, 다른 날이면 전일 종가를 모르므로 뺀다
+        if(priceEdited){const data={name,price,currency:cur.value,asOf:date,source:price!==num(pc.price)||!pc.source?"직접 입력":pc.source,updatedAt:new Date().toISOString()};if(pc.prevClose&&date===pc.asOf)data.prevClose=pc.prevClose;await db.doc("prices/"+t).set(data);}
+        else if(metaOnly)await db.doc("prices/"+t).update({name,currency:cur.value,updatedAt:new Date().toISOString()});
       },isNew?"관심 목록에 추가했습니다":"저장했습니다");
-      if(ok)closeSheet();};
+      if(ok)closeSheetOf(bg);};
     const del=bg.querySelector("#aDel");if(del)armDelete(del,async()=>{
       if(heldInfo().m[ticker]){toast("보유 중인 종목은 삭제할 수 없습니다");return;}
-      if(await write(async db=>{if(S.assets[ticker])await db.doc("assets/"+ticker).delete();if(S.prices[ticker])await db.doc("prices/"+ticker).delete();},"‘관심’ 메뉴에서 삭제했습니다"))closeSheet();});
+      if(await write(async db=>{if(S.assets[ticker])await db.doc("assets/"+ticker).delete();if(S.prices[ticker])await db.doc("prices/"+ticker).delete();},"‘관심’ 메뉴에서 삭제했습니다"))closeSheetOf(bg);});
   });}
 
 /* ---------- 순서 변경 ---------- */
@@ -2757,13 +2982,16 @@ function moveHold(id,dir){const h=S.holdings[id];if(!h)return;const list=acctHol
   applyOrder("holdings",list,S.holdings);}
 function moveAsset(t,dir){const list=watchList();const i=list.findIndex(x=>x.ticker===t),j=i+dir;if(i<0||j<0||j>=list.length)return;[list[i],list[j]]=[list[j],list[i]];
   const changed=list.map((x,k)=>[x,k]).filter(([x,k])=>x.order!==k);
-  changed.forEach(([x,k])=>{S.assets[x.ticker]={...(S.assets[x.ticker]||{ticker:x.ticker,name:x.name,currency:x.currency,assetClass:x.assetClass,riskyDefault:x.riskyDefault??null}),order:k};});hydrate();render();
-  orderQ=orderQ.then(()=>write(async db=>{for(const [x,k] of changed){const {id,saved,held,...doc}=S.assets[x.ticker];await db.doc("assets/"+x.ticker).set({...doc,order:k});}}));}
+  const had=new Set(changed.filter(([x])=>S.assets[x.ticker]).map(([x])=>x.ticker));
+  changed.forEach(([x,k])=>{S.assets[x.ticker]={...(S.assets[x.ticker]||{ticker:x.ticker,name:x.name,currency:x.currency,assetClass:x.assetClass,riskyDefault:x.riskyDefault??null}),order:k};S.ordPend.assets[x.ticker]=k;});hydrate();render();
+  // 이미 있는 관심 종목은 순서만 고친다 (다른 곳에서 바뀐 이름 등을 옛 값으로 덮지 않게)
+  orderQ=orderQ.then(async()=>{const ok=await write(async db=>{for(const [x,k] of changed){if(had.has(x.ticker))await db.doc("assets/"+x.ticker).update({order:k});else{const {id,saved,held,...doc}=S.assets[x.ticker];await db.doc("assets/"+x.ticker).set({...doc,order:k});}}});
+    if(!ok)changed.forEach(([x])=>delete S.ordPend.assets[x.ticker]);});}
 let orderQ=Promise.resolve();
 function applyOrder(col,list,store){
   const changed=list.map((x,i)=>[x.id,i]).filter(([id,i])=>store[id]&&store[id].order!==i);
-  changed.forEach(([id,i])=>{store[id]={...store[id],order:i};if(col==="holdings"&&S.holdingsRaw[id])S.holdingsRaw[id]={...S.holdingsRaw[id],order:i};});render();
-  orderQ=orderQ.then(()=>write(async db=>{for(const [id,i] of changed)await db.doc(col+"/"+id).update({order:i});}));}
+  changed.forEach(([id,i])=>{store[id]={...store[id],order:i};S.ordPend[col][id]=i;if(col==="holdings"&&S.holdingsRaw[id])S.holdingsRaw[id]={...S.holdingsRaw[id],order:i};});render();
+  orderQ=orderQ.then(async()=>{const ok=await write(async db=>{for(const [id,i] of changed)await db.doc(col+"/"+id).update({order:i});});if(!ok)changed.forEach(([id])=>delete S.ordPend[col][id]);});}
 
 /* ---------- events ---------- */
 app.addEventListener("click",async e=>{const t=e.target.closest("button");if(!t)return;
@@ -2800,10 +3028,11 @@ app.addEventListener("click",async e=>{const t=e.target.closest("button");if(!t)
     case "addHold":holdSheet(null,S.openAcct);break;
     case "snapBtn":await recordSnap(false);break;
     case "copyReq":{const txt="Kinfolio 가격 업데이트해줘";try{await navigator.clipboard.writeText(txt);toast("복사했습니다");}catch(err){toast("복사할 수 없습니다: "+txt);}break;}
-    case "saveSettings":{const data={usdkrw:num(document.getElementById("sFx").value)||null,updatedAt:new Date().toISOString()};
-      if(data.usdkrw&&data.usdkrw!==num(S.settings.usdkrw))data.fxAsOf=today();
+    case "saveSettings":{const raw=document.getElementById("sFx").value;if(badNum(raw)){toast("환율은 숫자로 넣으세요");break;}
+      const fxv=num(raw)||null;if(fxv&&!(fxv>=FX_MIN&&fxv<=FX_MAX)){toast(`USD/KRW 환율은 ${nf.format(FX_MIN)}~${nf.format(FX_MAX)} 사이로 넣으세요`);break;}
+      const data={usdkrw:fxv};if(fxv&&fxv!==num(S.settings.usdkrw))data.fxAsOf=today();
       const {targetAmount,startYear,...rest}=S.settings; // 쓰지 않는 예전 ‘은퇴 목표’ 값은 지운다
-      await write(db=>db.doc("settings/main").set({...rest,...data}),"환율을 저장했습니다");break;}
+      clearDraft("#sFx");await writeSettings({...rest,...data},"환율을 저장했습니다");render();break;}
     case "exportData":await exportData();break;
   }
 });
@@ -2822,19 +3051,32 @@ try { const v = localStorage.getItem("rf.pv"); if (v) S.planView = v; const r = 
 
 function has(v) { return v !== null && v !== undefined && v !== "" && isFinite(Number(v)); }
 function blankPlan() { return { members: [], incomes: [], expenses: [], events: [], transfers: [], properties: [], loans: [], futureAccounts: [], accountPlans: {}, surplusOrder: [], drawOrder: [], assumptions: {} }; }
-function PL() { if (!S.plan) S.plan = blankPlan(); const b = blankPlan(); for (const k in b) if (S.plan[k] == null) S.plan[k] = b[k]; return S.plan; }
-function AS() { return memo("AS", () => RE.deepMerge(RE.DEFAULT_ASSUMPTIONS, PL().assumptions || {})); }
+// 계획 문서의 모양을 맞춘다: 빠졌거나 모양이 틀린 항목(목록 자리에 다른 값, 목록 안의 빈 값)은 기본값으로 (앱이 멈추지 않게)
+function PL() { if (!S.plan || typeof S.plan !== "object") S.plan = blankPlan(); const P = S.plan, b = blankPlan();
+  for (const k in b) { const v = P[k];
+    if (v == null || typeof v !== "object" || Array.isArray(v) !== Array.isArray(b[k])) P[k] = b[k];
+    else if (Array.isArray(v) && k !== "surplusOrder" && k !== "drawOrder" && v.some(x => !x || typeof x !== "object")) P[k] = v.filter(x => x && typeof x === "object"); }
+  return P; }
+function curY() { return new Date().getFullYear(); }
+// 기준 연도는 비워 두면 해마다 올해. 저장된 값이 올해보다 앞서면(예전에 저장한 올해) 올해로 본다
+function baseYearOf(a) { const b = num((a || {}).baseYear); return b > curY() ? b : curY(); }
+function AS() { return memo("AS", () => { const a = RE.deepMerge(RE.DEFAULT_ASSUMPTIONS, PL().assumptions || {}); a.baseYear = baseYearOf(PL().assumptions); return a; }); }
 function mem(id) { return PL().members.find(m => m.id === id); }
 function memName(id) { if (id === "household") return "가구 공통"; const m = mem(id); return m ? m.name : "–"; }
 function primaryM() { const ms = PL().members; return ms.find(m => m.relation === "본인") || ms[0]; }
 function yr() { return num(AS().baseYear) || new Date().getFullYear(); }
 function ageNow(m) { return m ? yr() - num(m.birthYear) : null; }
 let planQ = Promise.resolve();
+// 계획 저장: 한 번에 하나씩 순서대로. 저장 중에 도착한 앞선 저장의 메아리는 무시하고(index.src.html 계획 구독), 실패하면 저장소 내용으로 되돌린다
+S.planPend = 0; S.planLastHash = "";
 function savePlan(msg) {
   const snap = JSON.parse(JSON.stringify(PL())); snap.updatedAt = new Date().toISOString();
+  S.planPend++; S.planLastHash = docHash(snap);
   S.simCache.key = null; render();
-  planQ = planQ.then(() => write(db => db.doc("plan/main").set(snap), msg));
-  return planQ;
+  const q = planQ.then(async () => { const ok = await write(db => db.doc("plan/main").set(snap), msg); S.planPend--;
+    if (!ok && !S.planPend) { S.plan = S.planServer ? JSON.parse(JSON.stringify(S.planServer)) : null; S.planExists = !!S.planServerExists; if (S.plan) PL(); S.simCache.key = null; render(); toast("계획을 저장하지 못해 방금 고친 내용을 되돌렸습니다. 다시 시도하세요", 5000); }
+    return ok; });
+  planQ = q.catch(() => {}); return q;
 }
 
 /* ---------- 엔진 입력 ---------- */
@@ -2899,7 +3141,8 @@ function planRetLabel() { const fx = fixRet(); return fx ? `고정 ${expTxt(fx.r
 function simWith(src, cache) { return memo("sim:" + src + ":" + cache, () => simWith0(src, cache)); }
 function simWith0(src, cache) {
   const uc = unitCfg(); const fx = fixRet();
-  const input = { plan: PL(), accounts: engineAccounts(src), firstYearFraction: yearFrac(), amtFmt: { unit: uc.u, dec: uc.d }, fixedReturn: fx ? { r: fx.r / 100, dy: fx.dy / 100 } : null, minCash: minCash() };
+  const P0 = PL(); const by = baseYearOf(P0.assumptions); const plan = num((P0.assumptions || {}).baseYear) === by ? P0 : { ...P0, assumptions: { ...(P0.assumptions || {}), baseYear: by } };
+  const input = { plan, accounts: engineAccounts(src), firstYearFraction: yearFrac(), amtFmt: { unit: uc.u, dec: uc.d }, fixedReturn: fx ? { r: fx.r / 100, dy: fx.dy / 100 } : null, minCash: minCash() };
   const key = JSON.stringify(input);
   if (S[cache] && S[cache].key === key) return S[cache].val;
   let val; try { val = RE.simulate(input); } catch (e) { val = { rows: [], warnings: [{ type: "err", from: yr(), to: yr(), msg: "계산 중 오류가 났습니다: " + e.message }], summary: null }; }
@@ -2911,7 +3154,10 @@ function getSimBase() { return retSrc() === "current" || fixRet() ? getSim() : s
 
 /* ---------- 표시 도우미 ---------- */
 function sh(n) { return fmtA(n, { bare: true, dash: true }); }
-function man(n) { return has(n) && num(n) ? nf.format(Math.round(num(n) / 1e4)) : ""; }
+const nfMan = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 4 });
+function man(n) { return has(n) && num(n) ? nfMan.format(num(n) / 1e4) : ""; }
+// 음수 표시: 표시값이 0이면 "-"를 붙이지 않는다
+function neg(s) { return /[1-9]/.test(s) ? "-" + s : s; }
 function viewSim() { const sim = getSim(); if (!S.resGroup || S.resGroup === "main" || !sim.groups) return sim; const g = sim.groups.find(x => x.key === S.resGroup); return g ? g.result : sim; }
 function ageMembers(sim) { const ids = sim.groupMembers || []; const ms = PL().members.filter(m => ids.includes(m.id)); return (sim.groupKey === "main" || !sim.groupKey) ? ms.filter(m => m.relation === "본인" || m.relation === "배우자") : ms; }
 function ageStr(row, sim) { return ageMembers(sim || viewSim()).filter(m => row.ages[m.id] != null).map(m => row.ages[m.id]).join("·"); }
@@ -2958,7 +3204,7 @@ function sheetErr(bg, m) { const e = bg.querySelector("#pErr"); e.textContent = 
 function wireSheet(bg, onSave, onDel) {
   bg.querySelector("#pCancel").onclick = closeSheet;
   bg.querySelector("#pSave").onclick = () => { const r = onSave(); if (r !== false) closeSheet(); };
-  const d = bg.querySelector("#pDel"); if (d && onDel) armDelete(d, () => { onDel(); closeSheet(); });
+  const d = bg.querySelector("#pDel"); if (d && onDel) armDelete(d, () => { if (onDel() !== false) closeSheet(); });
   segWire(bg);
 }
 
@@ -3006,7 +3252,7 @@ function vPlanHome() {
     const inH = m.inHorizon ?? ["본인", "배우자"].includes(m.relation);
     return `<button class="card acard mcard" data-psel="${esc(m.id)}"><div class="row"><div class="l"><span class="name">${esc(m.name)} <span class="chip">${esc(m.relation)}</span>${sep ? ` <span class="chip warn">${esc(RE.HH_LABEL[m.household])}</span>` : inH ? ` <span class="chip acc">계획 기간 기준</span>` : ""}</span>
       <span class="meta">${esc(m.birthYear)}년생 · 올해 ${ageNow(m)}세 · ${esc(m.deathAge)}세까지 계산 (${num(m.birthYear) + num(m.deathAge)}년)</span></div><span class="meta">›</span></div>
-      <div class="mfacts"><span>수입 <b>${nInc}</b></span><span>생활비 <b>${segNow ? "월 " + eok(segNow) : "–"}</b></span><span>계좌 <b>${nAcc}</b></span>${(() => { const fx = fixRet(); if (fx) return `<span>수익률 <b>고정 연 ${expTxt(fx.r)}</b></span>`; const e = retSrc() !== "current" ? planMemberExp(m.id) : memberExp(m.id); return e ? `<span>${retSrc() !== "current" ? "배분 후 " : ""}예상 수익률 <b>연 ${expTxt(e.r)}</b></span>` : ""; })()}${tIn || tOut ? `<span>이체 <b>${tIn ? "받음 " + tIn : ""}${tIn && tOut ? " · " : ""}${tOut ? "보냄 " + tOut : ""}</b></span>` : ""}${lr ? `<span>${num(m.birthYear) + num(m.deathAge) <= (rows[rows.length - 1] || {}).year ? "계획 끝" : "마지막 해"} 자산 <b>${eok(endAssets)}</b></span>` : ""}</div></button>`;
+      <div class="mfacts"><span>수입 <b>${nInc}</b></span><span>생활비 <b>${segNow ? "월 " + fmtM(segNow) : "–"}</b></span><span>계좌 <b>${nAcc}</b></span>${(() => { const fx = fixRet(); if (fx) return `<span>수익률 <b>고정 연 ${expTxt(fx.r)}</b></span>`; const e = retSrc() !== "current" ? planMemberExp(m.id) : memberExp(m.id); return e ? `<span>${retSrc() !== "current" ? "배분 후 " : ""}예상 수익률 <b>연 ${expTxt(e.r)}</b></span>` : ""; })()}${tIn || tOut ? `<span>이체 <b>${tIn ? "받음 " + tIn : ""}${tIn && tOut ? " · " : ""}${tOut ? "보냄 " + tOut : ""}</b></span>` : ""}${lr ? `<span>${num(m.birthYear) + num(m.deathAge) <= (rows[rows.length - 1] || {}).year ? "계획 끝" : "마지막 해"} 자산 <b>${eok(endAssets)}</b> <small>현재가치</small></span>` : ""}</div></button>`;
   }).join("");
   h += `<p class="hint" style="margin:0">‘계획 기간 기준’인 구성원 중 계획 끝 나이가 가장 늦은 해까지 계산합니다. 구성원마다 계획 끝 나이까지만 생활비·수입·이체·계좌를 계산하고, 그 뒤로는 그 사람의 계좌를 더 굴리거나 꺼내지 않고 남은 금액 그대로 둡니다. 구성원 정보는 구성원을 연 뒤 ‘정보 수정’에서 바꿉니다.</p>`;
   return h;
@@ -3030,9 +3276,9 @@ function vResult() {
     <div class="row"><span class="label">${sim.firstYearFraction < 0.999 ? `오늘–${sm.endYear}년` : `${sm.startYear}–${sm.endYear}년`} · ${sm.years}년 계획</span>${realToggle()}</div>
     <span class="label">계획 마지막 해 순자산${S.real ? " (현재가치)" : ""}</span>
     <span class="total">${eok(last.netWorth * d(last))}</span>
-    <div class="chips">${ok ? `<span class="chip good">✓ 계획 기간 내내 자산 유지</span>` : `<span class="chip bad">! ${sm.depletionYear}년부터 생활비 통장 마이너스</span><span class="chip">가장 깊을 때 ${sm.maxDebtYear}년 ${eok(-(S.real ? sm.maxDebtReal : sm.maxDebt))}</span>`}
-    ${ok ? `<span class="chip">최저 금융자산 ${sm.minFinancialYear}년 ${eok(S.real ? sm.minFinancialReal : sim.rows.find(r => r.year === sm.minFinancialYear).financial)}</span>` : ""}<button type="button" class="chip${fixRet() ? " warn" : ""}" data-go="settings">수익률 ${esc(planRetLabel())}</button>${minCash() ? `<button type="button" class="chip" data-go="settings">생활비 통장 최소 ${eok(minCash())} 유지</button>` : ""}</div>
-    <span class="meta">계획 기간 세금 ${eok(sm.totalTax)} · 건강보험료 ${eok(sm.totalHealth)} (명목 합계, 배당 원천징수 포함)</span>
+    <div class="chips">${ok ? `<span class="chip good">✓ 계획 기간 내내 자산 유지</span>` : `<span class="chip bad">! ${sm.depletionYear}년부터 생활비 통장 마이너스</span>${(() => { const dr = sim.rows.filter(r => r.debt > 0).reduce((a, r) => !a || r.debt * d(r) > a.debt * d(a) ? r : a, null); return dr ? `<span class="chip">가장 깊을 때 ${dr.year}년 ${eok(-dr.debt * d(dr))}</span>` : ""; })()}`}
+    ${ok ? (() => { const mr = sim.rows.reduce((a, r) => r.financial * d(r) < a.financial * d(a) ? r : a); return `<span class="chip">최저 금융자산 ${mr.year}년 ${eok(mr.financial * d(mr))}</span>`; })() : ""}<button type="button" class="chip${fixRet() ? " warn" : ""}" data-go="settings">수익률 ${esc(planRetLabel())}</button>${minCash() ? `<button type="button" class="chip" data-go="settings">생활비 통장 최소 ${eok(minCash())} 유지</button>` : ""}</div>
+    <span class="meta">계획 기간 세금 ${eok(sim.rows.reduce((s2, r) => s2 + (r.tax - (r.credits || 0)) * d(r), 0))} (세액공제 차감 후, 배당 원천징수 포함) · 건강보험료 ${eok(sim.rows.reduce((s2, r) => s2 + r.health * d(r), 0))} · ${S.real ? "현재가치" : "명목"} 합계</span>
   </section>`;
   h += `<section class="card"><div class="row"><h2>연도별 자산</h2><span class="meta">${S.real ? "현재가치" : "명목"} · ${unitName()}</span></div>
     <div class="chart-wrap" id="chartWrap"><div class="chart-tip" id="chartTip" hidden></div></div>
@@ -3043,7 +3289,7 @@ function vResult() {
   if (sim.warnings.length) h += `<section class="card"><div class="row"><h2>확인할 점 ${sim.warnings.length}</h2>${wsAll.length > WN + 1 ? `<button type="button" class="btn small" data-warnall="${S.warnAll ? 0 : 1}">${S.warnAll ? "접기" : `모두 보기 (${wsAll.length}개)`}</button>` : ""}</div><div class="list">${ws.map(w => `<div class="item"><div class="row" style="align-items:flex-start"><span>${esc(w.msg)}</span><span class="chip ${w.type === "deficit" ? "bad" : "warn"}" style="flex-shrink:0">${w.from === w.to ? w.from : `${w.from}–${w.to}`}</span></div></div>`).join("")}</div></section>`;
   const mNames = ageMembers(sim).map(m => m.name).join("·");
   h += `<section class="card"><div class="row"><h2>연도별 현금흐름</h2><span class="meta">${S.real ? "현재가치" : "명목"} · 행을 누르면 상세</span></div>
-  ${flowTable(sim.rows, HH_COLS.concat([rateCol(sim)]), d, r => ageStr(r, sim), { ageLabel: mNames, partialYear: sim.firstYearFraction < 0.999 ? sim.rows[0].year : null, rowClass: r => `${r.overdraft > 5000 ? "bad" : ""}${r.events.length ? " ev" : ""}` })}
+  ${flowTable(sim.rows, HH_COLS.concat([rateCol(sim)]), d, r => ageStr(r, sim), { ageLabel: mNames, partialYear: sim.firstYearFraction < 0.999 ? sim.rows[0].year : null, rowClass: r => `${shows(r.overdraft * d(r)) ? "bad" : ""}${r.events.length ? " ev" : ""}` })}
   <p class="hint" style="margin:0">${partialNote(sim)}값이 없는 항목은 표에서 뺐습니다. 계좌 인출은 계좌에서 꺼낸 돈, 계좌 납입은 계좌에 넣은 돈입니다. 세금은 그해 현금으로 낸 세금이고, 계좌 해지 때 떼는 세금과 배당 원천징수는 들어오는 금액에서 이미 빠져 있습니다. ● 표시가 있는 해에는 계좌 해지·목돈 지출 같은 일이 있습니다. 인출률은 그해 계좌(연금계좌·일반·ISA)에서 꺼낸 돈을 연초 금융자산으로 나눈 값이고(생활비 통장에서 쓴 돈은 뺌), 4%를 넘는 해는 굵게 표시합니다.</p></section>`;
   h += memberTaxSection(sim, d);
   return h;
@@ -3072,7 +3318,7 @@ function vMemberResult(sim, id) {
   let h = `<section class="hero"><div class="row"><span class="label">${esc(m.name)} (${esc(m.relation)}) · ${esc(m.birthYear)}년생${ended ? ` · ${num(m.birthYear) + num(m.deathAge)}년 ${m.deathAge}세까지 계산` : ""}</span>${realToggle()}</div>
     <span class="label">${ended ? `계획 끝(${m.deathAge}세)에 남는` : "계획 마지막 해"} 본인 명의 금융자산${S.real ? " (현재가치)" : ""}</span>
     <span class="total">${eok(bp(lastR).assets * d(lastR))}</span>
-    <div class="kv"><div><span>계획 기간 수입</span><b>${eok(T.inc)}</b></div><div><span>연금계좌 수령</span><b>${eok(T.pd)}</b></div><div><span>계획 기간 세금</span><b>${eok(T.tax)}</b></div></div>
+    <div class="kv"><div><span>계획 기간 수입</span><b>${eok(T.inc)}</b></div><div><span>연금계좌 수령</span><b>${eok(T.pd)}</b></div><div><span>계획 기간 세금 <small>공제 후</small></span><b>${eok(T.tax)}</b></div></div>
     ${hasTr ? `<span class="meta">가족 간 이체: 받음 ${eok(T.tIn)} · 보냄 ${eok(T.tOut)}</span>` : ""}
     ${(() => { const fx = fixRet(); if (fx) return `<span class="meta"><span class="chip warn">수익률 ${esc(planRetLabel())}</span> 모든 계좌를 이 수익률로 계산했습니다</span>`; const al = retSrc() !== "current"; const e = al ? planMemberExp(id) : memberExp(id); return e ? `<span class="meta">${al ? `배분 후 ${esc(m.name)} 명의 계좌 예상 연수익률` : `지금 ${esc(m.name)} 명의 계좌 예상 연수익률`} <b>${expTxt(e.r)}</b> · 수익률 ${esc(planRetLabel())}</span>` : ""; })()}
   </section>`;
@@ -3087,7 +3333,7 @@ function vMemberResult(sim, id) {
     { g: "out", label: "본인 생활비", get: r => bp(r).living }, { g: "out", label: "목돈 지출", get: r => bp(r).lump }, { g: "out", label: "가계 공통비", get: r => bp(r).shared || 0 }, { g: "out", label: "건강보험료", get: r => bp(r).health || 0 },
     { g: "out", label: "이체 보냄", get: r => bp(r).transferOut }, { g: "out", label: "계좌 납입", get: r => bp(r).contrib }, { g: "out", label: "생활비 통장 입금", get: r => bp(r).toCash || 0 }, { g: "out", label: "세금", get: r => bp(r).taxCash || 0 },
     { g: "end", label: "연금계좌", get: r => bp(r).pension }, { g: "end", label: "ISA", get: r => bp(r).isa }, { g: "end", label: "일반", get: r => bp(r).general }, { g: "end", label: "생활비 통장", get: r => bp(r).cash || 0 },
-    { g: "end", label: "합계", get: r => bp(r).assets, always: true, bold: true }, rateCol(sim, id)], d, r => r.ages[id] ?? "–", { mid: id,  partialYear: sim.firstYearFraction < 0.999 ? rows[0].year : null, rowClass: r => `${(bp(r).overdraft || 0) > 5000 ? "bad" : ""}${memberEvents(r, id).length ? " ev" : ""}` })}
+    { g: "end", label: "합계", get: r => bp(r).assets, always: true, bold: true }, rateCol(sim, id)], d, r => r.ages[id] ?? "–", { mid: id,  partialYear: sim.firstYearFraction < 0.999 ? rows[0].year : null, rowClass: r => `${shows((bp(r).overdraft || 0) * d(r)) ? "bad" : ""}${memberEvents(r, id).length ? " ev" : ""}` })}
   <p class="hint" style="margin:0">${partialNote(sim)}● 표시가 있는 해에는 ${esc(m.name)}의 계좌 개설·해지, 퇴직금, 목돈 지출 같은 일이 있습니다(행을 누르면 보입니다). 표와 그래프는 ${esc(m.name)}의 계획 끝 나이(${esc(m.deathAge)}세)까지만 보여줍니다. 계좌는 명의자 기준입니다. 가구 공통 생활비·주택·대출·건강보험료는 내는 사람(가정 탭에서 지정)의 표에 들어갑니다. 이 표의 세금은 그해 생활비 통장에서 낸 세금이고, 배당·해지 때 계좌에서 바로 떼인 원천징수는 계좌 잔액에서 빠져 여기엔 없습니다(위 ‘계획 기간 세금’에는 포함). 세액공제 환급은 현금 증가 쪽에 따로 나옵니다. 인출률은 ${esc(m.name)} 명의 계좌에서 꺼낸 돈 ÷ 연초 ${esc(m.name)} 금융자산이고, 4%를 넘는 해는 굵게 표시합니다. 값이 없는 항목은 뺐습니다.</p></section>`;
   return h;
 }
@@ -3126,9 +3372,8 @@ function flowTable(rows, cols, d, ageFn, opts = {}) {
   const allRows = rows; rows = flowRows(rows, opts);
   const GL = { in: ["현금 증가", "g-in"], out: ["현금 감소", "g-out"], end: ["연말 자산", "g-end"], rt: ["비율", "g-rt"] };
   // pct 열은 금액이 아니라 비율(현재가치·명목과 무관): 값이 있는 해가 하나라도 있으면 보여 준다
-  const vis = cols.filter(c => c.always || allRows.some(r => c.pct ? (c.get(r) || 0) > 0.00005 : Math.abs(c.get(r) * d(r)) >= 5000));
+  const vis = cols.filter(c => c.always || allRows.some(r => c.pct ? pctTxt(c.get(r)) !== "–" : shows(c.get(r) * d(r))));
   const groups = ["in", "out", "end", "rt"].map(g => [g, vis.filter(c => c.g === g)]).filter(([, cs]) => cs.length);
-  const pctTxt = v => v == null ? "–" : v > 0.00005 ? `${(Math.round(v * 1000) / 10).toLocaleString("ko-KR")}%` : "–";
   const head1 = `<tr><th rowspan="2">연도</th><th rowspan="2">나이${opts.ageLabel ? `<br><small>${esc(opts.ageLabel)}</small>` : ""}</th>${groups.map(([g, cs]) => `<th colspan="${cs.length}" class="gh ${GL[g][1]}">${GL[g][0]}</th>`).join("")}</tr>`;
   const head2 = `<tr>${groups.map(([, cs]) => cs.map((c, i) => `<th class="${i === 0 ? "gs" : ""}">${esc(c.label)}</th>`).join("")).join("")}</tr>`;
   const fy = opts.partialYear;
@@ -3136,6 +3381,9 @@ function flowTable(rows, cols, d, ageFn, opts = {}) {
     if (c.pct) return `<td${cl}>${pctTxt(c.get(r))}</td>`; const v = c.get(r) * k; return `<td${cl}>${c.bold ? `<b>${sh(v)}</b>` : sh(v)}</td>`; }).join("")).join("")}</tr>`; }).join("");
   return `<div class="tbl-wrap"><table class="tbl ft"><thead>${head1}${head2}</thead><tbody>${body}</tbody></table></div>${flowToggle(allRows.length)}`;
 }
+// 인출률 표시: 표와 연도 상세가 같은 규칙 (소수 첫째 자리, 0이면 –)
+function pctTxt(v) { if (v == null || !isFinite(v)) return "–"; const r1 = Math.round(v * 1000) / 10, r2 = Math.round(v * 10000) / 100;   // 0.1% 미만은 소수 둘째 자리까지
+  return r1 > 0 ? `${r1.toLocaleString("ko-KR")}%` : r2 > 0 ? `${r2.toLocaleString("ko-KR")}%` : "–"; }
 const CAT_KEYS = [["pension", "연금계좌", "--c1"], ["isa", "ISA", "--c2"], ["general", "일반·생활비", "--c3"], ["house", "주택 순가치", "--c4"]];
 
 function axLbl(v, step) { const div = unitCfg().u === "eok" ? 1e8 : 1e4; const st = step / div; const dd = st >= 1 ? 0 : Math.min(4, Math.ceil(-Math.log10(st) - 1e-9)); return (v / div).toLocaleString("ko-KR", { minimumFractionDigits: dd, maximumFractionDigits: dd }); }
@@ -3176,7 +3424,7 @@ function drawChart() {
     const i = Math.max(0, Math.min(rows.length - 1, Math.round((px - L) / (W - L - R) * (rows.length - 1))));
     const r = rows[i], v = vals[i]; xh.setAttribute("x1", x(i)); xh.setAttribute("x2", x(i)); xh.setAttribute("opacity", ".5");
     const ages = PL().members.filter(m => r.ages[m.id] != null && (!mid || m.id === mid)).map(m => `${esc(m.name)} ${r.ages[m.id]}세`).join(" · ");
-    tip.innerHTML = `<b>${r.year}년</b><span class="meta">${ages}</span>${CAT_KEYS.filter(([kk]) => !mid || kk !== "house").map(([kk, l, c]) => `<span class="tr"><i style="background:var(${c})"></i>${l}<b>${sh(v[kk])}</b></span>`).join("")}${v.debt ? `<span class="tr"><i style="background:var(--danger)"></i>생활비 통장 마이너스<b>${sh(-v.debt)}</b></span>` : ""}<span class="tr tot">${mid ? "합계" : "순자산"}<b>${sh(mid ? v.pension + v.isa + v.general : r.netWorth * k(r))}</b></span>`;
+    tip.innerHTML = `<b>${r.year}년</b><span class="meta">${ages}</span>${CAT_KEYS.filter(([kk]) => !mid || kk !== "house").map(([kk, l, c]) => `<span class="tr"><i style="background:var(${c})"></i>${l}<b>${sh(v[kk])}</b></span>`).join("")}${v.debt ? `<span class="tr"><i style="background:var(--danger)"></i>생활비 통장 마이너스<b>${sh(-v.debt)}</b></span>` : ""}<span class="tr tot">${mid ? "합계" : "순자산"}<b>${sh(mid ? (((r.byPerson || {})[mid] || {}).assets || 0) * k(r) : r.netWorth * k(r))}</b></span>`;
     tip.hidden = false; const tw = tip.offsetWidth; let left = x(i) + 12; if (left + tw > W) left = x(i) - tw - 12; tip.style.left = Math.max(0, left) + "px";
   };
   hit.addEventListener("pointermove", show); hit.addEventListener("pointerdown", show);
@@ -3207,11 +3455,11 @@ function rateInfo(id) {
 }
 function acctFlowHtml(a, x, f, sim, k) {
   const mo = pr => pr < 1 ? ` × ${Math.round(pr * 12)}/12개월` : "";
-  const sg = v => fmtA(v * k, { plus: true }); const big = v => Math.abs(v * k) >= 5000;
+  const sg = v => fmtA(v * k, { plus: true }); const big = v => shows(v * k);
   if (x.closed) return `<details class="acf"><summary><span class="nm">${esc(a.name)}</span><span class="acf-v"><b>${f(0)}</b><span class="meta">${esc(x.why)}</span></span></summary><div class="kvlist">${kv("연초 잔액", f(x.start))}${x.tax > 1 ? kv("해지할 때 낸 세금", sg(-x.tax)) : ""}${kv(`${esc(x.to)}(으)로 옮김`, sg(-x.net))}${kv("<b>연말 잔액</b>", `<b>${f(0)}</b>`)}</div></details>`;
   const pen = PENSION_T.has(a.type), isa = a.type === "ISA", cash = a.type === "현금" || a.type === "생활비";
   const d = x.end - x.start; const earn = x.growth + x.odInt - x.divTax;
-  const sum = `<summary><span class="nm">${esc(a.name)}</span><span class="acf-v"><b>${f(x.end)}</b><span class="meta ${d * k >= 5000 ? "up" : d * k <= -5000 ? "down" : ""}">${big(d) ? sg(d) : "변동 없음"}${big(x.growth) ? ` · 수익 ${sg(x.growth)}` : ""}</span></span></summary>`;
+  const sum = `<summary><span class="nm">${esc(a.name)}</span><span class="acf-v"><b>${f(x.end)}</b><span class="meta ${big(d) ? (d > 0 ? "up" : "down") : ""}">${big(d) ? sg(d) : "변동 없음"}${big(x.growth) ? ` · 수익 ${sg(x.growth)}` : ""}</span></span></summary>`;
   let b = kv("연초 잔액", f(x.start));
   for (const [l, v] of x.src || []) b += kv(esc(l), sg(v));
   if (big(x.contrib)) b += kv(cash ? "입금" : "납입", sg(x.contrib));
@@ -3232,34 +3480,34 @@ function yearSheet(year) {
   const sim = viewSim(); const r = sim.rows.find(x => x.year === year); if (!r) return;
   const k = S.real ? 1 / r.infl : 1; const f = n => eok((n || 0) * k);
   const part = r.year === (sim.rows[0] || {}).year && sim.firstYearFraction < 0.999; const mN = part ? Math.round(sim.firstYearFraction * 12) : 12;
-  const mm = (l, n) => mN > 0 && Math.abs((n || 0) * k) >= 5000 ? kv(`${l} <span class="meta">월 ${fmtM((n || 0) * k / mN)} × ${mN}개월</span>`, f(n)) : "";
+  const mm = (l, n) => mN > 0 && shows((n || 0) * k) ? kv(`${l} <span class="meta">${monthX((n || 0) * k, mN)}</span>`, f(n)) : "";
   const ages = PL().members.filter(m => r.ages[m.id] != null).map(m => `${esc(m.name)} ${r.ages[m.id]}세`).join(" · ");
   const tpm = PL().members.filter(m => { const t = (r.taxByPerson || {})[m.id]; return t && (Math.abs(t.total) > 1 || t.credit > 1); });
   const tkeys = TAX_KEYS.filter(([kk]) => tpm.some(m => r.taxByPerson[m.id][kk] > 1));
   const taxTable = tpm.length ? `<div class="tbl-wrap"><table class="tbl in2"><thead><tr><th>세목</th>${tpm.map(m => `<th>${esc(m.name)}</th>`).join("")}</tr></thead><tbody>
     ${tkeys.map(([kk, l]) => `<tr><td>${esc(l)}</td>${tpm.map(m => `<td>${sh(r.taxByPerson[m.id][kk] * k)}</td>`).join("")}</tr>`).join("")}
-    ${tpm.some(m => r.taxByPerson[m.id].credit > 1) ? `<tr><td>연금 세액공제</td>${tpm.map(m => `<td>${r.taxByPerson[m.id].credit > 1 ? "-" + sh(r.taxByPerson[m.id].credit * k) : "–"}</td>`).join("")}</tr>` : ""}
+    ${tpm.some(m => r.taxByPerson[m.id].credit > 1) ? `<tr><td>연금 세액공제</td>${tpm.map(m => `<td>${r.taxByPerson[m.id].credit > 1 ? neg(sh(r.taxByPerson[m.id].credit * k)) : "–"}</td>`).join("")}</tr>` : ""}
     <tr class="tot"><td>합계</td>${tpm.map(m => `<td><b>${sh(r.taxByPerson[m.id].total * k)}</b></td>`).join("")}</tr></tbody></table></div>` : "";
-  const kn = (l, n) => Math.abs((n || 0) * k) >= 5000 ? kv(l, f(n)) : "";
+  const kn = (l, n) => shows((n || 0) * k) ? kv(l, f(n)) : "";
   const inSum = r.salary + r.npension + (r.basic || 0) + r.otherIncome + (r.transferIn || 0) + (r.inheritIn || 0) + (r.propSaleCash || 0) + (r.acctClose || 0) + (r.loanIn || 0) + r.pensionDraw + r.otherDraw + r.credits;
   const outSum = r.living + (r.transfer || 0) + r.lump + r.housing + r.contrib + r.toCash + r.taxCash + r.health;
   const trV = x => { const lab = `${esc(x.name)} <span class="meta">${esc(memName(x.from))} → ${esc(memName(x.to))}${x.acctName ? ` ${esc(x.acctName)}(납입)` : ""}${x.cut > 1 ? ` · 보내는 사람 돈이 모자라 ${f(x.cut)} 줄임` : ""}</span>`; return trRow(lab, x, mm, kn); };
   const choice = Object.entries(r.taxB.choice || {}).filter(([, c]) => c !== "low").map(([id, c]) => `${esc(memName(id))}: ${choiceText(c)}`);
   const accts = sim.accounts.filter(a => r.balances[a.id] != null || (r.draws[a.id] || 0) > 0 || (r.acctFlow || {})[a.id]);
   openSheet(`<h3>${year}년${part ? ` <span class="chip">남은 ${mN}개월만 계산</span>` : ""}</h3><span class="meta">${ages}${S.real ? " · 금액은 현재가치" : ""}${part ? " · 올해 지금까지의 수입·지출·수익은 현재 잔액에 이미 들어 있습니다" : ""}</span>
-  ${r.events.length ? `<div class="evlist">${r.events.map(e => `<span class="chip">${esc(e)}</span>`).join("")}</div>` : ""}
+  ${r.events.length ? `<div class="evlist">${r.events.map((e, i) => `<span class="chip">${esc(evText(r, i, k))}</span>`).join("")}</div>` : ""}
   <div class="kvlist"><h4 class="g-in">현금 증가 <span>${f(inSum)}</span></h4>
-   ${mm("근로소득(세후)", r.salary)}${mm("국민연금", r.npension)}${mm("기초연금", r.basic || 0)}${kn("기타 수입", r.otherIncome)}${(r.transfers || []).filter(x => x.dir === "in").map(trV).join("")}${kn("주택 매각", r.propSaleCash || 0)}${kn("계좌 해지 (세후)", r.acctClose || 0)}${kn("대출 실행", r.loanIn || 0)}${kn("연금계좌 인출", r.pensionDraw)}${kn("일반·ISA·생활비 통장 인출", r.otherDraw)}${r.overdraft > 5000 ? kv(`<span class="meta">└ 그중 잔액이 없어 생활비 통장을 마이너스로 쓴 돈</span>`, `<span class="up">${f(r.overdraft)}</span>`) : ""}${kn("연금 세액공제 환급", r.credits)}
+   ${mm("근로소득(세후)", r.salary)}${mm("국민연금", r.npension)}${mm("기초연금", r.basic || 0)}${kn("기타 수입", r.otherIncome)}${(r.transfers || []).filter(x => x.dir === "in").map(trV).join("")}${kn("주택 매각", r.propSaleCash || 0)}${kn("계좌 해지 (세후)", r.acctClose || 0)}${kn("대출 실행", r.loanIn || 0)}${kn("연금계좌 인출", r.pensionDraw)}${kn("일반·ISA·생활비 통장 인출", r.otherDraw)}${shows(r.overdraft * k) ? kv(`<span class="meta">└ 그중 잔액이 없어 생활비 통장을 마이너스로 쓴 돈</span>`, `<span class="up">${f(r.overdraft)}</span>`) : ""}${kn("연금 세액공제 환급", r.credits)}
    <h4 class="g-out">현금 감소 <span>${f(outSum)}</span></h4>
    ${mm("생활비", r.living)}${(r.transfers || []).filter(x => x.dir === "out").map(trV).join("")}${kn("목돈 지출", r.lump)}${kn("주택 매입·대출 상환", r.housing)}${kn("계좌 납입", r.contrib)}${kn("생활비 통장 입금", r.toCash)}${kn("세금", r.taxCash)}${mm(`건강보험료 (${esc(r.healthStatus)}, 세대 합산)`, r.health)}
    ${(r.transfers || []).some(x => x.dir === "internal") ? `<h4>가계 안 이체 <span class="meta">가계 현금 변화 없음</span></h4>${(r.transfers || []).filter(x => x.dir === "internal").map(trV).join("")}` : ""}
    ${taxTable ? `<h4>구성원별 세금 <span class="meta">해지·원천징수분 포함</span></h4>${taxTable}${choice.map(c => `<span class="hint">${c}</span>`).join("")}` : ""}
    <h4 class="g-end">계좌별 증감 <span class="meta">누르면 무슨 가정으로 얼마나 늘었는지 보입니다</span></h4>
-   ${accts.filter(a => { const x = (r.acctFlow || {})[a.id]; return x && (x.closed || [x.start, x.end, x.draw, x.contrib, x.tin].some(v => Math.abs(v * k) >= 5000)); }).map(a => acctFlowHtml(a, r.acctFlow[a.id], f, sim, k)).join("")}
+   ${accts.filter(a => { const x = (r.acctFlow || {})[a.id]; return x && (x.closed || [x.start, x.end, x.draw, x.contrib, x.tin].some(v => shows(v * k))); }).map(a => acctFlowHtml(a, r.acctFlow[a.id], f, sim, k)).join("")}
    <h4 class="g-end">연말 자산</h4>
    ${kv("금융자산 합계", f(r.financial))}
-   ${(() => { const w = wdStats(sim, r); return w.draw > 1 && w.base > 0 ? kv(`인출률 <span class="meta">계좌 인출 ${f(w.draw)} ÷ 연초 금융자산 ${f(w.base)}</span>`, `${(Math.round(w.rate * 1000) / 10).toLocaleString("ko-KR")}%`) : ""; })()}
-   ${r.propVal ? kv("주택", f(r.propVal)) : ""}${r.loanBal ? kv("대출 잔액", "-" + f(r.loanBal)) : ""}
+   ${wdRow(sim, r)}
+   ${r.propVal ? kv("주택", f(r.propVal)) : ""}${r.loanBal ? kv("대출 잔액", neg(f(r.loanBal))) : ""}
    ${kv("<b>순자산</b>", `<b>${f(r.netWorth)}</b>`)}
   </div><div class="btns"><span class="grow"></span><button type="button" class="btn" id="pCancel">닫기</button></div>`, bg => { bg.querySelector("#pCancel").onclick = closeSheet; });
 }
@@ -3269,37 +3517,42 @@ function memberYearSheet(year, mid) {
   const b = (r.byPerson || {})[mid] || {}; const g = kk => b[kk] || 0;
   const k = S.real ? 1 / r.infl : 1; const f = n => eok((n || 0) * k);
   const part = r.year === (sim.rows[0] || {}).year && sim.firstYearFraction < 0.999; const mN = part ? Math.round(sim.firstYearFraction * 12) : 12;
-  const mm = (l, n) => mN > 0 && Math.abs((n || 0) * k) >= 5000 ? kv(`${l} <span class="meta">월 ${fmtM((n || 0) * k / mN)} × ${mN}개월</span>`, f(n)) : "";
-  const kn = (l, n) => Math.abs((n || 0) * k) >= 5000 ? kv(l, f(n)) : "";
+  const mm = (l, n) => mN > 0 && shows((n || 0) * k) ? kv(`${l} <span class="meta">${monthX((n || 0) * k, mN)}</span>`, f(n)) : "";
+  const kn = (l, n) => shows((n || 0) * k) ? kv(l, f(n)) : "";
   const trs = r.transfers || [];
   const trLab = x => `${esc(x.name)} <span class="meta">${esc(memName(x.from))} → ${esc(memName(x.to))}${x.acctName ? ` ${esc(x.acctName)}(납입)` : ""}${x.cut > 1 ? ` · 보내는 사람 돈이 모자라 ${f(x.cut)} 줄임` : ""}</span>`;
   const inSum = g("salary") + g("npension") + g("basic") + g("other") + g("transferIn") + g("inherit") + g("acctClose") + g("pensionDraw") + g("otherDraw") + g("cashDraw") + g("credit");
   const outSum = g("living") + g("lump") + g("shared") + g("health") + g("transferOut") + g("contrib") + g("toCash") + g("taxCash");
   const t = (r.taxByPerson || {})[mid];
   const tkeys = t ? TAX_KEYS.filter(([kk]) => t[kk] > 1) : [];
-  const taxT = t && (Math.abs(t.total) > 1 || t.credit > 1) ? `<h4>${esc(m.name)} 세금 <span class="meta">해지·원천징수분 포함</span></h4>${tkeys.map(([kk, l]) => kv(esc(l), f(t[kk]))).join("")}${t.credit > 1 ? kv("연금 세액공제", "-" + f(t.credit)) : ""}${kv("<b>합계</b>", `<b>${f(t.total)}</b>`)}${(r.taxB.choice || {})[mid] && r.taxB.choice[mid] !== "low" ? `<span class="hint">${choiceText(r.taxB.choice[mid])}</span>` : ""}` : "";
+  const taxT = t && (Math.abs(t.total) > 1 || t.credit > 1) ? `<h4>${esc(m.name)} 세금 <span class="meta">해지·원천징수분 포함</span></h4>${tkeys.map(([kk, l]) => kv(esc(l), f(t[kk]))).join("")}${t.credit > 1 ? kv("연금 세액공제", neg(f(t.credit))) : ""}${kv("<b>합계</b>", `<b>${f(t.total)}</b>`)}${(r.taxB.choice || {})[mid] && r.taxB.choice[mid] !== "low" ? `<span class="hint">${choiceText(r.taxB.choice[mid])}</span>` : ""}` : "";
   const af = r.acctFlow || {};
-  const accts = sim.accounts.filter(a => { const x = af[a.id]; return x && x.owner === mid && (x.closed || [x.start, x.end, x.draw, x.contrib, x.tin].some(v => Math.abs(v * k) >= 5000)); });
-  const evs = memberEvents(r, mid);
+  const accts = sim.accounts.filter(a => { const x = af[a.id]; return x && x.owner === mid && (x.closed || [x.start, x.end, x.draw, x.contrib, x.tin].some(v => shows(v * k))); });
+  const evs = memberEvents(r, mid, k);
   openSheet(`<h3>${year}년 · ${esc(m.name)} ${r.ages[mid] != null ? r.ages[mid] + "세" : ""}${part ? ` <span class="chip">남은 ${mN}개월만 계산</span>` : ""}</h3><span class="meta">${esc(m.name)}의 돈만 보여줍니다${S.real ? " · 금액은 현재가치" : ""}${part ? " · 올해 지금까지의 수입·지출·수익은 현재 잔액에 이미 들어 있습니다" : ""}</span>
   ${evs.length ? `<div class="evlist">${evs.map(e => `<span class="chip">${esc(e)}</span>`).join("")}</div>` : ""}
   <div class="kvlist"><h4 class="g-in">현금 증가 <span>${f(inSum)}</span></h4>
-   ${mm("근로소득(세후)", g("salary"))}${mm("국민연금", g("npension"))}${mm("기초연금", g("basic"))}${kn("기타 수입", g("other"))}${trs.filter(x => x.to === mid).map(x => trRow(trLab(x), x, mm, kn)).join("")}${kn("계좌 해지·매각·대출", g("acctClose"))}${kn("연금계좌 인출", g("pensionDraw"))}${kn("일반·ISA 인출", g("otherDraw"))}${kn("생활비 통장 인출", g("cashDraw"))}${g("overdraft") * k >= 5000 ? kv(`<span class="meta">└ 그중 잔액이 없어 마이너스로 쓴 돈</span>`, `<span class="up">${f(g("overdraft"))}</span>`) : ""}${kn("연금 세액공제 환급", g("credit"))}
+   ${mm("근로소득(세후)", g("salary"))}${mm("국민연금", g("npension"))}${mm("기초연금", g("basic"))}${kn("기타 수입", g("other"))}${trs.filter(x => x.to === mid).map(x => trRow(trLab(x), x, mm, kn)).join("")}${kn("계좌 해지·매각·대출", g("acctClose"))}${kn("연금계좌 인출", g("pensionDraw"))}${kn("일반·ISA 인출", g("otherDraw"))}${kn("생활비 통장 인출", g("cashDraw"))}${shows(g("overdraft") * k) ? kv(`<span class="meta">└ 그중 잔액이 없어 마이너스로 쓴 돈</span>`, `<span class="up">${f(g("overdraft"))}</span>`) : ""}${kn("연금 세액공제 환급", g("credit"))}
    <h4 class="g-out">현금 감소 <span>${f(outSum)}</span></h4>
    ${mm("생활비", g("living"))}${kn("목돈 지출", g("lump"))}${kn(`가계 공통비·주택·대출 <span class="meta">내는 사람으로 지정됨</span>`, g("shared"))}${mm(`건강보험료 <span class="meta">${esc(r.healthStatus)}, 세대 전체분을 냄</span>`, g("health"))}${trs.filter(x => x.from === mid).map(x => trRow(trLab(x), x, mm, kn)).join("")}${kn("계좌 납입", g("contrib"))}${kn("생활비 통장 입금", g("toCash"))}${kn("세금", g("taxCash"))}
    ${taxT}
    <h4 class="g-end">${esc(m.name)} 명의 계좌 증감 <span class="meta">누르면 무슨 가정으로 얼마나 늘었는지 보입니다</span></h4>
    ${accts.map(a => acctFlowHtml(a, af[a.id], f, sim, k)).join("") || `<span class="meta">변동이 있는 계좌가 없습니다.</span>`}
    <h4 class="g-end">연말 자산</h4>
-   ${kn("연금계좌", g("pension"))}${kn("ISA", g("isa"))}${kn("일반", g("general"))}${Math.abs(g("cash") * k) >= 5000 ? kv("생활비 통장", f(g("cash"))) : ""}
+   ${kn("연금계좌", g("pension"))}${kn("ISA", g("isa"))}${kn("일반", g("general"))}${shows(g("cash") * k) ? kv("생활비 통장", f(g("cash"))) : ""}
    ${kv(`<b>${esc(m.name)} 금융자산</b>`, `<b>${f(g("assets"))}</b>`)}
-   ${(() => { const w = wdStats(sim, r, mid); return w.draw > 1 && w.base > 0 ? kv(`인출률 <span class="meta">계좌 인출 ${f(w.draw)} ÷ 연초 ${esc(m.name)} 금융자산 ${f(w.base)}</span>`, `${(Math.round(w.rate * 1000) / 10).toLocaleString("ko-KR")}%`) : ""; })()}
+   ${wdRow(sim, r, mid, `${esc(m.name)} `)}
   </div><div class="btns"><span class="grow"></span><button type="button" class="btn" id="pCancel">닫기</button></div>`, bg => { bg.querySelector("#pCancel").onclick = closeSheet; });
 }
 // 이체 한 줄: 월 단위는 '월 금액 × 개월', 연 단위는 '연 1회 · N월'
 function trRow(lab, x, mm, kn) { return x.freq === "year" ? kn(`${lab} <span class="meta">연 1회 · ${x.month}월</span>`, x.amount) : mm(lab, x.amount); }
 // 그 구성원과 관련된 이벤트만 (계좌 개설·해지, 퇴직금, 목돈 지출, 계획 끝, 내는 사람이면 주택·대출)
-function memberEvents(r, mid) { return (r.events || []).filter((e, i) => ((r.eventWho || [])[i] || []).includes(mid)); }
+function memberEvents(r, mid, k) { return (r.events || []).map((e, i) => [e, i]).filter(([, i]) => ((r.eventWho || [])[i] || []).includes(mid)).map(([e, i]) => k == null ? e : evText(r, i, k)); }
+// 이벤트 문구: 금액이 든 이벤트는 화면 기준(현재가치·명목, 단위)으로 다시 쓴다
+function evText(r, i, k) { const t = (r.eventTpl || [])[i], a = (r.eventAmt || [])[i]; return t && a != null ? t.replace("{A}", eok(a * k)) : (r.events || [])[i]; }
+// 인출률 한 줄: 나누는 두 금액과 비율이 화면에서도 맞도록, 현재가치로 볼 때도 명목 금액으로 보여 준다
+function wdRow(sim, r, mid, who = "") { const w = wdStats(sim, r, mid); const t = pctTxt(w.rate); if (!(w.draw > 1) || !(w.base > 0) || t === "–") return "";
+  return kv(`인출률 <span class="meta">계좌 인출 ${eok(w.draw)} ÷ 연초 ${who}금융자산 ${eok(w.base)}${S.real ? " (명목)" : ""}</span>`, t); }
 function kv(l, v) { return `<div class="kvr"><span>${l}</span><span>${v}</span></div>`; }
 
 /* ---------- 가족 ---------- */
@@ -3328,14 +3581,30 @@ function memberSheet(m) {
     const o = { id: m.id || newPid("m_"), name, relation: rel, birthYear: by, deathAge: da, inHorizon: gv(bg, "mHor"), household: rel === "본인" ? "main" : gv(bg, "mHH") };
     const p = PL(); const i = p.members.findIndex(x => x.id === o.id); if (i >= 0) p.members[i] = o; else p.members.push(o);
     savePlan("저장했습니다");
-  }, () => { const p = PL(); p.members = p.members.filter(x => x.id !== m.id); p.expenses = p.expenses.filter(e => e.memberId !== m.id); savePlan("삭제했습니다"); }));
+  }, () => delMember(bg, m)));
+}
+// 구성원 삭제: 그 사람 명의 장부 계좌가 있으면 막고, 계획 항목(수입·지출·목돈·이체·개설 예정 계좌)은 함께 지운다
+function delMember(bg, m) {
+  const p = PL(); const id = m.id;
+  const own = Object.values(S.accounts || {}).filter(a => ownerOf(a) === id);
+  if (own.length) { sheetErr(bg, `${m.name} 명의 계좌가 ${own.length}개 있습니다 (${own.slice(0, 3).map(a => a.name).join(", ")}${own.length > 3 ? " 등" : ""}). 계좌 수정에서 명의자를 먼저 바꾸세요.`); return false; }
+  const fut = new Set(p.futureAccounts.filter(f => ((p.accountPlans || {})[f.id] || {}).ownerId === id).map(f => f.id));
+  const n = { 수입: p.incomes.filter(i => i.ownerId === id).length, 지출: p.expenses.filter(e => e.memberId === id).length, 목돈: p.events.filter(e => e.memberId === id).length,
+    이체: p.transfers.filter(t => t.fromId === id || t.toId === id).length, "개설 예정 계좌": fut.size };
+  p.members = p.members.filter(x => x.id !== id); p.incomes = p.incomes.filter(i => i.ownerId !== id); p.expenses = p.expenses.filter(e => e.memberId !== id);
+  p.events = p.events.filter(e => e.memberId !== id); p.transfers = p.transfers.filter(t => t.fromId !== id && t.toId !== id);
+  if (fut.size) { p.futureAccounts = p.futureAccounts.filter(f => !fut.has(f.id)); fut.forEach(f => delete p.accountPlans[f]); p.surplusOrder = (p.surplusOrder || []).filter(x => !fut.has(x)); p.drawOrder = (p.drawOrder || []).filter(x => !fut.has(x)); }
+  if (p.assumptions && p.assumptions.payerId === id) p.assumptions.payerId = null;
+  if (p.alloc && p.alloc[id]) delete p.alloc[id];
+  const parts = Object.entries(n).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`);
+  savePlan("삭제했습니다" + (parts.length ? ` (함께 지운 항목: ${parts.join(", ")})` : ""));
 }
 
 /* ---------- 수입 ---------- */
 const INC_T = { salary: "근로소득", npension: "국민연금", basic: "기초연금", severance: "퇴직금", other: "기타 수입" };
 function vIncome() {
   const pmid = S.planMember; const its = PL().incomes.filter(i => !pmid || i.ownerId === pmid);
-  const desc = i => { const o = memName(i.ownerId);
+  const desc = i => { const o = esc(memName(i.ownerId));
     if (i.type === "salary") return `${o} · ${num(i.fromAge) ? i.fromAge + "~" : "지금~"}${i.toAge}세 · 연 ${eok(i.amount)} (세후) · 매년 ${num(i.growth)}% 인상`;
     if (i.type === "basic") return `${o} · ${i.fromAge}~${has(i.toAge) ? i.toAge + "세" : "계획 끝까지"} · 월 ${fmtM(i.amount)} (현재가치) · ${has(i.indexRate) ? `매년 ${num(i.indexRate)}% 인상` : "물가만큼 인상"}`;
     if (i.type === "npension") return `${o} · ${i.fromAge}세부터 월 ${fmtM(i.amount)} (현재가치) · ${has(i.indexRate) ? `매년 ${num(i.indexRate)}% 인상` : "물가만큼 인상"}`;
@@ -3406,12 +3675,12 @@ function trMonth(t) { return Math.min(12, Math.max(1, Math.round(num(t.month) ||
 function trAmt(t) { return t.freq === "year" ? `연 ${eok(t.yearly)}` : `월 ${fmtM(t.monthly)}`; }
 // 연 단위 이체의 올해 분: 보내는 달이 올해 남은 기간에 있으면 올해 보내고, 이미 지났으면 보낸 것으로 본다
 function trThisYear(t) { return t.freq !== "year" || monthsLeft() >= 13 - trMonth(t); }
-function trRange(t) {
+function trRange(t, raw) {
   const ref = mem(t.basis === "from" ? t.fromId : t.toId); if (!ref) return "";
   const by = num(ref.birthYear); const y0 = has(t.fromAge) && num(t.fromAge) ? by + num(t.fromAge) : null; const y1 = has(t.toAge) ? by + num(t.toAge) : null;
   let s0 = Math.max(y0 || yr(), yr()); if (s0 === yr() && !trThisYear(t)) s0++;
   const from = s0 === yr() ? "올해" : s0 + "년";
-  return `${esc(ref.name)} ${y0 ? t.fromAge + "세" : "지금"}~${y1 ? t.toAge + "세" : "계획 끝"} · ${from}~${y1 ? y1 + "년" : ""}`;
+  return `${raw ? ref.name : esc(ref.name)} ${y0 ? t.fromAge + "세" : "지금"}~${y1 ? t.toAge + "세" : "계획 끝"} · ${from}~${y1 ? y1 + "년" : ""}`;
 }
 // 이체 받는 곳: 받는 사람 생활비 통장(현금) 또는 받는 사람 명의 계좌(생활비 계좌 제외, 개설 예정 포함)
 function trAcctOpts(toId) { return [["", "받는 사람 생활비 통장 (현금)"]].concat(allPlanAccounts().filter(a => a.type !== "생활비" && acctOwner(a.id) === toId).map(a => [a.id, `${a.name} (${a.type}${a.future ? " · 개설 예정" : ""})`])); }
@@ -3434,7 +3703,7 @@ function transferSheet(t) {
     bg.querySelector("#tTo").addEventListener("change", syncAcct);
     const yrs = () => { const fq = gv(bg, "tFreq"); const o = { fromId: gv(bg, "tFrom"), toId: gv(bg, "tTo"), basis: gv(bg, "tBasis"), fromAge: gn(bg, "tFromAge"), toAge: gn(bg, "tToAge"), freq: fq, month: gn(bg, "tMonth") };
       bg.querySelector("#tMonthF").hidden = fq !== "year"; bg.querySelector('label[for="tAmt"]').textContent = fq === "year" ? "연 금액 (만원, 현재가치)" : "월 금액 (만원, 현재가치)";
-      bg.querySelector("#tYears").textContent = "기간: " + trRange(o).replace(/<[^>]+>/g, "") + (fq === "year" ? ` · 매년 ${trMonth(o)}월` : ""); };
+      bg.querySelector("#tYears").textContent = "기간: " + trRange(o, true) + (fq === "year" ? ` · 매년 ${trMonth(o)}월` : ""); };
     ["tFrom", "tTo", "tBasis", "tFromAge", "tToAge", "tFreq", "tMonth"].forEach(id => { const e = bg.querySelector("#" + id); if (e) { e.addEventListener("input", yrs); e.addEventListener("change", yrs); } }); yrs();
     wireSheet(bg, () => {
     const o = { id: t.id || newPid("t_"), name: gv(bg, "tName") || "생활비 지급", fromId: gv(bg, "tFrom"), toId: gv(bg, "tTo"), basis: gv(bg, "tBasis"), inflate: gv(bg, "tInf"), fromAge: gn(bg, "tFromAge"), toAge: gn(bg, "tToAge"), onShort: gv(bg, "tShort") || "keep", toAccountId: gv(bg, "tAcct") || null };
@@ -3519,8 +3788,8 @@ function acctPlanSheet(id) {
     ${fut ? sheetBtns(false) : sheetBtns(true)}`, bg => wireSheet(bg, () => {
       const o = { ...ap, ownerId: gv(bg, "aOwner"), returnOverride: gn(bg, "aRet") };
       if (!fut && S.accounts[id] && S.accounts[id].ownerId !== o.ownerId) { const oid = o.ownerId; write(db => db.doc("accounts/" + id).update({ ownerId: oid })); }
-      p.accountPlans[id] = o; savePlan("저장했습니다");
-    }, fut ? () => { p.futureAccounts = p.futureAccounts.filter(x => x.id !== id); delete p.accountPlans[id]; p.surplusOrder = (p.surplusOrder || []).filter(x => x !== id); p.drawOrder = (p.drawOrder || []).filter(x => x !== id); savePlan("삭제했습니다"); } : null));
+      PL().accountPlans[id] = o; savePlan("저장했습니다");
+    }, fut ? () => { const p = PL(); p.futureAccounts = p.futureAccounts.filter(x => x.id !== id); delete p.accountPlans[id]; p.surplusOrder = (p.surplusOrder || []).filter(x => x !== id); p.drawOrder = (p.drawOrder || []).filter(x => x !== id); savePlan("삭제했습니다"); } : null));
     return;
   }
   const others = allPlanAccounts().filter(x => x.id !== id);
@@ -3534,7 +3803,7 @@ function acctPlanSheet(id) {
     <div class="grid2">${fld("세액공제 안 받은 원금 (만원)", "aFree", man(ap.freeBasis), { type: "num", hint: "꺼낼 때 세금이 없습니다" })}${fld("이연퇴직소득 (만원)", "aRetB", man(ap.retBasis), { type: "num" })}</div>
     ${fld("이연퇴직소득 실효세율 (%)", "aRetR", ap.retTaxRate ?? 5, { type: "num" })}`;
   if (t === "ISA") f += `<div class="grid2">${fld("가입 연도", "aIsaOpen", ap.isaOpenYear ?? (fut ? fut.openYear : ""), { type: "num", ph: fut ? "" : `모르면 ${yr()}년으로 봄`, hint: "3년이 지나야 비과세 혜택. 납입 한도(연 2,000만원, 안 쓴 한도 이월)도 이 해부터 셉니다" })}${fld("비과세 한도", "aIsaEx", ap.isaExempt ?? 2000000, { type: "select", options: [[2000000, "일반형 200만원"], [4000000, "서민형 400만원"]] })}</div>
-    ${fut ? "" : fld("지금까지 넣은 원금 (만원)", "aIsaPaid", man(ap.isaPaid), { type: "num", ph: `비우면 ${man(a.basis) || 0} (매입 원가+예수금)`, hint: "총 납입한도 1억원에서 이미 쓴 금액입니다. 중간에 인출했어도 넣은 금액 그대로 넣으세요" })}`;
+    ${fut ? "" : fld("지금까지 넣은 원금 (만원)", "aIsaPaid", man(ap.isaPaid), { type: "num", ph: `비우면 ${nf.format(Math.round(num(a.basis) / 1e4))} (매입 원가+예수금)`, hint: "총 납입한도 1억원에서 이미 쓴 금액입니다. 중간에 인출했어도 넣은 금액 그대로 넣으세요" })}`;
   f += fld("부족할 때 이 계좌에서 생활비를 자동으로 꺼내기", "aAuto", !autoOff(id), { type: "check" }) + `<span class="hint">명의자의 돈이 모자랄 때 이 계좌에서 자동으로 꺼냅니다. 끄면 계획한 수령 구간으로만 인출합니다.</span>`;
   f += `<h4>해지·이전</h4><div class="grid2">${fld("해지 연도", "aClose", ap.closeYear ?? "", { type: "num", ph: "해지 안 함" })}${fld("옮길 계좌", "aCloseTo", ap.closeTo || "", { type: "select", options: [["", "현금으로"]].concat(others.map(x => [x.id, x.name])) })}</div>
   ${t === "ISA" ? `<span class="hint">만기 ISA를 60일 안에 연금저축·IRP로 옮기면 옮긴 금액의 10%(최대 300만원)를 추가로 세액공제 받습니다. 새 ISA는 ‘개설 예정 계좌’로 추가하세요.</span>` : ""}
@@ -3555,9 +3824,9 @@ function acctPlanSheet(id) {
     if (bg.querySelector("#aAuto")) o.noAutoDraw = !gv(bg, "aAuto");
     o.contribs = segRead(bg, "c", cCols).filter(r => r.amount != null).map(r => ({ fromAge: r.fromAge ?? 0, toAge: r.toAge, amount: r.amount, inflate: !!r.inflate }));
     o.wds = segRead(bg, "w", wCols).map(r => { const mode = r.mode || "fixed"; const s = { fromAge: r.fromAge ?? 0, toAge: r.toAge, mode, inflate: r.inflate !== false }; if (mode === "fixed") s.amount = (r.val || 0) * 1e4; if (mode === "pct") s.pct = r.val || 0; return s; }).filter(s => s.mode !== "fixed" || s.amount > 0);
-    if (fut) { const fo = p.futureAccounts.find(x => x.id === id); fo.name = gv(bg, "fName") || fo.name; fo.type = gv(bg, "fType"); fo.openYear = gn(bg, "fOpen") || fo.openYear; fo.assetClass = gv(bg, "fClass"); }
-    p.accountPlans[id] = o; savePlan("저장했습니다");
-  }, fut ? () => { p.futureAccounts = p.futureAccounts.filter(x => x.id !== id); delete p.accountPlans[id]; p.surplusOrder = (p.surplusOrder || []).filter(x => x !== id); p.drawOrder = (p.drawOrder || []).filter(x => x !== id); savePlan("삭제했습니다"); } : null));
+    if (fut) { const fo = PL().futureAccounts.find(x => x.id === id); if (!fo) return sheetErr(bg, "이 계좌가 다른 곳에서 지워졌습니다."), false; fo.name = gv(bg, "fName") || fo.name; fo.type = gv(bg, "fType"); fo.openYear = gn(bg, "fOpen") || fo.openYear; fo.assetClass = gv(bg, "fClass"); }
+    PL().accountPlans[id] = o; savePlan("저장했습니다");
+  }, fut ? () => { const p = PL(); p.futureAccounts = p.futureAccounts.filter(x => x.id !== id); delete p.accountPlans[id]; p.surplusOrder = (p.surplusOrder || []).filter(x => x !== id); p.drawOrder = (p.drawOrder || []).filter(x => x !== id); savePlan("삭제했습니다"); } : null));
 }
 function futureSheet() {
   openSheet(`<h3>개설 예정 계좌</h3><span class="meta">예: 지금 ISA를 해지한 뒤 새로 여는 ISA, 배우자 명의 연금저축</span>
@@ -3612,7 +3881,7 @@ function vAssume() {
   const a = AS(); const h = a.health;
   const rows = CLASSES.map(c => `<tr><td>${c}</td><td><input id="asR_${c}" inputmode="decimal" value="${esc(a.returns[c])}" aria-label="${c} 예상 수익률"></td><td><input id="asD_${c}" inputmode="decimal" value="${esc(a.divYield[c])}" aria-label="${c} 배당수익률"></td></tr>`).join("");
   return `<section class="card"><h2>물가와 수익률</h2>
-  <div class="grid2">${fld("물가상승률 (%/년)", "asInf", a.inflation, { type: "num" })}${fld("기준 연도", "asBase", a.baseYear, { type: "num" })}</div>
+  <div class="grid2">${fld("물가상승률 (%/년)", "asInf", a.inflation, { type: "num" })}${fld("기준 연도", "asBase", num((PL().assumptions || {}).baseYear) > curY() ? PL().assumptions.baseYear : "", { type: "num", ph: `${curY()} (올해)`, hint: "비워 두면 해마다 올해부터 계산합니다" })}</div>
   <div class="tbl-wrap"><table class="tbl in"><thead><tr><th>자산군</th><th>예상 수익률 (%/년)</th><th>배당·이자 (%/년)</th></tr></thead><tbody>${rows}</tbody></table></div>
   <span class="hint">수익률은 배당을 포함한 명목 연수익률입니다. 배당·이자는 일반계좌에서 해마다 15.4% 과세되는 부분을 계산하는 데 씁니다. 종목별로 다르게 잡으려면 ‘관심’ 메뉴에서 종목을 눌러 예상 수익률을 입력하세요.</span>
   ${fld("본인의 계좌 밖 현금·예금 (만원)", "asCash", man(a.startCash), { type: "num" })}
@@ -3634,18 +3903,18 @@ function vAssume() {
 function saveAssume() {
   const q = id => { const e = document.getElementById(id); return e ? e.value.trim() : ""; };
   const n = id => q(id) === "" ? null : num(q(id)); const m = id => q(id) === "" ? null : num(q(id)) * 1e4;
-  const a = { inflation: n("asInf"), baseYear: n("asBase"), returns: {}, divYield: {}, startCash: m("asCash") || 0, payerId: q("asPayer") || null, overdraftRate: n("asOd"), creditRate: n("asCr"), workMarginal: n("asMg"),
+  const byIn = n("asBase"); const a = { inflation: n("asInf"), baseYear: byIn > curY() ? byIn : null, returns: {}, divYield: {}, startCash: m("asCash") || 0, payerId: q("asPayer") || null, overdraftRate: n("asOd"), creditRate: n("asCr"), workMarginal: n("asMg"),
     pensionSepLimit: m("asSep"), pensionContribLimit: m("asPl"), isaAnnualLimit: m("asIa"), isaTotalLimit: m("asIt"),
     health: { currentMonthly: n("asHm") || 0, continueMonths: n("asHc") ?? 0, dependentFrom: n("asDf"), dependentTo: n("asDt"), rate: n("asHr"), ltc: n("asHl"), pointWon: n("asHp"), officialRatio: n("asHo") } };
   CLASSES.forEach(c => { a.returns[c] = n("asR_" + c); a.divYield[c] = n("asD_" + c); });
-  PL().assumptions = a; savePlan("가정을 저장했습니다");
+  PL().assumptions = a; clearDraft("#as"); savePlan("가정을 저장했습니다");
 }
 
 /* ---------- 계획 이벤트 ---------- */
 function planClick(t) {
-  if (t.dataset.pv) { S.planView = t.dataset.pv; try { localStorage.setItem("rf.pv", S.planView); } catch (e) {} render(); return true; }
+  if (t.dataset.pv) { S.draft = {}; S.planView = t.dataset.pv; try { localStorage.setItem("rf.pv", S.planView); } catch (e) {} render(); return true; }
   if (t.dataset.resg) { S.resGroup = t.dataset.resg; render(); return true; }
-  if (t.dataset.psel != null) { setPlanSel(t.dataset.psel); render(); window.scrollTo(0, 0); return true; }
+  if (t.dataset.psel != null) { S.draft = {}; setPlanSel(t.dataset.psel); render(); window.scrollTo(0, 0); return true; }
   if (t.dataset.real != null) { S.real = t.dataset.real === "1"; try { localStorage.setItem("rf.real", S.real ? "1" : "0"); } catch (e) {} render(); return true; }
   if (t.dataset.member) { memberSheet(mem(t.dataset.member)); return true; }
   if (t.dataset.addinc) { incomeSheet(null, t.dataset.addinc); return true; }
@@ -3701,7 +3970,9 @@ function alInfo(key) {
   const cls = w.assetClass || (h && h.assetClass) || "기타"; const cur = w.currency || (h && h.currency) || "KRW"; const name = w.name || (h && h.name) || key;
   const p = S.prices[key]; const px = p && num(p.price) > 0 ? num(p.price) : h ? num(h.avgPrice) : 0;
   const e = expOf(key, cls, h); const st = styleOf({ ticker: key, name, assetClass: cls });
-  const risky = h && h.risky != null ? !!h.risky : (w.riskyDefault != null ? !!w.riskyDefault : !!RISKY_DEFAULT[cls]);
+  // 위험자산 여부: IRP·DC 계좌에 든 보유분에 적은 값(하나라도 위험자산이면 위험자산), 없으면 다른 보유분, 그다음 종목 기본값
+  const hk = Object.values(S.holdings).filter(x => tkey(x.ticker) === key && x.risky != null); const hc = hk.filter(x => RISK_CAPPED.has((S.accounts[x.accountId] || {}).type));
+  const risky = hc.length ? hc.some(x => !!x.risky) : hk.length ? hk.some(x => !!x.risky) : (w.riskyDefault != null ? !!w.riskyDefault : !!RISKY_DEFAULT[cls]);
   return { key, name, cls, cur, r: e.r + retAdj(cls, null, st), rBase: e.r, dy: e.dy, risky, kind: holdTaxKind({ name, currency: cur, assetClass: cls }), price: px * rate(cur), priceNative: px,
     etf: cur === "USD" ? !!KNOWN_STYLE[key] || /ETF|TRUST|FUND/i.test(name) : ETF_RE.test(name), lev: LEV_RE.test(name), missing: !(p && num(p.price) > 0) };
 }
@@ -3759,27 +4030,29 @@ function alCompute(scope) { return memo("alc:" + scope, () => alCompute1(scope))
 function alCompute1(scope) {
   const cfg = alCfg(scope); const year = has(cfg.year) ? num(cfg.year) : yr() + 10;
   const dep = alDepMode(cfg) !== "none" ? alDeposits(scope, year) : null;
-  const key = JSON.stringify([scope, cfg, alLocks(), dep, S.accounts, S.holdings, S.prices, S.assets, retScen(), AS(), yr(), PL().members, PL().accountPlans]);
+  const key = JSON.stringify([scope, cfg, alLocks(), dep, S.accounts, S.holdings, S.prices, S.assets, fx(), retScen(), AS(), yr(), PL().members, PL().accountPlans]);
   if (alCache[scope] && alCache[scope].key === key) return alCache[scope].val;
   const val = alCompute0(scope, dep); alCache[scope] = { key, val }; return val;
 }
 function alCompute0(scope, depIn) {
   const cfg = alCfg(scope);
   const accts = memberAccts(scope).filter(a => a.type !== "생활비");
-  const V = {}, current = {}, qty = {}, cost = {};
+  const V = {}, current = {}, qty = {}, cost = {}, cash0 = {};
   for (const a of accts) {
-    const st = acctStats(a); V[a.id] = st.total; current[a.id] = {}; qty[a.id] = {}; cost[a.id] = {};
-    for (const h of st.hs) { const k = tkey(h.ticker); current[a.id][k] = (current[a.id][k] || 0) + hVal(h); qty[a.id][k] = (qty[a.id][k] || 0) + num(h.qty); cost[a.id][k] = (cost[a.id][k] || 0) + hCost(h); }
-    if (st.cash) current[a.id][AL_CASH] = st.cash;
+    const st = acctStats(a); current[a.id] = {}; qty[a.id] = {}; cost[a.id] = {}; cash0[a.id] = st.cash;
+    for (const h of st.hs) { const k = tkey(h.ticker); qty[a.id][k] = (qty[a.id][k] || 0) + num(h.qty); cost[a.id][k] = (cost[a.id][k] || 0) + hCost(h); }
   }
-  const total = accts.reduce((s, a) => s + V[a.id], 0);
-  const cw = {}; for (const a of accts) for (const k in current[a.id]) cw[k] = (cw[k] || 0) + current[a.id][k] / (total || 1);
   const saved = cfg.targets || null;
   const LK = alLocks(); const fixKeys = accts.flatMap(a => Object.keys(LK[a.id] || {}));
-  const keys = [...new Set(Object.keys(cw).filter(k => k !== AL_CASH).concat(saved ? Object.keys(saved).filter(k => k !== AL_CASH) : [], fixKeys.filter(k => k !== AL_CASH)))];
+  const keys = [...new Set(accts.flatMap(a => Object.keys(qty[a.id])).concat(saved ? Object.keys(saved) : [], fixKeys).filter(k => k !== AL_CASH))];
   keys.push(AL_CASH);
   const info = Object.fromEntries(keys.map(k => [k, alInfo(k)]));
-  const tg = {}; for (const k of keys) tg[k] = saved ? num(saved[k]) : Math.round((cw[k] || 0) * 10000) / 100;
+  // 지금 금액 = 수량 × 배분에 쓰는 가격: 사고팔 주식 수를 같은 가격으로 계산하므로 (현재가가 없는 종목도 같은 기준)
+  for (const a of accts) { for (const k in qty[a.id]) current[a.id][k] = qty[a.id][k] * info[k].price; if (cash0[a.id]) current[a.id][AL_CASH] = cash0[a.id];
+    V[a.id] = Object.values(current[a.id]).reduce((s2, v) => s2 + v, 0); }
+  const total = accts.reduce((s, a) => s + V[a.id], 0);
+  const cw = {}; for (const a of accts) for (const k in current[a.id]) cw[k] = (cw[k] || 0) + current[a.id][k] / (total || 1);
+  const tg = {}; for (const k of keys) tg[k] = Math.max(0, saved ? num(saved[k]) : Math.round((cw[k] || 0) * 10000) / 100);   // 음수 목표(마이너스 예수금 등)는 0
   const tsum = keys.reduce((s, k) => s + tg[k], 0);
   const year = has(cfg.year) ? num(cfg.year) : yr() + 10; const years = Math.max(0, year - yr());
   // 목표 연도까지 쓸 성장률: 배당을 반영하면 예상 수익률(배당 재투자), 반영하지 않으면 배당·이자를 뺀 가격 상승분만
@@ -3863,7 +4136,10 @@ function alCompute0(scope, depIn) {
   for (const b of buys) { const y = calYear(b.tau); const Y = nb.byYear[y] || (nb.byYear[y] = { dep: 0, div: 0, sh: {}, amt: {} });
     for (const k in b.amt) { const v = b.amt[k]; nb[b.src][k] = (nb[b.src][k] || 0) + v; Y[b.src] += v; Y.amt[k] = (Y.amt[k] || 0) + v;
       if (k !== AL_CASH && prices[k] > 0) { const n = v / priceAt(k, b.tau); nb[b.src + "Sh"][k] = (nb[b.src + "Sh"][k] || 0) + n; Y.sh[k] = (Y.sh[k] || 0) + n; } } }
-  const nowTrade = {}; for (const a of accts) for (const k of new Set([...Object.keys(qty[a.id]), ...Object.keys(sh[a.id].shares)])) { if (k === AL_CASH) continue; nowTrade[k] = (nowTrade[k] || 0) + (sh[a.id].shares[k] || 0) - (qty[a.id][k] || 0); }
+  // 사고팔 수: 종목별 순 수량과, 계좌마다 따로 사고파는 수량(한 계좌에서 사고 다른 계좌에서 팔면 둘 다 거래)
+  const nowTrade = {}, tradeB = {}, tradeS = {}, acctB = {}, acctS = {};
+  for (const a of accts) { acctB[a.id] = 0; acctS[a.id] = 0; for (const k of new Set([...Object.keys(qty[a.id]), ...Object.keys(sh[a.id].shares)])) { if (k === AL_CASH) continue; const d = (sh[a.id].shares[k] || 0) - (qty[a.id][k] || 0);
+    nowTrade[k] = (nowTrade[k] || 0) + d; if (d > 0) { tradeB[k] = (tradeB[k] || 0) + d; acctB[a.id] += d * prices[k]; } else if (d < 0) { tradeS[k] = (tradeS[k] || 0) - d; acctS[a.id] -= d * prices[k]; } } }
   const heldNow = {}, heldAfter = {}; for (const a of accts) { for (const k in qty[a.id]) heldNow[k] = (heldNow[k] || 0) + qty[a.id][k]; for (const k in sh[a.id].shares) heldAfter[k] = (heldAfter[k] || 0) + sh[a.id].shares[k]; }
   // 기대 수익률: 변경 전(지금 보유)·변경 후(제안)·목표 비중 — 지금 가중평균, 목표 연도 비중 기준(입금분 포함), 지금 보유분의 연평균(복리), 목표 연도 예상 평가액(입금분 포함)
   const ret = amt => { const T = keys.reduce((s2, k) => s2 + (amt[k] || 0), 0) || 1; const pj = proj(amt);
@@ -3873,12 +4149,12 @@ function alCompute0(scope, depIn) {
   const beforeAmt = Object.fromEntries(keys.map(k => [k, (cw[k] || 0) * total]));
   const exp = { before: ret(beforeAmt), after: ret(after), ideal: ret(demand) };
   // 일반계좌에서 팔 때 차익 세금(추정): 국내 상장 해외·채권형 15.4%, 해외 상장 22%(250만원 공제 전), 국내 주식형 0
-  const sellTax = {};
+  const sellTax = {}, sellUsd = {};
   for (const a of accts) { if (alAcctKind(a.type) !== "general") continue; let t = 0;
     for (const k in qty[a.id]) { const n0 = qty[a.id][k], n1 = sh[a.id].shares[k] || 0; if (n1 >= n0 || !n0) continue;
-      const gainPer = (current[a.id][k] - cost[a.id][k]) / n0; if (gainPer <= 0) continue; const rt = info[k].kind === "foreign" ? 0.22 : info[k].kind === "dividend" ? 0.154 : 0; t += (n0 - n1) * gainPer * rt; }
+      const gainPer = (current[a.id][k] - cost[a.id][k]) / n0; if (gainPer <= 0) continue; const rt = info[k].kind === "foreign" ? 0.22 : info[k].kind === "dividend" ? 0.154 : 0; if (rt && info[k].cur === "USD") sellUsd[a.id] = true; t += (n0 - n1) * gainPer * rt; }
     if (t > 0) sellTax[a.id] = t; }
-  return { scope, cfg, accts, V, current, qty, total, cw, keys, info, tg, tsum, year, years, demand, pt, pl, sh, after, fut, futSum, allowed, sellTax, lot, lots, lotCap, exp,
+  return { scope, cfg, accts, V, current, qty, total, cw, keys, info, tg, tsum, year, years, demand, pt, pl, sh, after, fut, futSum, allowed, sellTax, sellUsd, lot, lots, lotCap, exp, tradeB, tradeS, acctB, acctS,
     lockQ, lockVal, cellV, isFixed, fixCut, lockedK, lockTot, lockOver, irpOver, free, nb, nowTrade, heldNow, heldAfter, pr,
     lotIn, futIdeal: proj(demand).F, depMode, dep, depRatio: (pf.bySrc || {}).dep || {}, divRatio: (pf.bySrc || {}).div || {}, divTotal: pf.divTotal || 0, divMode, divOn, pool, er, rr, mode: cfg.mode === "tax" ? "tax" : "keep" };
 }
@@ -3893,13 +4169,15 @@ function vAlloc() {
   let h = `<div class="row"><h2>자산 배분</h2><span class="meta">수익률 ${esc(scenLabel())}</span></div>
   <div class="subnav">${scopes.map(([k, l]) => `<button type="button" data-alsel="${esc(k)}" aria-selected="${k === S.alSel}">${esc(l)}</button>`).join("")}</div>`;
   if (!c.accts.length || !(c.total > 0)) return h + `<div class="card empty">배분할 계좌가 없습니다. 생활비 계좌는 배분에서 뺍니다.</div>`;
+  // 환율이 없으면 달러 종목이 0원이 되어 ‘모두 팔기’ 같은 엉뚱한 제안이 나온다: 계산하지 않는다
+  if (c.keys.some(k => k !== AL_CASH && c.info[k].cur === "USD") && !fx()) return h + `<div class="card empty">달러 종목이 있는데 환율이 없어 원화 금액을 알 수 없습니다. 설정에서 USD/KRW 환율을 넣으면 배분을 계산합니다.</div>`;
   // 목표
   h += `<section class="card"><h2>목표</h2>
    <div>${fld("비중을 맞출 연도", "alYear", c.year, { type: "num", hint: c.years ? `${c.years}년 뒤. 종목마다 예상 수익률이 달라서, 그해에 목표 비중이 되도록 지금 비중을 거꾸로 맞춥니다` : "올해: 지금 바로 목표 비중으로 맞춥니다" })}
    ${fld("계좌에 담는 방식", "alMode", c.mode, { type: "select", options: [["keep", "지금 자리 최대한 유지 (매매 최소)"], ["tax", "세금이 적은 계좌 우선 (다시 배치)"]], hint: c.mode === "tax" ? "국내 상장 해외·채권형 ETF는 연금·ISA에, 국내 주식형은 일반계좌에 담는 쪽으로" : "지금 들고 있는 종목은 그 계좌에 두고 모자라거나 넘치는 만큼만 사고팝니다" })}
-   ${fld("주식 수 단위", "alLot", c.lot, { type: "select", options: [[100, "100주"], [10, "10주"], [1, "1주"]], hint: "이 단위로만 사고팝니다. 그 때문에 생기는 목표와의 차이는 계좌마다 종목을 바꿔 가며 가장 작게 맞춥니다" })}
+   ${fld("주식 수 단위", "alLot", c.lot, { type: "select", options: [[100, "100주"], [10, "10주"], [1, "1주"]], hint: "제안하는 보유 주식 수를 이 단위의 배수로 맞춥니다(수량을 지정한 종목은 지정한 수량). 그 때문에 생기는 목표와의 차이는 계좌마다 종목을 바꿔 가며 가장 작게 맞춥니다" })}
    ${fld("미래 입금", "alDep", c.depMode, { type: "select", options: AL_DEP, hint: !c.years ? "올해 목표라 입금을 반영할 기간이 없습니다" : c.depMode === "none" ? `목표 연도까지 들어올 입금은 계산에 넣지 않습니다${(() => { const d = alDeposits(c.scope, c.year); return d.total > 0 ? ` (계획상 ${d.from}~${d.to}년 ${eok(d.total)})` : ""; })()}` : c.dep.total > 0 ? `${c.dep.from}~${c.dep.to}년 입금 ${eok(c.dep.total)} (계획 결과: 이 계좌들의 계획 납입 + 남는 돈 적립, 명목. 인출은 넣지 않음). ${c.depMode === "fill" ? "지금 가진 종목은 목표 연도에 필요한 만큼까지 그대로 두고, 모자란 종목은 아래 ‘입금 배분’ 비율대로 입금해 채운다고 봅니다" : "입금할 때마다 그때 맞출 비중대로 산다고 봅니다. 지금 배분은 입금이 없을 때와 같고, 목표 연도 평가액만 늘어납니다"}` : "계획에 목표 연도까지 이 계좌들로 들어올 입금이 없습니다 (계획 → 계좌 계획의 납입 구간)" })}
-   ${fld("미래 배당·분배", "alDiv", c.divMode, { type: "select", options: AL_DIV, hint: !c.years ? "올해 목표라 배당을 반영할 기간이 없습니다" : { reinvest: "배당은 받은 종목에 다시 사서, 예상 수익률(배당 포함)로 자란다고 봅니다", target: `배당·분배·이자를 해마다 모아서 그때 맞출 비중대로 산다고 봅니다. 종목은 가격 상승분(예상 수익률 − 배당)만큼 자라고, ${c.year}년까지 배당 약 ${eok(c.divTotal)}`, fill: `배당·분배·이자를 해마다 모아서 모자란 종목을 아래 ‘배당 배분’ 비율대로 산다고 봅니다(지금은 덜 팔기). 종목은 가격 상승분만큼 자라고, ${c.year}년까지 배당 약 ${eok(c.divTotal)}`, none: "배당·분배·이자는 꺼내 쓴다고 보고, 예상 수익률에서 배당수익률을 뺀 가격 상승분만으로 목표 연도 비중을 계산합니다. 배당이 많은 종목일수록 지금 더 담아야 합니다" }[c.divMode] })}
+   ${fld("미래 배당·분배", "alDiv", c.divMode, { type: "select", options: AL_DIV, hint: !c.years ? "올해 목표라 배당을 반영할 기간이 없습니다" : { reinvest: "배당은 받은 종목에 다시 사서, 예상 수익률(배당 포함)로 자란다고 봅니다", target: `배당·분배·이자를 해마다 모아서 그때 맞출 비중대로 산다고 봅니다. 종목은 가격 상승분(예상 수익률 − 배당)만큼 자라고, ${c.year}년까지 제안대로 사고판 뒤 배당 약 ${eok(c.exp.after.divT)}`, fill: `배당·분배·이자를 해마다 모아서 모자란 종목을 아래 ‘배당 배분’ 비율대로 산다고 봅니다(지금은 덜 팔기). 종목은 가격 상승분만큼 자라고, ${c.year}년까지 제안대로 사고판 뒤 배당 약 ${eok(c.exp.after.divT)}`, none: "배당·분배·이자는 꺼내 쓴다고 보고, 예상 수익률에서 배당수익률을 뺀 가격 상승분만으로 목표 연도 비중을 계산합니다. 배당이 많은 종목일수록 지금 더 담아야 합니다" }[c.divMode] })}
    ${c.lot > 1 ? fld(`${c.lot}주 금액이 이보다 크면 1주 단위로 (만원)`, "alLotCap", Math.round(c.lotCap / 1e4), { type: "num", hint: `0이면 모든 종목을 ${c.lot}주 단위로. 지금 1주 단위로 맞추는 종목: ${c.keys.filter(k => k !== AL_CASH && c.lots[k] === 1).map(k => c.info[k].name).join(", ") || "없음"}` }) : ""}</div>
    <span class="meta">배분 대상 ${esc(c.scope === "__all" ? "가족 전체" : memName(c.scope))} 명의 계좌 ${c.accts.length}개 · ${eok(c.total)} (생활비 계좌 제외)</span></section>`;
   // 목표 비중
@@ -3925,7 +4203,7 @@ function vAlloc() {
    <div class="tbl-wrap" data-keep="alRes"><table class="tbl in al"><thead><tr><th>종목</th><th>${c.year}년 예상</th><th>목표</th><th>차이</th><th>현재</th><th>지금 맞출</th><th>주식 수 반영</th><th>단위</th>${c.dep.total > 0 ? "<th>입금 배분</th>" : ""}${c.divTotal > 0 ? "<th>배당 배분</th>" : ""}</tr></thead><tbody>
    ${c.keys.map(k => { const t = c.pt.find(x => x.key === k); return `<tr><td>${esc(c.info[k].name)}</td><td><b>${pct1(c.futSum ? c.fut[k] / c.futSum : 0)}</b></td><td>${pct1(c.tsum ? c.tg[k] / c.tsum : 0)}</td><td>${(() => { const d = (c.futSum ? c.fut[k] / c.futSum : 0) - (c.tsum ? c.tg[k] / c.tsum : 0); return Math.abs(d) < 0.0005 ? "–" : `<span class="${d > 0 ? "up" : "down"}">${d > 0 ? "+" : "−"}${(Math.round(Math.abs(d) * 1000) / 10).toLocaleString("ko-KR")}%p</span>`; })()}</td><td>${pct1(c.cw[k] || 0)}</td><td>${pct1(t ? t.now : 0)}</td><td>${pct1((c.after[k] || 0) / c.total)}</td><td>${k === AL_CASH ? "" : c.info[k].price > 0 ? `${c.lots[k]}주 · ${eok(c.info[k].price * c.lots[k])}` : "–"}</td>${c.dep.total > 0 ? `<td>${(c.depRatio[k] || 0) > 0.0005 ? pct1(c.depRatio[k]) : "–"}</td>` : ""}${c.divTotal > 0 ? `<td>${(c.divRatio[k] || 0) > 0.0005 ? pct1(c.divRatio[k]) : "–"}</td>` : ""}</tr>`; }).join("")}
    <tr class="tot"><td>차이 합계</td><td colspan="2"></td><td><b>${(Math.round(c.keys.reduce((s2, k) => s2 + Math.abs((c.futSum ? c.fut[k] / c.futSum : 0) - (c.tsum ? c.tg[k] / c.tsum : 0)), 0) * 1000) / 10).toLocaleString("ko-KR")}%p</b></td><td colspan="${4 + (c.dep.total > 0 ? 1 : 0) + (c.divTotal > 0 ? 1 : 0)}"></td></tr></tbody></table></div>
-   <span class="hint">‘${c.year}년 예상’은 제안대로 사고판 뒤 인출·세금 없이 종목마다 ${{ reinvest: "예상 수익률(배당 재투자)로", target: "가격 상승분만큼 자라고 배당은 모아서 그때 맞출 비중대로 산다고", fill: "가격 상승분만큼 자라고 배당은 모아서 ‘배당 배분’ 비율대로 산다고", none: "가격 상승분(배당 제외)만큼" }[c.divMode]} 자란다고 본 값입니다${c.dep.total > 0 ? `. 입금 ${eok(c.dep.total)}도 넣었고, 입금은 ${c.depMode === "fill" ? "해마다 ‘입금 배분’ 비율대로" : "그때 맞출 비중대로(‘입금 배분’은 전체 평균)"} 산다고 봅니다` : ""}. 주식 수는 종목마다 ‘단위’로만 사고팔고(${c.lot}주, ${c.lot}주 금액이 ${eok(c.lotCap)}을 넘는 종목은 1주), 그 때문에 생기는 차이(목표 연도 기준)가 가장 작도록 계좌마다 종목 수량을 고릅니다. 남는 돈은 예수금입니다.</span></section>`;
+   <span class="hint">‘${c.year}년 예상’은 제안대로 사고판 뒤 인출·세금 없이 종목마다 ${{ reinvest: "예상 수익률(배당 재투자)로", target: "가격 상승분만큼 자라고 배당은 모아서 그때 맞출 비중대로 산다고", fill: "가격 상승분만큼 자라고 배당은 모아서 ‘배당 배분’ 비율대로 산다고", none: "가격 상승분(배당 제외)만큼" }[c.divMode]} 자란다고 본 값입니다${c.dep.total > 0 ? `. 입금 ${eok(c.dep.total)}도 넣었고, 입금은 ${c.depMode === "fill" ? "해마다 ‘입금 배분’ 비율대로" : "그때 맞출 비중대로(‘입금 배분’은 전체 평균)"} 산다고 봅니다` : ""}. 보유 주식 수는 종목마다 ‘단위’의 배수로 맞추고(${c.lot}주, ${c.lot}주 금액이 ${eok(c.lotCap)}을 넘는 종목은 1주), 그 때문에 생기는 차이(목표 연도 기준)가 가장 작도록 계좌마다 종목 수량을 고릅니다. 남는 돈은 예수금입니다.</span></section>`;
   // 경고
   const warns = [];
   for (const k in c.pl.moved) if (c.pl.moved[k] < -1) warns.push(`${esc(c.info[k].name)}: 더 담을 수 있는 계좌가 없어 ${eok(-c.pl.moved[k])}만큼 목표에 못 미칩니다. 이 금액은 다른 종목에 목표 비율대로 나눠 담았습니다. (${esc([c.accts.map(a => alRule(a, c.info[k])).filter(Boolean)[0], c.lockedK[k] ? "수량을 지정한 계좌에서는 이 종목을 더 사지 않습니다" : ""].filter(Boolean).join(". ") || "나머지 계좌는 ‘계좌별로 담을 종목’에서 뺐습니다")})`);
@@ -3952,7 +4230,7 @@ function vAlloc() {
      <div class="tbl-wrap" data-keep="alAc:${esc(a.id)}"><table class="tbl in al lkt"><thead><tr><th>종목</th><th>지금</th><th>제안</th><th>사고팔 수</th><th>금액</th></tr></thead><tbody>${rows}
      <tr><td>예수금</td><td>${eok(cash0)}</td><td><b>${eok(o.cash)}</b></td><td></td><td>${eok(o.cash)}</td></tr></tbody></table></div>
      ${addable.length ? `<div class="btns"><select class="alfixadd" data-alfixadd="${esc(a.id)}" aria-label="${esc(a.name)}에 수량 지정할 종목 추가"><option value="">+ 수량 지정할 종목 추가…</option>${addable.map(x => `<option value="${esc(x.k)}">${esc(x.inf.name)}</option>`).join("")}</select></div>` : ""}
-     ${riskyPct != null ? `<span class="meta">위험자산 ${pct1(riskyPct)} (IRP 한도 70%)</span>` : ""}${c.sellTax[a.id] ? `<span class="meta">파는 종목의 차익 세금 추정 ${eok(c.sellTax[a.id])} (해외 상장은 연 250만원 공제 전)</span>` : ""}</section>`; }).join("");
+     ${riskyPct != null ? `<span class="meta">위험자산 ${pct1(riskyPct)} (IRP 한도 70%)</span>` : ""}${c.acctB[a.id] > 0.5 || c.acctS[a.id] > 0.5 ? `<span class="meta">사기 ${eok(c.acctB[a.id])} · 팔기 ${eok(c.acctS[a.id])}</span>` : ""}${c.sellTax[a.id] ? `<span class="meta">파는 종목의 차익 세금 추정 ${eok(c.sellTax[a.id])} (해외 상장은 연 250만원 공제 전${c.sellUsd[a.id] ? ", 달러 종목은 환율 변동분 제외" : ""})</span>` : ""}</section>`; }).join("");
   // 계좌별로 담을 종목
   h += `<details class="card" id="alAllowBox"${S.alAllowOpen ? " open" : ""}><summary class="row" style="cursor:pointer"><h2>계좌별로 담을 종목</h2><span class="meta">체크를 빼면 그 계좌에는 담지 않습니다 ›</span></summary>
    <div class="tbl-wrap" data-keep="alAllow"><table class="tbl in"><thead><tr><th>계좌</th>${c.keys.filter(k => k !== AL_CASH).map(k => `<th>${esc(c.info[k].name)}</th>`).join("")}</tr></thead><tbody>
@@ -3967,11 +4245,14 @@ function alFutureCard(c) {
   const hasDep = c.dep.total > 0, hasDiv = c.divMode !== "none";
   if (!c.years || !(hasDep || hasDiv) || !(c.tsum > 0)) return "";
   const nb = c.nb; const shTxt = (n, amt) => !(amt > 0.5) ? "–" : n >= 1 ? `약 ${nf.format(Math.round(n))}주` : "1주 미만";
-  const ks = c.keys.filter(k => k !== AL_CASH && (Math.abs(c.nowTrade[k] || 0) > 0 || (nb.dep[k] || 0) > 0.5 || (nb.div[k] || 0) > 0.5 || (c.heldAfter[k] || 0) > 0));
-  const buyNow = ks.reduce((s2, k) => s2 + Math.max(0, c.nowTrade[k] || 0) * c.info[k].price, 0), sellNow = ks.reduce((s2, k) => s2 + Math.max(0, -(c.nowTrade[k] || 0)) * c.info[k].price, 0);
+  const ks = c.keys.filter(k => k !== AL_CASH && ((c.tradeB[k] || 0) > 0 || (c.tradeS[k] || 0) > 0 || (nb.dep[k] || 0) > 0.5 || (nb.div[k] || 0) > 0.5 || (c.heldAfter[k] || 0) > 0));
+  // 합계는 계좌마다 사고파는 금액을 그대로 더한다 (같은 종목을 한 계좌에서 사고 다른 계좌에서 팔아도 둘 다)
+  const buyNow = ks.reduce((s2, k) => s2 + (c.tradeB[k] || 0) * c.info[k].price, 0), sellNow = ks.reduce((s2, k) => s2 + (c.tradeS[k] || 0) * c.info[k].price, 0);
   const tot = src => Object.values(nb[src]).reduce((s2, v) => s2 + v, 0);
   const row = k => { const i = c.info[k]; const d = c.nowTrade[k] || 0; const endN = (c.heldAfter[k] || 0) + (nb.depSh[k] || 0) + (nb.divSh[k] || 0);
-    return `<tr><td>${esc(i.name)}</td><td class="${d > 0 ? "up" : d < 0 ? "down" : ""}">${d ? (d > 0 ? "+" : "−") + nf2.format(Math.abs(d)) + "주" : "–"}${d ? `<br><span class="meta">${eok(Math.abs(d) * i.price)}</span>` : ""}</td>
+    const b = c.tradeB[k] || 0, sl = c.tradeS[k] || 0;
+    const tr = b && sl ? `+${nf2.format(b)} / −${nf2.format(sl)}주<br><span class="meta">사기 ${eok(b * i.price)} · 팔기 ${eok(sl * i.price)}</span>` : d ? `${d > 0 ? "+" : "−"}${nf2.format(Math.abs(d))}주<br><span class="meta">${eok(Math.abs(d) * i.price)}</span>` : "–";
+    return `<tr><td>${esc(i.name)}</td><td class="${b && sl ? "" : d > 0 ? "up" : d < 0 ? "down" : ""}">${tr}</td>
       ${hasDep ? `<td>${shTxt(nb.depSh[k] || 0, nb.dep[k] || 0)}${(nb.dep[k] || 0) > 0.5 ? `<br><span class="meta">${eok(nb.dep[k])}</span>` : ""}</td>` : ""}
       ${hasDiv ? `<td>${shTxt(nb.divSh[k] || 0, nb.div[k] || 0)}${(nb.div[k] || 0) > 0.5 ? `<br><span class="meta">${eok(nb.div[k])}</span>` : ""}</td>` : ""}
       <td><b>약 ${nf.format(Math.round(endN))}주</b><br><span class="meta">지금 ${nf2.format(c.heldNow[k] || 0)}주</span></td></tr>`; };
@@ -4039,8 +4320,11 @@ try { S.trRange = localStorage.getItem("rf.trr") || "all"; S.trGran = localStora
 function trPoints() {
   const all = (S.snapshots || []).filter(x => x && x.date); const m = S.trMem;
   if (!m || m === "__all") return all.filter(x => x.total > 0);
-  return all.filter(x => x.byMember && x.byMember[m] > 0).map(x => ({ ...x, total: x.byMember[m], cost: (x.byMemberCost || {})[m] || 0 }));
+  return all.filter(x => x.byMember && x.byMember[m] > 0).map(x => ({ ...x, total: x.byMember[m], cost: (x.byMemberCost || {})[m] || 0, cash: x.byMemberCash ? x.byMemberCash[m] || 0 : null }));
 }
+// 평가손익률: 평가손익 ÷ 매입 원금 (현금은 손익이 없어 빼고 나눈다 — 요약·계좌 화면과 같은 기준). 현금을 모르는 예전 구성원 기록은 비율을 내지 않는다
+function trPlR(x) { if (!x.cost || x.cash == null) return null; const b = x.cost - x.cash; return b > 0 ? (x.total - x.cost) / b : null; }
+const trPct = (x, d) => { const r = trPlR(x); return r == null ? "" : pct(r, d); };
 // 고를 수 있는 구성원: 지금 명의자 + 기록에 남은 구성원
 function trMembers() {
   const ms = (S.plan && S.plan.members) || []; const ids = new Set(ownerGroups().map(g => g.id || "__none"));
@@ -4052,22 +4336,27 @@ const TR_RANGES = [["1m", "1개월", 31], ["3m", "3개월", 92], ["1y", "1년", 
 function snapAuto() { return (S.settings || {}).snapAuto !== false; }
 // 지금 장부로 오늘 기록을 만든다
 function snapDoc(auto) {
-  const t = totals(); const byMember = {}, byMemberCost = {};
-  for (const g of ownerGroups()) { const k = g.id || "__none"; byMember[k] = Math.round(g.total); byMemberCost[k] = Math.round(g.accts.reduce((s, a) => { const st = acctStats(a); return s + st.cost + st.cash; }, 0)); }
-  return { date: today(), total: Math.round(t.total), cost: Math.round(t.cost + t.cash), cash: Math.round(t.cash), invested: Math.round(t.invested), byMember, byMemberCost, fx: fx() || null, auto: !!auto, at: new Date().toISOString() };
+  const t = totals(); const byMember = {}, byMemberCost = {}, byMemberCash = {};
+  for (const g of ownerGroups()) { const k = g.id || "__none"; byMember[k] = Math.round(g.total); let c = 0, ca = 0; g.accts.forEach(a => { const st = acctStats(a); c += st.cost + st.cash; ca += st.cash; }); byMemberCost[k] = Math.round(c); byMemberCash[k] = Math.round(ca); }
+  // 기록의 믿을 만함: 가격이 없어 매입가로 셈한 종목 수, 보유 종목 가격 중 가장 오래된 날짜
+  const hs = Object.values(S.holdings).filter(h => num(h.qty) > 0); const pis = hs.map(priceInfo);
+  const miss = pis.filter(p => p.missing).length; const old = pis.filter(p => !p.missing && p.asOf).map(p => p.asOf).sort()[0] || null;
+  return { date: today(), total: Math.round(t.total), cost: Math.round(t.cost + t.cash), cash: Math.round(t.cash), invested: Math.round(t.invested), byMember, byMemberCost, byMemberCash, fx: fx() || null, miss, pxOld: old, auto: !!auto, at: new Date().toISOString() };
 }
 async function recordSnap(auto) {
   if (!S.db || !acctList().length) return false;
+  // 환율이 없으면 달러 자산이 0원으로 계산돼 총액이 틀리므로 기록하지 않는다
+  if (needsFx()) { if (!auto) toast("달러 자산이 있는데 환율이 비어 있어 기록하지 않았습니다. 설정에서 환율을 넣거나 가격을 가져오세요.", 5000); return false; }
   const d = snapDoc(auto); if (!(d.total > 0)) return false;
   const cur = (S.snapshots || []).find(x => x.date === d.date);
   if (auto && cur && cur.total === d.total && cur.cost === d.cost) return false;   // 그대로면 다시 쓰지 않는다
-  if (auto) { try { await S.db.doc("snapshots/" + d.date).set(d); } catch (e) { return false; } return true; }
+  if (auto) { try { await S.db.doc("snapshots/" + d.date).set(d); } catch (e) { if (!S.snapErr) { S.snapErr = true; render(); } return false; } if (S.snapErr) { S.snapErr = false; render(); } return true; }
   return write(db => db.doc("snapshots/" + d.date).set(d), `${d.date} 평가액을 기록했습니다`);
 }
 // 자동 기록: 앱을 열었을 때(동기화가 켜져 있으면 첫 동기화 뒤), 가격을 가져온 뒤, 다른 기기의 변경을 받은 뒤
 let snapT = null;
 function autoSnap(ms) { if (!snapAuto()) return; clearTimeout(snapT); snapT = setTimeout(() => { if (snapReady()) recordSnap(true); }, ms == null ? 1500 : ms); }
-function snapReady() { const l = S.loaded || {}; return S.dbState === "ok" && l.accounts && l.holdingsRaw && l.prices && l.assets && l.settings && l.snapshots && !S.sync.busy; }
+function snapReady() { const l = S.loaded || {}; return S.dbState === "ok" && l.accounts && l.holdingsRaw && l.prices && l.assets && l.settings && l.snapshots && S.planLoaded && !S.sync.busy; }
 
 function trFiltered() {
   const all = trPoints();
@@ -4093,11 +4382,13 @@ function vTrend() {
   const list = trFiltered(); const first = list[0] || last;
   const chg = last.total - first.total, chgR = first.total ? chg / first.total : 0;
   const hi = list.reduce((a, b) => b.total > a.total ? b : a, first), lo = list.reduce((a, b) => b.total < a.total ? b : a, first);
-  const pl = last.total - (last.cost || 0), plR = last.cost ? pl / last.cost : 0;
-  let h = msel + `<div class="row"><h2>평가액 추이</h2><div class="seg-toggle" role="group" aria-label="기간">${TR_RANGES.map(([k, l]) => `<button type="button" data-trr="${k}" aria-pressed="${S.trRange === k}">${l}</button>`).join("")}</div></div>
+  const pl = last.total - (last.cost || 0);
+  const warn = (S.snapErr ? `<div class="banner">오늘 평가액을 자동으로 기록하지 못했습니다. 아래 ‘지금 값으로 다시 기록’을 누르세요.</div>` : "")
+    + (last.miss > 0 || (last.pxOld && daysAgo(last.pxOld) > 7) ? `<div class="banner">마지막 기록(${esc(last.date)})은 ${last.miss > 0 ? `가격이 없는 종목 ${last.miss}개를 매입가로 계산했습니다` : ""}${last.miss > 0 && last.pxOld && daysAgo(last.pxOld) > 7 ? " · " : ""}${last.pxOld && daysAgo(last.pxOld) > 7 ? `${esc(last.pxOld)} 가격이 섞여 있습니다` : ""}. 가격을 가져온 뒤 다시 기록하면 정확해집니다.</div>` : "");
+  let h = msel + warn + `<div class="row"><h2>평가액 추이</h2><div class="seg-toggle" role="group" aria-label="기간">${TR_RANGES.map(([k, l]) => `<button type="button" data-trr="${k}" aria-pressed="${S.trRange === k}">${l}</button>`).join("")}</div></div>
   <section class="hero"><span class="label">${esc(last.date)} 기록${daysAgo(last.date) > 0 ? ` · ${daysAgo(last.date)}일 전` : " · 오늘"}</span>
     <span class="total">${eok(last.total)}</span>
-    ${last.cost ? `<span class="pl ${cls(pl)}">평가손익 ${fmtA(pl, { plus: true })} (${pct(plR, 2)})</span>` : ""}
+    ${last.cost ? `<span class="pl ${cls(pl)}">평가손익 ${fmtA(pl, { plus: true })}${trPlR(last) != null ? ` (${trPct(last, 2)})` : ""}</span>` : ""}
     <div class="chips">${list.length > 1 ? `<span class="chip ${chg > 0 ? "good" : chg < 0 ? "bad" : ""}">${esc(first.date)} 이후 ${fmtA(chg, { plus: true })} (${pct(chgR, 2)})</span>` : ""}
       ${list.length > 1 ? `<span class="chip">최고 ${eok(hi.total)} · ${esc(hi.date.slice(2))}</span><span class="chip">최저 ${eok(lo.total)} · ${esc(lo.date.slice(2))}</span>` : ""}</div></section>`;
   h += `<section class="card"><div class="row"><h2>${who ? esc(who) + " 명의 평가액" : "총 평가액"}</h2><span class="meta">${unitName()} · 기록 ${nf.format(list.length)}개</span></div>
@@ -4111,10 +4402,10 @@ function vTrend() {
     <div class="tbl-wrap"><table class="tbl"><thead><tr><th>${S.trGran === "month" ? "월" : "날짜"}</th><th>평가액</th><th>변화</th><th>평가손익</th></tr></thead><tbody>
     ${rows.map((x, i) => { const prev = rows0[i + 1]; const d = prev ? x.total - prev.total : null; const p = x.total - (x.cost || 0); const sg = v => (v > 0 ? "+" : "") + sh(v);
       const dl = S.trGran === "month" ? x.date.slice(2, 7).replace("-", ".") : x.date.slice(2).replace(/-/g, ".");
-      return `<tr data-snap="${esc(x.date)}"><td>${esc(dl)}${x.auto ? "" : ` <span class="meta">·</span>`}</td><td><b>${sh(x.total)}</b></td><td class="${d == null ? "" : cls(d)}">${d == null ? "–" : sg(d)}</td><td class="${cls(p)}">${x.cost ? `${sg(p)}<br><small>${pct(x.cost ? p / x.cost : 0, 1)}</small>` : "–"}</td></tr>`; }).join("")}
+      return `<tr data-snap="${esc(x.date)}"><td>${esc(dl)}${x.auto ? "" : ` <span class="meta">·</span>`}${x.miss > 0 ? ` <span class="meta" title="가격이 없어 매입가로 계산한 종목 ${x.miss}개">!</span>` : ""}</td><td><b>${sh(x.total)}</b></td><td class="${d == null ? "" : cls(d)}">${d == null ? "–" : sg(d)}</td><td class="${cls(p)}">${x.cost ? `${sg(p)}${trPlR(x) != null ? `<br><small>${trPct(x, 1)}</small>` : ""}` : "–"}</td></tr>`; }).join("")}
     </tbody></table></div>
     ${rows0.length > rows.length ? `<div class="btns"><button type="button" class="btn small" id="trMore">더 보기 (${nf.format(rows0.length - rows.length)}개 남음)</button></div>` : ""}
-    <span class="hint">금액 단위 ${unitName()}. 변화는 앞 기록과의 차이입니다.${who ? ` ${esc(who)} 명의 계좌만 더한 값이고, 평가손익은 구성원별 원금을 남긴 기록부터 나옵니다.` : ""} 행을 누르면 그날 구성원별 평가액을 보고 기록을 지울 수 있습니다. ‘·’ 표시는 직접 기록한 날입니다.</span></section>`;
+    <span class="hint">금액 단위 ${unitName()}. 변화는 앞 기록과의 차이입니다.${who ? ` ${esc(who)} 명의 계좌만 더한 값이고, 평가손익은 구성원별 원금을 남긴 기록부터 나옵니다.` : ""} 평가손익률은 평가손익 ÷ 매입 원금(현금 제외)입니다. 행을 누르면 그날 구성원별 평가액을 보고 기록을 지울 수 있습니다. ‘·’ 표시는 직접 기록한 날, ‘!’ 표시는 가격이 없는 종목을 매입가로 계산한 날입니다.</span></section>`;
   const td = (S.snapshots || []).find(x => x.date === today());
   h += `<section class="card"><h2>기록하기</h2>${td ? `<p class="meta" style="margin:0">오늘(${esc(td.date)}) ${td.auto ? "자동으로" : "직접"} 기록됨 · ${eok(td.total)}${td.at ? ` · ${esc(whenTxt(td.at))}` : ""}</p>` : `<p class="meta" style="margin:0">오늘 기록은 아직 없습니다.</p>`}
     <div class="btns"><button class="btn${td ? "" : " primary"}" id="snapNow">${td ? "지금 값으로 다시 기록" : "지금 평가액 기록"}</button></div>${autoBox}</section>`;
@@ -4123,9 +4414,9 @@ function vTrend() {
 function snapSheet(date) {
   const x = (S.snapshots || []).find(s => s.date === date); if (!x) return;
   const ms = (S.plan && S.plan.members) || []; const bm = x.byMember || {};
-  const rowsM = Object.entries(bm).sort((a, b) => b[1] - a[1]).map(([id, v]) => kv(id === "__none" ? "명의자 미지정" : ((ms.find(m => m.id === id) || {}).name || id), eok(v))).join("");
+  const rowsM = Object.entries(bm).sort((a, b) => b[1] - a[1]).map(([id, v]) => kv(id === "__none" ? "명의자 미지정" : esc((ms.find(m => m.id === id) || {}).name || id), eok(v))).join("");
   openSheet(`<h3>${esc(date)} 평가액</h3><span class="meta">${x.auto ? "자동 기록" : "직접 기록"}${x.at ? ` · ${esc(whenTxt(x.at))}` : ""}</span>
-    <div class="kvlist">${kv("총 평가액", `<b>${eok(x.total)}</b>`)}${x.cost ? kv("원금 (매입 금액 + 현금)", eok(x.cost)) + kv("평가손익", `${fmtA(x.total - x.cost, { plus: true })} (${pct((x.total - x.cost) / x.cost, 2)})`) : ""}${x.cash != null ? kv("현금", eok(x.cash)) : ""}${x.fx ? kv("USD/KRW", nf2.format(x.fx)) : ""}${rowsM}</div>
+    <div class="kvlist">${kv("총 평가액", `<b>${eok(x.total)}</b>`)}${x.cost ? kv("원금 (매입 금액 + 현금)", eok(x.cost)) + kv("평가손익", `${fmtA(x.total - x.cost, { plus: true })}${trPlR(x) != null ? ` (${trPct(x, 2)})` : ""}`) : ""}${x.cash != null ? kv("현금", eok(x.cash)) : ""}${x.fx ? kv("USD/KRW", nf2.format(x.fx)) : ""}${x.miss > 0 ? kv("가격이 없어 매입가로 계산한 종목", `${x.miss}개`) : ""}${x.pxOld ? kv("가장 오래된 가격", esc(x.pxOld)) : ""}${rowsM}</div>
     <div class="btns"><button class="btn danger" id="snapDel">기록 지우기</button><span class="grow"></span><button class="btn" id="pCancel">닫기</button></div>`, bg => {
     bg.querySelector("#pCancel").onclick = closeSheet;
     armDelete(bg.querySelector("#snapDel"), async () => { if (await write(db => db.doc("snapshots/" + date).delete(), "기록을 지웠습니다")) closeSheet(); });
@@ -4160,7 +4451,7 @@ function drawTrend() {
   const show = ev => { const r = hit.getBoundingClientRect(); const px = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left + L;
     let bi = 0, bd = Infinity; tt.forEach((t, i) => { const d = Math.abs(x(t) - px); if (d < bd) { bd = d; bi = i; } });
     const s = list[bi], X = x(tt[bi]); xh.setAttribute("x1", X); xh.setAttribute("x2", X); xh.setAttribute("opacity", ".35"); dot.setAttribute("cx", X); dot.setAttribute("cy", y(s.total)); dot.setAttribute("opacity", "1");
-    tip.innerHTML = `<b>${esc(s.date)}</b><span class="tr"><i style="background:var(--c1)"></i>평가액<b>${sh(s.total)}</b></span>${s.cost ? `<span class="tr"><i class="dash" style="border-top:2px dashed var(--c2);height:0;width:10px;border-radius:0;background:none"></i>원금<b>${sh(s.cost)}</b></span><span class="tr tot">평가손익<b class="${cls(s.total - s.cost)}">${sh(s.total - s.cost)} (${pct((s.total - s.cost) / s.cost, 1)})</b></span>` : ""}`;
+    tip.innerHTML = `<b>${esc(s.date)}</b><span class="tr"><i style="background:var(--c1)"></i>평가액<b>${sh(s.total)}</b></span>${s.cost ? `<span class="tr"><i class="dash" style="border-top:2px dashed var(--c2);height:0;width:10px;border-radius:0;background:none"></i>원금<b>${sh(s.cost)}</b></span><span class="tr tot">평가손익<b class="${cls(s.total - s.cost)}">${s.total - s.cost > 0 ? "+" : ""}${sh(s.total - s.cost)}${trPlR(s) != null ? ` (${trPct(s, 1)})` : ""}</b></span>` : ""}`;
     tip.hidden = false; const tw = tip.offsetWidth; tip.style.left = Math.min(Math.max(0, X - tw / 2), W - tw) + "px"; tip.style.top = "0px"; };
   const hide = () => { tip.hidden = true; xh.setAttribute("opacity", "0"); dot.setAttribute("opacity", "0"); };
   hit.addEventListener("pointermove", show); hit.addEventListener("pointerdown", show); hit.addEventListener("pointerleave", hide);
@@ -4170,14 +4461,14 @@ function trendClick(t) {
   if (t.dataset.trm) { S.trMem = t.dataset.trm; S.trMore = 0; try { localStorage.setItem("rf.trm", S.trMem); } catch (e) {} render(); return true; }
   if (t.dataset.trg) { S.trGran = t.dataset.trg; S.trMore = 0; try { localStorage.setItem("rf.trg", S.trGran); } catch (e) {} render(); return true; }
   if (t.id === "trMore") { S.trMore++; render(); return true; }
-  if (t.id === "snapNow") { recordSnap(false); return true; }
+  if (t.id === "snapNow") { if (!acctList().length || !(totals().total > 0)) toast("기록할 평가액이 없습니다. 계좌와 보유 종목을 먼저 넣으세요."); else recordSnap(false); return true; }
   return false;
 }
 
 app.addEventListener("click",e=>{const tr=e.target.closest("tr[data-snap]");if(tr)snapSheet(tr.dataset.snap);});
 RE.DEFAULT_ASSUMPTIONS.baseYear=new Date().getFullYear();
 // 자동 테스트에서만 내부 계산 함수를 꺼내 쓴다 (평소에는 아무 일도 하지 않음)
-if(window.__KINFOLIO_TEST__)window.__kinfolio={S,fmtA,fmtM,exportDoc,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
+if(window.__KINFOLIO_TEST__)window.__kinfolio={S,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
 document.getElementById("hdrSub").addEventListener("click",()=>{if(S.dbState==="ok"&&freshness())setTab("prices");});
 document.getElementById("syncChip").addEventListener("click",()=>{
   if(PWA&&!KinfolioPWA.clientId()){setTab("settings");return;}

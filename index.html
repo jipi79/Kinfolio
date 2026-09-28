@@ -1926,7 +1926,8 @@ function fmtA(n,o){o=o||{};const c=unitCfg();const v=(+n||0)/(c.u==="eok"?1e8:1e
   return (zero?"":v<0?"-":o.plus?"+":"")+s+(c.u==="eok"?"억":"만")+(o.bare?"":"원");}
 function eok(n){return fmtA(n);}
 // 월 금액처럼 작은 금액: 억원 단위 설정이어도 1억 미만은 만원으로 (월 0.005억원 → 월 50만원)
-function fmtM(n,o){o=o||{};const c=unitCfg();const x=+n||0;if(c.u!=="eok"||Math.abs(x)>=1e8)return fmtA(n,o);
+function monthMan(){return (S.settings||{}).monthMan!==false;}   // 설정: 억원 단위일 때 월 금액은 만원으로 (기본 켬)
+function fmtM(n,o){o=o||{};const c=unitCfg();const x=+n||0;if(c.u!=="eok"||!monthMan()||Math.abs(x)>=1e8)return fmtA(n,o);
   const v=x/1e4,a=Math.abs(v);const s=a<10&&a%1>0.05?a.toLocaleString("ko-KR",{maximumFractionDigits:1}):nf.format(Math.round(a));
   if(!/[1-9]/.test(s)&&o.dash)return "–";return (v<=-0.05?"-":o.plus&&v>=0.05?"+":"")+s+"만"+(o.bare?"":"원");}
 // 입력 칸에 넣는 숫자: 천 단위 쉼표 (소수점은 그대로)
@@ -2225,6 +2226,8 @@ function vSettings(){const s=S.settings;const uc=unitCfg();const ex=1234567890;
   return `<section class="card"><h2>금액 표시</h2>
    <div class="grid2"><div class="field"><label for="sUnit">단위</label><select id="sUnit">${[["man","만원"],["eok","억원"]].map(([v,l])=>`<option value="${v}"${uc.u===v?" selected":""}>${l}</option>`).join("")}</select></div>
    <div class="field"><label for="sDec">소수점 자리</label><select id="sDec">${[0,1,2,3,4].map(d=>`<option value="${d}"${uc.d===d?" selected":""}>${d}자리</option>`).join("")}</select></div></div>
+   <label class="check"><input type="checkbox" id="sMonthMan"${monthMan()?" checked":""}${uc.u==="eok"?"":" disabled"}> 월 금액은 만원으로 보기</label>
+   <span class="hint">억원 단위일 때만 적용됩니다. 수입·지출·이체의 월 금액과 연도 상세의 ‘월 ○○’처럼 1억 미만인 월 금액을 ‘월 0.005억원’ 대신 ‘월 50만원’으로 보여 줍니다.</span>
    <span class="hint">장부·계획·결과의 모든 금액을 이 단위로 보여줍니다. 예: 12억 3,456만 7,890원 → <b>${fmtA(ex)}</b>. 억원에 소수점 4자리면 만원 단위까지 정확합니다. 입력 칸은 그대로 만원(또는 원) 단위입니다. 주가·평단가는 원·달러 그대로 둡니다.</span></section>
    ${minCashSection()}
    ${retSection()}
@@ -2578,6 +2581,7 @@ function render0(){
 function saveRet(data,msg){S.settings={...S.settings,...data};S.simCache.key=null;render();
   return write(db=>db.doc("settings/main").set({...S.settings,updatedAt:new Date().toISOString()}),msg);}
 app.addEventListener("change",async e=>{const id=e.target.id;
+  if(id==="sMonthMan"){await saveRet({monthMan:e.target.checked},e.target.checked?"월 금액을 만원으로 보여 줍니다":"월 금액도 억원으로 보여 줍니다");return;}
   if(id==="snapAutoChk"){const on=e.target.checked;await saveRet({snapAuto:on},on?"평가액을 자동으로 기록합니다":"자동 기록을 껐습니다");if(on)autoSnap(200);return;}
   if(id==="sMinCash"){const raw=String(e.target.value).replace(/,/g,"").trim();const v=raw===""?0:parseFloat(raw);if(!(v>=0&&v<1e7)){toast("금액을 만원 단위 숫자로 넣으세요");render();return;}await saveRet({minCash:Math.round(v)*1e4},v?`생활비 통장에 최소 ${fmtA(Math.round(v)*1e4)}을 남겨 둡니다`:"생활비 통장 최소 잔액을 없앴습니다");return;}
   if(id==="sFix"){await saveRet({fixRet:e.target.checked,fixRetR:parseFloat(document.getElementById("sFixR").value)||0,fixRetDy:parseFloat(document.getElementById("sFixD").value)||0},e.target.checked?"계획을 고정 수익률로 계산합니다":"고정 수익률을 껐습니다");return;}
@@ -4029,15 +4033,28 @@ app.addEventListener("change", e => {
 
 /* ================= 평가액 추이 (기록한 날의 총 평가액) ================= */
 // 기록 문서 snapshots/{날짜}: { date, total, cost(매입 원금 + 현금), cash, invested, byMember:{구성원: 평가액}, fx, auto, at }
-S.trRange = "all"; S.trGran = "day"; S.trMore = 0;
-try { S.trRange = localStorage.getItem("rf.trr") || "all"; S.trGran = localStorage.getItem("rf.trg") || "day"; } catch (e) {}
+S.trRange = "all"; S.trGran = "day"; S.trMore = 0; S.trMem = "__all";
+try { S.trRange = localStorage.getItem("rf.trr") || "all"; S.trGran = localStorage.getItem("rf.trg") || "day"; S.trMem = localStorage.getItem("rf.trm") || "__all"; } catch (e) {}
+// 보는 대상의 기록: 가족 전체는 총액, 구성원은 그 사람 명의 계좌 합계 (구성원별 값은 이 기능 이후 기록부터)
+function trPoints() {
+  const all = (S.snapshots || []).filter(x => x && x.date); const m = S.trMem;
+  if (!m || m === "__all") return all.filter(x => x.total > 0);
+  return all.filter(x => x.byMember && x.byMember[m] > 0).map(x => ({ ...x, total: x.byMember[m], cost: (x.byMemberCost || {})[m] || 0 }));
+}
+// 고를 수 있는 구성원: 지금 명의자 + 기록에 남은 구성원
+function trMembers() {
+  const ms = (S.plan && S.plan.members) || []; const ids = new Set(ownerGroups().map(g => g.id || "__none"));
+  (S.snapshots || []).forEach(x => Object.keys(x.byMember || {}).forEach(k => ids.add(k)));
+  const order = ms.map(m => m.id).concat(["__none"]).filter(id => ids.has(id));
+  return order.map(id => [id, id === "__none" ? "명의자 미지정" : (ms.find(m => m.id === id) || {}).name || id]);
+}
 const TR_RANGES = [["1m", "1개월", 31], ["3m", "3개월", 92], ["1y", "1년", 366], ["all", "전체", 0]];
 function snapAuto() { return (S.settings || {}).snapAuto !== false; }
 // 지금 장부로 오늘 기록을 만든다
 function snapDoc(auto) {
-  const t = totals(); const byMember = {};
-  for (const g of ownerGroups()) byMember[g.id || "__none"] = Math.round(g.total);
-  return { date: today(), total: Math.round(t.total), cost: Math.round(t.cost + t.cash), cash: Math.round(t.cash), invested: Math.round(t.invested), byMember, fx: fx() || null, auto: !!auto, at: new Date().toISOString() };
+  const t = totals(); const byMember = {}, byMemberCost = {};
+  for (const g of ownerGroups()) { const k = g.id || "__none"; byMember[k] = Math.round(g.total); byMemberCost[k] = Math.round(g.accts.reduce((s, a) => { const st = acctStats(a); return s + st.cost + st.cash; }, 0)); }
+  return { date: today(), total: Math.round(t.total), cost: Math.round(t.cost + t.cash), cash: Math.round(t.cash), invested: Math.round(t.invested), byMember, byMemberCost, fx: fx() || null, auto: !!auto, at: new Date().toISOString() };
 }
 async function recordSnap(auto) {
   if (!S.db || !acctList().length) return false;
@@ -4053,7 +4070,7 @@ function autoSnap(ms) { if (!snapAuto()) return; clearTimeout(snapT); snapT = se
 function snapReady() { const l = S.loaded || {}; return S.dbState === "ok" && l.accounts && l.holdingsRaw && l.prices && l.assets && l.settings && l.snapshots && !S.sync.busy; }
 
 function trFiltered() {
-  const all = (S.snapshots || []).filter(x => x && x.date && x.total > 0);
+  const all = trPoints();
   const r = TR_RANGES.find(x => x[0] === S.trRange) || TR_RANGES[3];
   if (!r[2]) return all;
   const from = new Date(new Date(today() + "T00:00:00+09:00").getTime() - r[2] * 864e5 + 9 * 3600e3).toISOString().slice(0, 10);
@@ -4062,25 +4079,30 @@ function trFiltered() {
 // 월별: 달마다 마지막 기록
 function trMonthly(list) { const m = {}; list.forEach(x => { m[x.date.slice(0, 7)] = x; }); return Object.values(m); }
 function vTrend() {
-  const all = (S.snapshots || []).filter(x => x && x.date && x.total > 0);
+  const mems = trMembers(); if (S.trMem !== "__all" && !mems.some(([id]) => id === S.trMem)) S.trMem = "__all";
+  const who = S.trMem === "__all" ? "" : (mems.find(([id]) => id === S.trMem) || [, ""])[1];
+  const msel = mems.length > 1 ? `<div class="subnav">${[["__all", "가족 전체"]].concat(mems).map(([id, l]) => `<button type="button" data-trm="${esc(id)}" aria-selected="${id === S.trMem}">${esc(l)}</button>`).join("")}</div>` : "";
+  const all = trPoints();
   const auto = snapAuto(); const last = all[all.length - 1];
   const autoBox = `<label class="check"><input type="checkbox" id="snapAutoChk"${auto ? " checked" : ""}> 자동으로 기록</label>
     <span class="hint">켜 두면 장부를 열 때, 가격을 가져온 뒤, 다른 기기에서 바뀐 내용을 받은 뒤에 오늘 평가액을 기록합니다. 하루에 한 번만 남고, 같은 날 다시 기록하면 그날 값이 바뀝니다.</span>`;
+  if (!all.length && S.trMem !== "__all") return msel + `<section class="card empty" style="text-align:left"><h2>${esc(who)} 평가액 추이</h2><p style="margin:0">${esc(who)} 명의의 기록이 아직 없습니다. 구성원별 평가액은 이 기능을 넣은 뒤의 기록부터 남습니다. 오늘 기록을 남기면 여기부터 쌓입니다.</p>
+    <div class="btns"><button class="btn primary" id="snapNow">지금 평가액 기록</button></div></section>`;
   if (!all.length) return `<section class="card empty" style="text-align:left"><h2>평가액 추이</h2><p style="margin:0">아직 기록이 없습니다. 날마다 총 평가액을 남겨 두면 여기에서 추이와 표로 볼 수 있습니다.</p>
     <div class="btns"><button class="btn primary" id="snapNow">지금 평가액 기록</button></div>${autoBox}</section>`;
   const list = trFiltered(); const first = list[0] || last;
   const chg = last.total - first.total, chgR = first.total ? chg / first.total : 0;
   const hi = list.reduce((a, b) => b.total > a.total ? b : a, first), lo = list.reduce((a, b) => b.total < a.total ? b : a, first);
   const pl = last.total - (last.cost || 0), plR = last.cost ? pl / last.cost : 0;
-  let h = `<div class="row"><h2>평가액 추이</h2><div class="seg-toggle" role="group" aria-label="기간">${TR_RANGES.map(([k, l]) => `<button type="button" data-trr="${k}" aria-pressed="${S.trRange === k}">${l}</button>`).join("")}</div></div>
+  let h = msel + `<div class="row"><h2>평가액 추이</h2><div class="seg-toggle" role="group" aria-label="기간">${TR_RANGES.map(([k, l]) => `<button type="button" data-trr="${k}" aria-pressed="${S.trRange === k}">${l}</button>`).join("")}</div></div>
   <section class="hero"><span class="label">${esc(last.date)} 기록${daysAgo(last.date) > 0 ? ` · ${daysAgo(last.date)}일 전` : " · 오늘"}</span>
     <span class="total">${eok(last.total)}</span>
-    <span class="pl ${cls(pl)}">평가손익 ${fmtA(pl, { plus: true })} (${pct(plR, 2)})</span>
+    ${last.cost ? `<span class="pl ${cls(pl)}">평가손익 ${fmtA(pl, { plus: true })} (${pct(plR, 2)})</span>` : ""}
     <div class="chips">${list.length > 1 ? `<span class="chip ${chg > 0 ? "good" : chg < 0 ? "bad" : ""}">${esc(first.date)} 이후 ${fmtA(chg, { plus: true })} (${pct(chgR, 2)})</span>` : ""}
       ${list.length > 1 ? `<span class="chip">최고 ${eok(hi.total)} · ${esc(hi.date.slice(2))}</span><span class="chip">최저 ${eok(lo.total)} · ${esc(lo.date.slice(2))}</span>` : ""}</div></section>`;
-  h += `<section class="card"><div class="row"><h2>총 평가액</h2><span class="meta">${unitName()} · 기록 ${nf.format(list.length)}개</span></div>
+  h += `<section class="card"><div class="row"><h2>${who ? esc(who) + " 명의 평가액" : "총 평가액"}</h2><span class="meta">${unitName()} · 기록 ${nf.format(list.length)}개</span></div>
     ${list.length > 1 ? `<div class="chart-wrap" id="trendWrap"><div class="chart-tip" id="trendTip" hidden></div></div>
-    <div class="legend"><span><i style="background:var(--c1)"></i>평가액</span><span><i class="dash" style="border-color:var(--c2)"></i>원금 (매입 금액 + 현금)</span></div>`
+    <div class="legend"><span><i style="background:var(--c1)"></i>평가액</span>${list.some(x => x.cost > 0) ? `<span><i class="dash" style="border-color:var(--c2)"></i>원금 (매입 금액 + 현금)</span>` : ""}</div>`
     : `<p class="meta" style="margin:0">기록이 두 개 이상이면 그래프가 나옵니다.</p>`}</section>`;
   // 표
   const rows0 = (S.trGran === "month" ? trMonthly(list) : list).slice().reverse();
@@ -4092,8 +4114,8 @@ function vTrend() {
       return `<tr data-snap="${esc(x.date)}"><td>${esc(dl)}${x.auto ? "" : ` <span class="meta">·</span>`}</td><td><b>${sh(x.total)}</b></td><td class="${d == null ? "" : cls(d)}">${d == null ? "–" : sg(d)}</td><td class="${cls(p)}">${x.cost ? `${sg(p)}<br><small>${pct(x.cost ? p / x.cost : 0, 1)}</small>` : "–"}</td></tr>`; }).join("")}
     </tbody></table></div>
     ${rows0.length > rows.length ? `<div class="btns"><button type="button" class="btn small" id="trMore">더 보기 (${nf.format(rows0.length - rows.length)}개 남음)</button></div>` : ""}
-    <span class="hint">금액 단위 ${unitName()}. 변화는 앞 기록과의 차이입니다. 행을 누르면 그날 구성원별 평가액을 보고 기록을 지울 수 있습니다. ‘·’ 표시는 직접 기록한 날입니다.</span></section>`;
-  const td = all.find(x => x.date === today());
+    <span class="hint">금액 단위 ${unitName()}. 변화는 앞 기록과의 차이입니다.${who ? ` ${esc(who)} 명의 계좌만 더한 값이고, 평가손익은 구성원별 원금을 남긴 기록부터 나옵니다.` : ""} 행을 누르면 그날 구성원별 평가액을 보고 기록을 지울 수 있습니다. ‘·’ 표시는 직접 기록한 날입니다.</span></section>`;
+  const td = (S.snapshots || []).find(x => x.date === today());
   h += `<section class="card"><h2>기록하기</h2>${td ? `<p class="meta" style="margin:0">오늘(${esc(td.date)}) ${td.auto ? "자동으로" : "직접"} 기록됨 · ${eok(td.total)}${td.at ? ` · ${esc(whenTxt(td.at))}` : ""}</p>` : `<p class="meta" style="margin:0">오늘 기록은 아직 없습니다.</p>`}
     <div class="btns"><button class="btn${td ? "" : " primary"}" id="snapNow">${td ? "지금 값으로 다시 기록" : "지금 평가액 기록"}</button></div>${autoBox}</section>`;
   return h;
@@ -4115,7 +4137,7 @@ function drawTrend() {
   const list = trFiltered(); if (list.length < 2) return;
   const W = Math.max(280, wrap.clientWidth), Hh = W < 500 ? 200 : 260, R = 10, T = 12, B = 30;
   const tt = list.map(x => Date.parse(x.date + "T00:00:00+09:00")); const t0 = tt[0], t1 = tt[tt.length - 1] || t0 + 1;
-  const vals = list.flatMap(x => [x.total, x.cost || x.total]);
+  const vals = list.flatMap(x => x.cost > 0 ? [x.total, x.cost] : [x.total]);
   let mn = Math.min(...vals), mx = Math.max(...vals); const pad = (mx - mn) * 0.08 || mx * 0.02 || 1; mn -= pad; mx += pad;
   const step = niceStep((mx - mn) / 4); mn = Math.floor(mn / step) * step; mx = Math.ceil(mx / step) * step;
   let L = 36; { let w = 0; for (let v = mn; v <= mx + 1; v += step) w = Math.max(w, axLbl(v, step).length); L = Math.max(36, w * 7 + 12); }
@@ -4125,7 +4147,8 @@ function drawTrend() {
   const line = f => list.map((s, i) => `${i ? "L" : "M"}${x(tt[i]).toFixed(1)} ${y(f(s)).toFixed(1)}`).join(" ");
   const tl = line(s => s.total);
   svg += `<path d="${tl} L${x(t1).toFixed(1)} ${Hh - B} L${x(t0).toFixed(1)} ${Hh - B} Z" fill="var(--c1)" opacity=".14"/>`;
-  if (list.some(s => s.cost)) svg += `<path d="${line(s => s.cost || s.total)}" fill="none" stroke="var(--c2)" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>`;
+  const cp = list.map((s, i) => [i, s.cost]).filter(([, c]) => c > 0);   // 원금은 남긴 기록만 잇는다
+  if (cp.length > 1) svg += `<path d="${cp.map(([i, c], j) => `${j ? "L" : "M"}${x(tt[i]).toFixed(1)} ${y(c).toFixed(1)}`).join(" ")}" fill="none" stroke="var(--c2)" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>`;
   svg += `<path d="${tl}" fill="none" stroke="var(--c1)" stroke-width="2" stroke-linejoin="round"/>`;
   // 날짜 눈금: 처음·끝과 그 사이 두세 개
   const nT = W < 500 ? 3 : 5; for (let k = 0; k < nT; k++) { const t = t0 + (t1 - t0) * k / (nT - 1); const d = new Date(t + 9 * 3600e3).toISOString().slice(2, 10).replace(/-/g, ".");
@@ -4144,6 +4167,7 @@ function drawTrend() {
 }
 function trendClick(t) {
   if (t.dataset.trr) { S.trRange = t.dataset.trr; S.trMore = 0; try { localStorage.setItem("rf.trr", S.trRange); } catch (e) {} render(); return true; }
+  if (t.dataset.trm) { S.trMem = t.dataset.trm; S.trMore = 0; try { localStorage.setItem("rf.trm", S.trMem); } catch (e) {} render(); return true; }
   if (t.dataset.trg) { S.trGran = t.dataset.trg; S.trMore = 0; try { localStorage.setItem("rf.trg", S.trGran); } catch (e) {} render(); return true; }
   if (t.id === "trMore") { S.trMore++; render(); return true; }
   if (t.id === "snapNow") { recordSnap(false); return true; }

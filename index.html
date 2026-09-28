@@ -4243,18 +4243,22 @@ function vAlloc() {
   // 지금 자금 vs 앞으로의 새 돈
   h += alFutureCard(c);
   // 계좌별
-  h += `<p class="hint" style="margin:0">계좌별 제안 · 종목 앞 자물쇠를 누르면 그 계좌의 그 종목 수량을 지정합니다(처음엔 지금 수량). 수량을 바꾸면 지금보다 많든 적든 그 수량으로 사거나 팔고 더는 건드리지 않으며, 나머지 돈으로 목표 비중을 맞춥니다. 지금 없는 종목은 ‘수량 지정할 종목 추가’로 넣습니다.${c.lockTot > 0 ? ` 수량을 지정한 금액 ${eok(c.lockTot)}.` : ""}</p>`;
-  h += c.accts.map(a => { const o = c.sh[a.id]; const ks = [...new Set(Object.keys(c.qty[a.id]).concat(Object.keys(o.shares), c.keys.filter(k => c.isFixed(a.id, k))))].filter(k => k !== AL_CASH);
+  h += `<p class="hint" style="margin:0">계좌별 제안 · 오른쪽 끝 열은 다음 해 이 계좌에 들어올 돈(계획 납입 + 예상 배당·이자)으로 지금 가격에 살 수 있는 주식 수입니다(입금은 ‘미래 입금’, 배당은 ‘미래 배당·분배’ 설정의 비율대로, 이 계좌에 담을 수 있는 종목만). 종목 앞 자물쇠를 누르면 그 계좌의 그 종목 수량을 지정합니다(처음엔 지금 수량). 수량을 바꾸면 지금보다 많든 적든 그 수량으로 사거나 팔고 더는 건드리지 않으며, 나머지 돈으로 목표 비중을 맞춥니다. 지금 없는 종목은 ‘수량 지정할 종목 추가’로 넣습니다.${c.lockTot > 0 ? ` 수량을 지정한 금액 ${eok(c.lockTot)}.` : ""}</p>`;
+  h += c.accts.map(a => { const o = c.sh[a.id]; const nm = alNewMoney(c, a);
+    const ks = [...new Set(Object.keys(c.qty[a.id]).concat(Object.keys(o.shares), c.keys.filter(k => c.isFixed(a.id, k)), Object.keys(nm.sh)))].filter(k => k !== AL_CASH);
+    const nmOn = nm.total > 0.5;
+    const nmCell = k => { const n = nm.sh[k] || 0; return `<td class="${n ? "up" : ""}">${n ? `+${nf.format(n)}주<br><span class="meta">${fmtM(n * c.info[k].price)}</span>` : "–"}</td>`; };
     const rows = ks.map(k => { const i = c.info[k]; const n0 = c.qty[a.id][k] || 0, n1 = o.shares[k] || 0, d = n1 - n0; const fx = c.isFixed(a.id, k);
       const btn = `<button type="button" class="lk" data-allock="${esc(a.id)}|${esc(k)}" aria-pressed="${fx}" aria-label="${esc(i.name)} ${fx ? "수량 지정 풀기" : "수량 지정 (처음엔 지금 수량)"}">${fx ? LOCK_SVG : UNLOCK_SVG}</button>`;
       const q = fx ? `<span class="lkq"><input data-allockq="${esc(a.id)}|${esc(k)}" inputmode="numeric" value="${c.lockQ(a.id, k)}" aria-label="${esc(i.name)} 지정 주식 수">주로 지정</span>` : "";
       const dTxt = d > 0 ? "+" + nf2.format(d) : d < 0 ? "−" + nf2.format(-d) : "–";
-      return `<tr${fx ? ' class="fixed"' : ""}><td><span class="lkc">${btn}<span>${esc(i.name)}${q}</span></span></td><td>${nf2.format(n0)}</td><td><b>${nf2.format(n1)}</b></td><td class="${d > 0 ? "up" : d < 0 ? "down" : ""}">${dTxt}${fx ? ` <span class="chip">지정</span>` : ""}</td><td>${eok(c.cellV(a.id, k))}</td></tr>`; }).join("");
+      return `<tr${fx ? ' class="fixed"' : ""}><td><span class="lkc">${btn}<span>${esc(i.name)}${q}</span></span></td><td>${nf2.format(n0)}</td><td><b>${nf2.format(n1)}</b></td><td class="${d > 0 ? "up" : d < 0 ? "down" : ""}">${dTxt}${fx ? ` <span class="chip">지정</span>` : ""}</td><td>${eok(c.cellV(a.id, k))}</td>${nmOn ? nmCell(k) : ""}</tr>`; }).join("");
     const addable = watchList().map(x => x.ticker).concat(c.keys).filter((k, j, arr) => arr.indexOf(k) === j && k !== AL_CASH && !ks.includes(k)).map(k => ({ k, inf: c.info[k] || alInfo(k) })).filter(x => !alRule(a, x.inf) && x.inf.price > 0);
     const cash0 = c.current[a.id][AL_CASH] || 0; const riskyPct = a.type === "IRP" && c.V[a.id] > 0 ? o.riskyV / c.V[a.id] : null;
     return `<section class="card"><div class="row"><div class="l"><span class="name">${esc(a.name)}</span><span class="meta">${esc(a.type)}${c.scope === "__all" ? " · " + esc(memName(ownerOf(a))) : ""}</span></div><b>${eok(c.V[a.id])}</b></div>
-     <div class="tbl-wrap" data-keep="alAc:${esc(a.id)}"><table class="tbl in al lkt"><thead><tr><th>종목</th><th>지금</th><th>제안</th><th>사고팔 수</th><th>금액</th></tr></thead><tbody>${rows}
-     <tr><td>예수금</td><td>${eok(cash0)}</td><td><b>${eok(o.cash)}</b></td><td></td><td>${eok(o.cash)}</td></tr></tbody></table></div>
+     <div class="tbl-wrap" data-keep="alAc:${esc(a.id)}"><table class="tbl in al lkt"><thead><tr><th>종목</th><th>지금</th><th>제안</th><th>사고팔 수</th><th>금액</th>${nmOn ? `<th>${nm.year}년 ${nm.divUse ? "입금·배당" : "입금"}으로<br><small>살 수 (지금 가격)</small></th>` : ""}</tr></thead><tbody>${rows}
+     <tr><td>예수금</td><td>${eok(cash0)}</td><td><b>${eok(o.cash)}</b></td><td></td><td>${eok(o.cash)}</td>${nmOn ? `<td>${nm.left > 0.5 ? `+${fmtM(nm.left)}<br><span class="meta">남는 돈</span>` : "–"}</td>` : ""}</tr></tbody></table></div>
+     ${nmOn ? `<span class="meta">${nm.year}년에 들어올 돈 <b>${fmtM(nm.total)}</b> = 계획 납입 ${fmtM(nm.dep)}${nm.dep > 0.5 ? ` (월 약 ${fmtM(nm.dep / 12)})` : ""} + 예상 배당·이자 ${fmtM(nm.divUse ? nm.div : 0)}${nm.gen && nm.div > 0.5 ? " (원천징수 뒤)" : ""} → 주식 매수 ${fmtM(nm.spent)}${nm.left > 0.5 ? ` · 남는 돈 ${fmtM(nm.left)}` : ""}${!nm.divUse && nm.div > 0.5 ? ` · 예상 배당 ${fmtM(nm.div)}은 ‘배당 반영 안 함’ 설정이라 넣지 않음` : ""}${nm.capped ? " · 위험자산이 70%를 넘지 않게 일부는 안전자산으로" : ""}</span>` : ""}
      ${addable.length ? `<div class="btns"><select class="alfixadd" data-alfixadd="${esc(a.id)}" aria-label="${esc(a.name)}에 수량 지정할 종목 추가"><option value="">+ 수량 지정할 종목 추가…</option>${addable.map(x => `<option value="${esc(x.k)}">${esc(x.inf.name)}</option>`).join("")}</select></div>` : ""}
      ${riskyPct != null ? `<span class="meta">위험자산 ${pct1(riskyPct)} (IRP 한도 70%)</span>` : ""}${c.acctB[a.id] > 0.5 || c.acctS[a.id] > 0.5 ? `<span class="meta">사기 ${eok(c.acctB[a.id])} · 팔기 ${eok(c.acctS[a.id])}</span>` : ""}${c.sellTax[a.id] ? `<span class="meta">파는 종목의 차익 세금 추정 ${eok(c.sellTax[a.id])} (해외 상장은 연 250만원 공제 전${c.sellUsd[a.id] ? ", 달러 종목은 환율 변동분 제외" : ""})</span>` : ""}</section>`; }).join("");
   // 계좌별로 담을 종목
@@ -4265,6 +4269,44 @@ function vAlloc() {
    <span class="hint">해외 상장 종목은 일반계좌에서만, 개별 종목과 레버리지·인버스 ETF는 연금저축·IRP에서 살 수 없습니다. IRP는 위험자산을 70%까지만 담습니다.</span></details>`;
   h += `<p class="hint" style="margin:0">제안은 계좌 사이에 돈을 옮기지 않고, 계좌마다 지금 평가액 안에서 종목만 바꾸는 방식입니다. 실제로 사고팔면 장부의 보유 종목을 고쳐 주세요. 세금 추정은 방향을 잡기 위한 대략적인 값입니다.</p>`;
   return h;
+}
+// 계좌에 한 해 동안 들어올 새 돈(계획 납입 + 예상 배당·이자)과 그 돈으로 살 주식 수.
+// 납입: 계획 결과의 다음 해 이 계좌 납입액(계좌 계획 납입 + 이체로 받는 납입 + 남는 돈 적립). 배당: 제안대로 사고판 뒤 보유분 × 종목 배당수익률 (일반계좌는 원천징수 뒤).
+// 사는 비율: 입금은 ‘미래 입금’ 설정의 입금 배분(반영 안 함이면 지금 맞출 비중), 배당은 재투자면 받은 종목, 모아 쓰면 배당 배분 비율.
+// 이 계좌에 담을 수 없는 종목은 빼고 나머지 비율로 나눈다. 주식 수는 1주 단위 내림(지금 가격 기준), 남는 돈은 예수금
+function alAcctDep(aid, y) { const sim = getSimBase(); let v = 0;
+  for (const res of [sim].concat((sim.groups || []).map(g => g.result))) for (const r of res.rows || []) if (r.year === y && (r.contribs || {})[aid] > 0) v += r.contribs[aid];
+  return v; }
+function alNewMoney(c, a) {
+  const Y = yr() + 1, o = c.sh[a.id], gen = alAcctKind(a.type) === "general";
+  const dep = alAcctDep(a.id, Y);
+  const net = k => !gen ? 1 : k !== AL_CASH && c.info[k].cur === "USD" ? 0.85 : 0.846;   // 일반계좌: 국내 15.4%, 미국 15% 원천징수
+  const divBy = {}; let div = 0;
+  for (const k in o.shares) { const i = c.info[k]; const v = o.shares[k] * i.price * i.dy / 100 * net(k); if (v > 0) { divBy[k] = v; div += v; } }
+  if (o.cash > 0 && c.info[AL_CASH]) { const v = o.cash * c.info[AL_CASH].dy / 100 * net(AL_CASH); if (v > 0) { divBy[AL_CASH] = v; div += v; } }
+  const ok = k => k !== AL_CASH && c.info[k] && c.info[k].price > 0 && c.allowed(a, k);
+  const norm = w => { const r = {}; let t = 0; for (const k in w || {}) if (ok(k) && w[k] > 0) { r[k] = w[k]; t += w[k]; } if (!(t > 0)) return null; for (const k in r) r[k] /= t; return r; };
+  const nowW = Object.fromEntries(c.keys.map(k => [k, c.demand[k] || 0]));
+  const acctW = Object.fromEntries(Object.keys(o.shares).map(k => [k, o.shares[k] * c.info[k].price]));
+  const buy = {}; const add = (k, v) => { buy[k] = (buy[k] || 0) + v; };
+  if (dep > 0) { const w = norm(c.depMode !== "none" && Object.keys(c.depRatio).length ? c.depRatio : nowW) || norm(acctW); if (w) for (const k in w) add(k, dep * w[k]); }
+  const divUse = c.divMode !== "none";
+  if (divUse && div > 0) {
+    if (c.divMode === "reinvest") { for (const k in divBy) if (ok(k)) add(k, divBy[k]); }
+    else { const w = norm(Object.keys(c.divRatio).length ? c.divRatio : nowW) || norm(acctW); if (w) for (const k in w) add(k, div * w[k]); } }
+  const total = dep + (divUse ? div : 0);
+  // IRP: 새 돈으로 사도 위험자산이 계좌의 70%를 넘지 않게. 넘는 몫은 안전자산(채권·혼합 등)으로, 담을 안전자산이 없으면 예수금
+  let capped = false;
+  if (RISK_CAPPED.has(a.type)) {
+    const room = Math.max(0, 0.7 * ((c.V[a.id] || 0) + total) - (o.riskyV || 0));
+    const rk = Object.keys(buy).filter(k => c.info[k].risky), rs = rk.reduce((t, k) => t + buy[k], 0);
+    if (rs > room + 1) { capped = true; const f = room / rs; let ex = 0; for (const k of rk) { ex += buy[k] * (1 - f); buy[k] *= f; }
+      const safe = w => { const r = {}; for (const k in w || {}) if (!c.info[k] || !c.info[k].risky) r[k] = w[k]; return norm(r); };
+      const sw = safe(c.depMode !== "none" && Object.keys(c.depRatio).length ? c.depRatio : nowW) || safe(acctW);
+      if (sw) for (const k in sw) add(k, ex * sw[k]); } }
+  const sh = {}; let spent = 0;
+  for (const k in buy) { let n = Math.floor(buy[k] / c.info[k].price + 1e-9); if (n > 0) { sh[k] = n; spent += n * c.info[k].price; } }
+  return { year: Y, dep, div, divUse, gen, total, buy, sh, spent, left: Math.max(0, total - spent), capped };
 }
 // 지금 자금(사고팔기)과 앞으로의 새 돈(입금·배당)으로 살 수량을 나눠 보여 준다
 function alFutureCard(c) {
@@ -4494,7 +4536,7 @@ function trendClick(t) {
 app.addEventListener("click",e=>{const tr=e.target.closest("tr[data-snap]");if(tr)snapSheet(tr.dataset.snap);});
 RE.DEFAULT_ASSUMPTIONS.baseYear=new Date().getFullYear();
 // 자동 테스트에서만 내부 계산 함수를 꺼내 쓴다 (평소에는 아무 일도 하지 않음)
-if(window.__KINFOLIO_TEST__)window.__kinfolio={S,pxAutoRun,pxLast,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
+if(window.__KINFOLIO_TEST__)window.__kinfolio={S,pxAutoRun,pxLast,alNewMoney,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
 document.getElementById("hdrSub").addEventListener("click",()=>{if(S.dbState==="ok"&&freshness())setTab("prices");});
 document.getElementById("syncChip").addEventListener("click",()=>{
   if(PWA&&!KinfolioPWA.clientId()){setTab("settings");return;}

@@ -398,6 +398,10 @@ nav.tabs button[aria-current="page"]{color:var(--accent)}
 .kv b{font-size:14px}
 .kv span{font-size:11.5px;color:var(--muted)}
 @media (max-width:420px){.kv{grid-template-columns:1fr 1fr}.hero .total{font-size:28px}}
+.kv.kv4{grid-template-columns:repeat(4,1fr)}
+@media (max-width:560px){.kv.kv4{grid-template-columns:1fr 1fr}}
+.fitbox{font-size:13px;line-height:1.5;padding:10px 12px;border-radius:10px;background:var(--warn-soft);color:var(--ink)}
+.fitbox b{font-weight:700}
 
 [hidden]{display:none!important}
 .vh{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;pointer-events:none}
@@ -2116,6 +2120,20 @@ function totals(){let total=0,cost=0,cash=0;const byClass={};const byAcct=[];
     st.hs.forEach(h=>{const k=h.assetClass||"기타";byClass[k]=(byClass[k]||0)+hVal(h);});});
   if(cash)byClass["현금성"]=(byClass["현금성"]||0)+cash;
   return{total,cost,cash,invested:total-cash,byClass,byAcct};}
+// 계좌 묶음의 지금 평가손익·수익률 (예수금·현금 제외한 매입 원가 대비)
+function groupPL(accts){let v=0,c=0;for(const a of accts){const st=acctStats(a);v+=st.value;c+=st.cost;}return{pl:v-c,cost:c,r:c>0?(v-c)/c:0};}
+// 기간 손익(주간·월간·연간): 지금 평가손익 − 기간 시작일(그날이나 그 전 가장 가까운 기록)의 평가손익.
+// 기간 중에 넣거나 뺀 돈은 원금(매입 금액 + 현금)이 함께 바뀌어 손익에 들어가지 않는다. 비율은 시작일 투자 평가액(현금 제외) 대비
+// 한 달·한 해 전: 그 달에 같은 날이 없으면(3월 31일 → 2월) 그 달 마지막 날
+function backMonths(d,n){const day=d.getUTCDate();d.setUTCDate(1);d.setUTCMonth(d.getUTCMonth()-n);const last=new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth()+1,0)).getUTCDate();d.setUTCDate(Math.min(day,last));}
+const PERIODS=[["주간",d=>{d.setUTCDate(d.getUTCDate()-7);},3],["월간",d=>backMonths(d,1),7],["연간",d=>backMonths(d,12),31]];
+function periodPL(back,tol){const t=totals();const now=t.invested-t.cost;const d=new Date(today()+"T00:00:00Z");back(d);const from=d.toISOString().slice(0,10);
+  const d2=new Date(d.getTime()-tol*864e5).toISOString().slice(0,10);
+  const base=(S.snapshots||[]).filter(x=>x&&x.date&&x.date<=from&&x.date>=d2&&x.total>0&&x.cost>0).pop();
+  if(!base)return null;const v=now-(base.total-base.cost);const inv=base.total-(+base.cash||0);return{d:v,r:inv>0?v/inv:null,date:base.date,from};}
+function periodChips(){if(!(S.snapshots||[]).length)return "";
+  const xs=PERIODS.map(([l,b,tol])=>[l,periodPL(b,tol)]);
+  return `<div class="chips pchips">${xs.map(([l,x])=>x?`<span class="chip" data-period="${l}" title="${esc(x.date)} 기록 대비 평가손익 변화 · 그사이 넣거나 뺀 돈은 빼고, 비율은 그때 투자 평가액(현금 제외) 대비">${l} <b class="${cls(x.d)}">${fmtM(x.d,{plus:true})}</b>${x.r==null?"":` <span class="${cls(x.d)}">${pct(x.r,2)}</span>`}</span>`:`<span class="chip" data-period="${l}" title="그만큼 오래된 평가액 기록이 없습니다">${l} –</span>`).join("")}</div>${xs.some(([,x])=>!x)?`<span class="meta pnote">‘–’는 그만큼 오래된 평가액 기록이 아직 없다는 뜻입니다. 추이 탭의 기록이 쌓이면 나옵니다.</span>`:""}`;}
 function needsFx(){return Object.values(S.holdings).some(h=>h.currency==="USD")&&!fx();}
 
 /* ---------- db ---------- */
@@ -2201,7 +2219,7 @@ function vHome(){
     <span class="total">${eok(t.total)}</span>
     <span class="pl ${cls(pl)}">평가손익 ${fmtA(pl,{plus:true})} (${pct(plr,2)})</span>
     ${(()=>{const fe=memberExp("__all");return fe?`<span class="meta">예상 연수익률 <b>${expTxt(fe.r)}</b> · 배당·분배 ${expTxt(fe.dy)} · 수익률 ${esc(scenLabel())}</span>`:"";})()}
-    ${fx()&&Object.values(S.holdings).some(h=>h.currency==="USD"&&num(h.qty)>0)?`<span class="meta">달러 종목 손익은 환율 변동분을 빼고 계산합니다 (매입가도 지금 환율로 환산)</span>`:""}
+    ${periodChips()}
     ${S.snapshots.length>1?`<button type="button" class="spark-btn" data-go="trend" aria-label="평가액 추이 보기">${sparkline(S.snapshots.slice(-120))}</button>`:""}
     </section>`;
   h+=planSummaryCard();
@@ -2214,7 +2232,7 @@ function vHome(){
   // by member
   const byMem=ownerGroups();
   if(byMem.length>1||(byMem.length===1&&byMem[0].id)){h+=`<section class="card"><h2>구성원별 자산</h2><div class="bar">${byMem.map((g,i)=>`<span style="width:${t.total?(g.total/t.total*100):0}%;background:${ACCT_COLORS[i%ACCT_COLORS.length]}"></span>`).join("")}</div>
-    <div class="list">${byMem.map((g,i)=>`<button class="item" data-mview="${esc(g.id||"__none")}"><div class="row"><div class="l"><span class="name"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ACCT_COLORS[i%ACCT_COLORS.length]};margin-right:7px"></i>${esc(g.name)}</span><span class="meta">계좌 ${g.accts.length}개 · ${g.types}${(()=>{const e=groupExp(g.accts);return e?` · 예상 연 ${expTxt(e.r)}`:"";})()}</span></div>
+    <div class="list">${byMem.map((g,i)=>`<button class="item" data-mview="${esc(g.id||"__none")}"><div class="row"><div class="l"><span class="name"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ACCT_COLORS[i%ACCT_COLORS.length]};margin-right:7px"></i>${esc(g.name)}</span><span class="meta">${(()=>{const q=groupPL(g.accts);const e=groupExp(g.accts);return [q.cost>0?`현재 수익률 <b class="${cls(q.r)}">${pct(q.r)}</b>`:"",e?`예상 수익률 연 ${expTxt(e.r)}`:""].filter(Boolean).join(" · ");})()}</span></div>
     <div class="r"><b>${eok(g.total)}</b><span class="meta">비중 ${t.total?(g.total/t.total*100).toFixed(1):0}%</span></div></div></button>`).join("")}</div></section>`;}
 
   // by account
@@ -3172,7 +3190,7 @@ function simWith0(src, cache) {
   const key = JSON.stringify(input);
   if (S[cache] && S[cache].key === key) return S[cache].val;
   let val; try { val = RE.simulate(input); } catch (e) { val = { rows: [], warnings: [{ type: "err", from: yr(), to: yr(), msg: "계산 중 오류가 났습니다: " + e.message }], summary: null }; }
-  S[cache] = { key, val }; return val;
+  S[cache] = { key, val, input }; return val;
 }
 function getSim() { return simWith(retSrc(), "simCache"); }
 // 지금 보유 종목 기준 계획: 배분 탭이 미래 입금을 가져올 때 쓴다 (배분 후 기준 계획 ↔ 배분 계산이 서로 부르지 않게)
@@ -3270,19 +3288,33 @@ function vPlanHome() {
     const res = resOf(m.id); const rows = res.rows || [];
     const alive = rows.filter(r => r.ages[m.id] != null); const lr = alive[alive.length - 1];
     const endAssets = lr && lr.byPerson && lr.byPerson[m.id] ? lr.byPerson[m.id].assets / lr.infl : 0;
-    const nInc = p.incomes.filter(i => i.ownerId === m.id).length;
-    const nAcc = allPlanAccounts().filter(a => acctOwner(a.id) === m.id).length;
-    const segNow = p.expenses.filter(e => e.memberId === m.id && num(e.fromAge) <= ageNow(m) && (!has(e.toAge) || num(e.toAge) >= ageNow(m))).reduce((s2, e) => s2 + num(e.monthly), 0);
-    const tIn = p.transfers.filter(t => t.toId === m.id).length, tOut = p.transfers.filter(t => t.fromId === m.id).length;
+    const segNow = livingNow(m);
+    const inc = incomeNow(m), tr = transferNow(m);
+    const acctTot = (ownerGroups().find(g => g.id === m.id) || {}).total || 0;
     const sep = m.household && m.household !== "main" && m.relation !== "본인";
     const inH = m.inHorizon ?? ["본인", "배우자"].includes(m.relation);
     return `<button class="card acard mcard" data-psel="${esc(m.id)}"><div class="row"><div class="l"><span class="name">${esc(m.name)} <span class="chip">${esc(m.relation)}</span>${sep ? ` <span class="chip warn">${esc(RE.HH_LABEL[m.household])}</span>` : inH ? ` <span class="chip acc">계획 기간 기준</span>` : ""}</span>
       <span class="meta">${esc(m.birthYear)}년생 · 올해 ${ageNow(m)}세 · ${esc(m.deathAge)}세까지 계산 (${num(m.birthYear) + num(m.deathAge)}년)</span></div><span class="meta">›</span></div>
-      <div class="mfacts"><span>수입 <b>${nInc}</b></span><span>생활비 <b>${segNow ? "월 " + fmtM(segNow) : "–"}</b></span><span>계좌 <b>${nAcc}</b></span>${(() => { const fx = fixRet(); if (fx) return `<span>수익률 <b>고정 연 ${expTxt(fx.r)}</b></span>`; const e = retSrc() !== "current" ? planMemberExp(m.id) : memberExp(m.id); return e ? `<span>${retSrc() !== "current" ? "배분 후 " : ""}예상 수익률 <b>연 ${expTxt(e.r)}</b></span>` : ""; })()}${tIn || tOut ? `<span>이체 <b>${tIn ? "받음 " + tIn : ""}${tIn && tOut ? " · " : ""}${tOut ? "보냄 " + tOut : ""}</b></span>` : ""}${lr ? `<span>${num(m.birthYear) + num(m.deathAge) <= (rows[rows.length - 1] || {}).year ? "계획 끝" : "마지막 해"} 자산 <b>${eok(endAssets)}</b> <small>현재가치</small></span>` : ""}</div></button>`;
+      <div class="mfacts"><span>생활비 <b>${segNow ? "월 " + fmtM(segNow) : "–"}</b></span>${(() => { const fx = fixRet(); if (fx) return `<span>수익률 <b>고정 연 ${expTxt(fx.r)}</b></span>`; const e = retSrc() !== "current" ? planMemberExp(m.id) : memberExp(m.id); return e ? `<span>${retSrc() !== "current" ? "배분 후 " : ""}예상 수익률 <b>연 ${expTxt(e.r)}</b></span>` : ""; })()}${lr ? `<span>${num(m.birthYear) + num(m.deathAge) <= (rows[rows.length - 1] || {}).year ? "계획 끝" : "마지막 해"} 자산 <b>${eok(endAssets)}</b> <small>현재가치</small></span>` : ""}<span>계좌 <b>${acctTot ? eok(acctTot) : "–"}</b></span><span>수입 <b>${inc.mo > 0.5 ? `월 ${inc.approx ? "약 " : ""}${fmtM(inc.mo)}` : inc.next ? `${inc.next.age}세부터 월 ${fmtM(inc.next.mo)}` : "–"}</b></span>${tr.inM > 0.5 || tr.outM > 0.5 ? `<span>이체 <b>${tr.inM > 0.5 ? `받음 월 ${tr.approx ? "약 " : ""}${fmtM(tr.inM)}` : ""}${tr.inM > 0.5 && tr.outM > 0.5 ? " · " : ""}${tr.outM > 0.5 ? `보냄 월 ${tr.approx ? "약 " : ""}${fmtM(tr.outM)}` : ""}</b></span>` : ""}</div></button>`;
   }).join("");
   h += `<p class="hint" style="margin:0">‘계획 기간 기준’인 구성원 중 계획 끝 나이가 가장 늦은 해까지 계산합니다. 구성원마다 계획 끝 나이까지만 생활비·수입·이체·계좌를 계산하고, 그 뒤로는 그 사람의 계좌를 더 굴리거나 꺼내지 않고 남은 금액 그대로 둡니다. 구성원 정보는 구성원을 연 뒤 ‘정보 수정’에서 바꿉니다.</p>`;
   return h;
 }
+// 구성원 카드: 지금 나이 기준 생활비·수입·이체 (월 금액, 오늘 물가 기준). 연 금액은 12로 나눠 ‘약’을 붙인다
+function livingNow(m) { const a = ageNow(m); return PL().expenses.filter(e => e.memberId === m.id && num(e.fromAge) <= a && (!has(e.toAge) || num(e.toAge) >= a)).reduce((s2, e) => s2 + num(e.monthly), 0); }
+function incomeNow(m) { const a = ageNow(m); let mo = 0, approx = false, next = null;
+  for (const i of PL().incomes.filter(x => x.ownerId === m.id)) { if (i.type === "severance") continue;
+    const from = num(i.fromAge), to = has(i.toAge) ? num(i.toAge) : 200; const monthly = i.type === "npension" || i.type === "basic";
+    const v = monthly ? num(i.amount) : num(i.amount) / 12;
+    if (a >= from && a <= to) { mo += v; if (!monthly && Math.round(num(i.amount)) % 12) approx = true; }
+    else if (from > a && (!next || from < next.age)) next = { age: from, mo: v }; }
+  return { mo, approx, next }; }
+function transferNow(m) { let inM = 0, outM = 0, approx = false;
+  for (const t of PL().transfers) { if (t.toId !== m.id && t.fromId !== m.id) continue; const ref = mem(t.basis === "from" ? t.fromId : t.toId); if (!ref || !mem(t.fromId) || !mem(t.toId)) continue;
+    const a = ageNow(ref); if (a < num(t.fromAge) || a > (has(t.toAge) ? num(t.toAge) : 200)) continue;
+    const v = t.freq === "year" ? num(t.yearly) / 12 : num(t.monthly); if (t.freq === "year") approx = true;
+    if (t.toId === m.id) inM += v; else outM += v; }
+  return { inM, outM, approx }; }
 function realToggle() { return `<div class="seg-toggle" role="group" aria-label="금액 기준"><button type="button" data-real="1" aria-pressed="${S.real}">현재가치</button><button type="button" data-real="0" aria-pressed="${!S.real}">명목</button></div>`; }
 
 function vResult() {
@@ -3332,11 +3364,51 @@ function memberTaxSection(sim, d) {
   </tbody></table></div>${flowToggle(sim.rows.length)}<p class="hint" style="margin:0">세금은 계좌 명의자와 수입을 받는 사람 기준으로 계산합니다. 세액공제는 근로소득이 있는 명의자만 받습니다. 건강보험료는 세대 단위로 매겨져 가계 전체로 계산합니다.</p></section>`;
   return h;
 }
+// 구성원 돈이 모자라는 첫해: 그 사람이 계산되는 해 중 생활비 통장이 마이너스(5천원 넘게)인 해
+function memShortYear(res, mid) { const r = (res.rows || []).find(x => { if (x.ages[mid] == null) return false; const b = (x.byPerson || {})[mid] || {}; return (b.neg || 0) > 5000 || (b.overdraft || 0) > 5000; }); return r ? r.year : null; }
+function resOfMember(sim, mid) { return [sim].concat((sim.groups || []).map(g => g.result)).find(r => (r.groupMembers || []).includes(mid)) || sim; }
+// 생활비 조절: 그 사람 생활비(모든 구간)를 같은 비율로 줄여 다시 계산하고, 계획 끝까지 모자라지 않는 가장 큰 비율(정수 %)을 찾는다(이분 탐색, 8번 안팎).
+// 한 번 계산에 수십 ms라 한 단계씩 나눠 돌리고, 계획·계좌·설정이 바뀌면(계산 키가 바뀌면) 버리고 다시 찾는다.
+function fitLiving(mid) {
+  const c = S.simCache; if (!c || !c.input || !c.key) return null;
+  if (!S.fit || S.fit.key !== c.key) S.fit = { key: c.key, m: {} };
+  const F = S.fit; if (F.m[mid]) return F.m[mid];
+  const st = F.m[mid] = { busy: true }; const inp0 = c.input; const ex0 = inp0.plan.expenses || [];
+  if (!ex0.some(e => e.memberId === mid && num(e.monthly) > 0)) { st.busy = false; st.none = true; return st; }
+  const ok = pc => { const inp = { ...inp0, plan: { ...inp0.plan, expenses: ex0.map(e => e.memberId === mid ? { ...e, monthly: num(e.monthly) * pc / 100 } : e) } }; return memShortYear(resOfMember(RE.simulate(inp), mid), mid) == null; };
+  let lo = 0, hi = 100, first = true;
+  const done = () => { st.busy = false; if (S.fit === F && typeof document !== "undefined" && document.querySelector(`[data-fit="${CSS.escape(mid)}"]`)) render(); };
+  const step = () => {
+    if (S.fit !== F) return;   // 그사이 계획이 바뀜: 버린다(다음 화면에서 새로 찾는다)
+    try {
+      if (first) { first = false; if (!ok(0)) { st.zero = true; return done(); } }
+      else { const md = (lo + hi) >> 1; if (ok(md)) lo = md; else hi = md; }
+      if (hi - lo <= 1) { st.pc = lo; return done(); }
+    } catch (e) { st.err = e.message || String(e); return done(); }
+    setTimeout(step, 0);
+  };
+  setTimeout(step, 0); return st;
+}
+function fitBox(sim, m) {
+  const y = memShortYear(sim, m.id); if (y == null) return "";
+  const nm = esc(m.name); const st = fitLiving(m.id);
+  const head = `<b>${y}년부터 ${nm}의 돈이 모자랍니다</b>(생활비 통장 마이너스). `;
+  const other = "목돈 지출, 가계 공통비, 가족 간 이체, 계좌 인출 계획을 확인하세요.";
+  let body;
+  if (!st || st.err) body = `생활비 조절 금액을 계산하지 못했습니다${st && st.err ? `: ${esc(st.err)}` : ""}.`;
+  else if (st.busy) body = `생활비를 얼마로 줄여야 하는지 계산하는 중…`;
+  else if (st.none) body = `${nm}의 생활비가 계획에 없어 생활비로는 조절할 수 없습니다. ${other}`;
+  else if (st.zero) body = `${nm}의 생활비를 0으로 줄여도 모자랍니다. ${other}`;
+  else { const A = livingNow(m); const B = A * st.pc / 100;
+    body = st.pc === 0 ? `${nm}의 생활비를 0으로 줄여야 계획 끝까지 모자라지 않습니다. ${other}`
+      : `생활비를 지금 계획의 <b>${st.pc}%</b>로 줄이면${A > 0 ? ` (지금 월 ${fmtM(A)} → <b>월 ${fmtM(B)}</b>)` : ""} 계획 끝까지 모자라지 않습니다. <span class="meta">${nm}의 모든 생활비 구간을 같은 비율로 줄여 다시 계산한 값입니다(오늘 물가 기준). 목돈 지출·가계 공통비·이체는 그대로 둡니다.</span>`; }
+  return `<div class="fitbox" data-fit="${esc(m.id)}"${st && st.busy ? ` aria-busy="true"` : ""}>${head}${body}</div>`;
+}
 function vMemberResult(sim, id) {
   const m = mem(id); const d = r => S.real ? 1 / r.infl : 1; const rows = sim.rows;
   const bp = r => (r.byPerson || {})[id] || { salary: 0, npension: 0, other: 0, transferIn: 0, transferOut: 0, living: 0, lump: 0, pensionDraw: 0, otherDraw: 0, contrib: 0, tax: 0, credit: 0, pension: 0, isa: 0, general: 0, assets: 0, inherit: 0 };
   const T = { inc: 0, pd: 0, od: 0, tax: 0, spend: 0, tIn: 0, tOut: 0, con: 0 };
-  rows.forEach(r => { const b = bp(r), k = d(r); T.inc += (b.salary + b.npension + (b.basic || 0) + b.other) * k; T.pd += b.pensionDraw * k; T.od += b.otherDraw * k; T.tax += b.tax * k; T.spend += (b.living + b.lump) * k; T.tIn += b.transferIn * k; T.tOut += b.transferOut * k; T.con += b.contrib * k; });
+  rows.forEach(r => { const b = bp(r), k = d(r); T.inc += (b.salary + b.npension + (b.basic || 0) + b.other) * k; T.pd += b.pensionDraw * k; T.od += b.otherDraw * k; T.tax += b.tax * k; T.spend += (b.living + b.lump + (b.shared || 0) + (b.health || 0)) * k; T.tIn += b.transferIn * k; T.tOut += b.transferOut * k; T.con += b.contrib * k; });
   const alive = rows.filter(r => r.ages[id] != null); const lastR = alive[alive.length - 1] || rows[rows.length - 1];
   const ended = num(m.birthYear) + num(m.deathAge) <= rows[rows.length - 1].year;
   const shown = rows.filter(r => r.ages[id] != null);
@@ -3344,8 +3416,9 @@ function vMemberResult(sim, id) {
   let h = `<section class="hero"><div class="row"><span class="label">${esc(m.name)} (${esc(m.relation)}) · ${esc(m.birthYear)}년생${ended ? ` · ${num(m.birthYear) + num(m.deathAge)}년 ${m.deathAge}세까지 계산` : ""}</span>${realToggle()}</div>
     <span class="label">${ended ? `계획 끝(${m.deathAge}세)에 남는` : "계획 마지막 해"} 본인 명의 금융자산${S.real ? " (현재가치)" : ""}</span>
     <span class="total">${eok(bp(lastR).assets * d(lastR))}</span>
-    <div class="kv"><div><span>계획 기간 수입</span><b>${eok(T.inc)}</b></div><div><span>연금계좌 수령</span><b>${eok(T.pd)}</b></div><div><span>계획 기간 세금 <small>공제 후</small></span><b>${eok(T.tax)}</b></div></div>
-    ${hasTr ? `<span class="meta">가족 간 이체: 받음 ${eok(T.tIn)} · 보냄 ${eok(T.tOut)}</span>` : ""}
+    <div class="kv kv4"><div><span>계획 기간 수입</span><b>${eok(T.inc)}</b></div><div><span>계획 기간 지출</span><b>${eok(T.spend)}</b></div><div><span>연금계좌 수령</span><b>${eok(T.pd)}</b></div><div><span>계획 기간 세금 <small>공제 후</small></span><b>${eok(T.tax)}</b></div></div>
+    ${fitBox(sim, m)}
+    ${hasTr ? `<span class="meta">가족 간 이체: ${[shows(T.tIn) ? `받음 ${eok(T.tIn)}` : "", shows(T.tOut) ? `보냄 ${eok(T.tOut)}` : ""].filter(Boolean).join(" · ") || `받음 ${eok(T.tIn)} · 보냄 ${eok(T.tOut)}`}</span>` : ""}
     ${(() => { const fx = fixRet(); if (fx) return `<span class="meta"><span class="chip warn">수익률 ${esc(planRetLabel())}</span> 모든 계좌를 이 수익률로 계산했습니다</span>`; const al = retSrc() !== "current"; const e = al ? planMemberExp(id) : memberExp(id); return e ? `<span class="meta">${al ? `배분 후 ${esc(m.name)} 명의 계좌 예상 연수익률` : `지금 ${esc(m.name)} 명의 계좌 예상 연수익률`} <b>${expTxt(e.r)}</b> · 수익률 ${esc(planRetLabel())}</span>` : ""; })()}
   </section>`;
   h += `<section class="card"><div class="row"><h2>${esc(m.name)} 명의 자산</h2><span class="meta">${S.real ? "현재가치" : "명목"} · ${unitName()}</span></div>
@@ -3360,7 +3433,7 @@ function vMemberResult(sim, id) {
     { g: "out", label: "이체 보냄", get: r => bp(r).transferOut }, { g: "out", label: "계좌 납입", get: r => bp(r).contrib }, { g: "out", label: "생활비 통장 입금", get: r => bp(r).toCash || 0 }, { g: "out", label: "세금", get: r => bp(r).taxCash || 0 },
     { g: "end", label: "연금계좌", get: r => bp(r).pension }, { g: "end", label: "ISA", get: r => bp(r).isa }, { g: "end", label: "일반", get: r => bp(r).general }, { g: "end", label: "생활비 통장", get: r => bp(r).cash || 0 },
     { g: "end", label: "합계", get: r => bp(r).assets, always: true, bold: true }, rateCol(sim, id)], d, r => r.ages[id] ?? "–", { mid: id,  partialYear: sim.firstYearFraction < 0.999 ? rows[0].year : null, rowClass: r => `${shows((bp(r).overdraft || 0) * d(r)) ? "bad" : ""}${memberEvents(r, id).length ? " ev" : ""}` })}
-  <p class="hint" style="margin:0">${partialNote(sim)}● 표시가 있는 해에는 ${esc(m.name)}의 계좌 개설·해지, 퇴직금, 목돈 지출 같은 일이 있습니다(행을 누르면 보입니다). 표와 그래프는 ${esc(m.name)}의 계획 끝 나이(${esc(m.deathAge)}세)까지만 보여줍니다. 계좌는 명의자 기준입니다. 가구 공통 생활비·주택·대출·건강보험료는 내는 사람(가정 탭에서 지정)의 표에 들어갑니다. 이 표의 세금은 그해 생활비 통장에서 낸 세금이고, 배당·해지 때 계좌에서 바로 떼인 원천징수는 계좌 잔액에서 빠져 여기엔 없습니다(위 ‘계획 기간 세금’에는 포함). 세액공제 환급은 현금 증가 쪽에 따로 나옵니다. 인출률은 ${esc(m.name)} 명의 계좌에서 꺼낸 돈 ÷ 연초 ${esc(m.name)} 금융자산이고, 4%를 넘는 해는 굵게 표시합니다. 값이 없는 항목은 뺐습니다.</p></section>`;
+  <p class="hint" style="margin:0">${partialNote(sim)}● 표시가 있는 해에는 ${esc(m.name)}의 계좌 개설·해지, 퇴직금, 목돈 지출 같은 일이 있습니다(행을 누르면 보입니다). 표와 그래프는 ${esc(m.name)}의 계획 끝 나이(${esc(m.deathAge)}세)까지만 보여줍니다. 계좌는 명의자 기준입니다. 가구 공통 생활비·주택·대출·건강보험료는 내는 사람(가정 탭에서 지정)의 표에 들어갑니다. 이 표의 세금은 그해 생활비 통장에서 낸 세금이고, 배당·해지 때 계좌에서 바로 떼인 원천징수는 계좌 잔액에서 빠져 여기엔 없습니다(위 ‘계획 기간 세금’에는 포함). 위 ‘계획 기간 지출’은 본인 생활비·목돈 지출과 ${esc(m.name)}이(가) 내는 가계 공통비·건강보험료의 합이고, 이체·계좌 납입·세금은 넣지 않습니다. 세액공제 환급은 현금 증가 쪽에 따로 나옵니다. 인출률은 ${esc(m.name)} 명의 계좌에서 꺼낸 돈 ÷ 연초 ${esc(m.name)} 금융자산이고, 4%를 넘는 해는 굵게 표시합니다. 값이 없는 항목은 뺐습니다.</p></section>`;
   return h;
 }
 const HH_COLS = [
@@ -4434,7 +4507,14 @@ function trFiltered() {
   return all.filter(x => x.date >= from);
 }
 // 월별: 달마다 마지막 기록
-function trMonthly(list) { const m = {}; list.forEach(x => { m[x.date.slice(0, 7)] = x; }); return Object.values(m); }
+// 주별·월별·연별: 그 기간의 마지막 기록. 주는 월요일부터 일요일까지
+const TR_GRANS = [["day", "일별", "날짜"], ["week", "주별", "주"], ["month", "월별", "월"], ["year", "연별", "연도"]];
+function trWeekKey(date) { const d = new Date(date + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() - (d.getUTCDay() + 6) % 7); return d.toISOString().slice(0, 10); }
+function trKey(x, g) { return g === "week" ? trWeekKey(x.date) : g === "month" ? x.date.slice(0, 7) : g === "year" ? x.date.slice(0, 4) : x.date; }
+// 기간마다 마지막 기록 하나 (list는 날짜 오름차순)
+function trGroup(list, g) { if (g === "day") return list; const m = new Map(); list.forEach(x => { m.set(trKey(x, g), x); }); return [...m.values()]; }
+function trMonthly(list) { return trGroup(list, "month"); }
+function trLabel(x, g) { const k = trKey(x, g); return g === "week" ? k.slice(2).replace(/-/g, ".") + "~" : g === "month" ? k.slice(2).replace("-", ".") : g === "year" ? k : k.slice(2).replace(/-/g, "."); }
 function vTrend() {
   const mems = trMembers(); if (S.trMem !== "__all" && !mems.some(([id]) => id === S.trMem)) S.trMem = "__all";
   const who = S.trMem === "__all" ? "" : (mems.find(([id]) => id === S.trMem) || [, ""])[1];
@@ -4464,16 +4544,17 @@ function vTrend() {
     <div class="legend"><span><i style="background:var(--c1)"></i>평가액</span>${list.some(x => x.cost > 0) ? `<span><i class="dash" style="border-color:var(--c2)"></i>원금 (매입 금액 + 현금)</span>` : ""}</div>`
     : `<p class="meta" style="margin:0">기록이 두 개 이상이면 그래프가 나옵니다.</p>`}</section>`;
   // 표
-  const rows0 = (S.trGran === "month" ? trMonthly(list) : list).slice().reverse();
+  if (!TR_GRANS.some(([k]) => k === S.trGran)) S.trGran = "day";
+  const rows0 = trGroup(list, S.trGran).slice().reverse();
   const N = 30 + S.trMore * 60; const rows = rows0.slice(0, N);
-  h += `<section class="card"><div class="row"><h2>기록</h2><div class="seg-toggle" role="group" aria-label="단위">${[["day", "일별"], ["month", "월별"]].map(([k, l]) => `<button type="button" data-trg="${k}" aria-pressed="${S.trGran === k}">${l}</button>`).join("")}</div></div>
-    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>${S.trGran === "month" ? "월" : "날짜"}</th><th>평가액</th><th>변화</th><th>평가손익</th></tr></thead><tbody>
+  h += `<section class="card"><div class="row"><h2>기록</h2><div class="seg-toggle" role="group" aria-label="단위">${TR_GRANS.map(([k, l]) => `<button type="button" data-trg="${k}" aria-pressed="${S.trGran === k}">${l}</button>`).join("")}</div></div>
+    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>${TR_GRANS.find(([k]) => k === S.trGran)[2]}</th><th>평가액</th><th>변화</th><th>평가손익</th></tr></thead><tbody>
     ${rows.map((x, i) => { const prev = rows0[i + 1]; const d = prev ? x.total - prev.total : null; const p = x.total - (x.cost || 0); const sg = v => (v > 0 ? "+" : "") + sh(v);
-      const dl = S.trGran === "month" ? x.date.slice(2, 7).replace("-", ".") : x.date.slice(2).replace(/-/g, ".");
+      const dl = trLabel(x, S.trGran);
       return `<tr data-snap="${esc(x.date)}"><td>${esc(dl)}${x.auto ? "" : ` <span class="meta">·</span>`}${x.miss > 0 ? ` <span class="meta" title="가격이 없어 매입가로 계산한 종목 ${x.miss}개">!</span>` : ""}</td><td><b>${sh(x.total)}</b></td><td class="${d == null ? "" : cls(d)}">${d == null ? "–" : sg(d)}</td><td class="${cls(p)}">${x.cost ? `${sg(p)}${trPlR(x) != null ? `<br><small>${trPct(x, 1)}</small>` : ""}` : "–"}</td></tr>`; }).join("")}
     </tbody></table></div>
     ${rows0.length > rows.length ? `<div class="btns"><button type="button" class="btn small" id="trMore">더 보기 (${nf.format(rows0.length - rows.length)}개 남음)</button></div>` : ""}
-    <span class="hint">금액 단위 ${unitName()}. 변화는 앞 기록과의 차이입니다.${who ? ` ${esc(who)} 명의 계좌만 더한 값이고, 평가손익은 구성원별 원금을 남긴 기록부터 나옵니다.` : ""} 평가손익률은 평가손익 ÷ 매입 원금(현금 제외)입니다. 행을 누르면 그날 구성원별 평가액을 보고 기록을 지울 수 있습니다. ‘·’ 표시는 직접 기록한 날, ‘!’ 표시는 가격이 없는 종목을 매입가로 계산한 날입니다.</span></section>`;
+    <span class="hint">금액 단위 ${unitName()}. 변화는 앞 기록과의 차이이고, 주별·월별·연별은 기간마다 마지막 기록으로 앞 기간과 비교합니다.${who ? ` ${esc(who)} 명의 계좌만 더한 값이고, 평가손익은 구성원별 원금을 남긴 기록부터 나옵니다.` : ""} 평가손익률은 평가손익 ÷ 매입 원금(현금 제외)입니다. 행을 누르면 그날 구성원별 평가액을 보고 기록을 지울 수 있습니다. ‘·’ 표시는 직접 기록한 날, ‘!’ 표시는 가격이 없는 종목을 매입가로 계산한 날입니다.</span></section>`;
   const td = (S.snapshots || []).find(x => x.date === today());
   h += `<section class="card"><h2>기록하기</h2>${td ? `<p class="meta" style="margin:0">오늘(${esc(td.date)}) ${td.auto ? "자동으로" : "직접"} 기록됨 · ${eok(td.total)}${td.at ? ` · ${esc(whenTxt(td.at))}` : ""}</p>` : `<p class="meta" style="margin:0">오늘 기록은 아직 없습니다.</p>`}
     <div class="btns"><button class="btn${td ? "" : " primary"}" id="snapNow">${td ? "지금 값으로 다시 기록" : "지금 평가액 기록"}</button></div>${autoBox}</section>`;
@@ -4536,7 +4617,7 @@ function trendClick(t) {
 app.addEventListener("click",e=>{const tr=e.target.closest("tr[data-snap]");if(tr)snapSheet(tr.dataset.snap);});
 RE.DEFAULT_ASSUMPTIONS.baseYear=new Date().getFullYear();
 // 자동 테스트에서만 내부 계산 함수를 꺼내 쓴다 (평소에는 아무 일도 하지 않음)
-if(window.__KINFOLIO_TEST__)window.__kinfolio={S,pxAutoRun,pxLast,alNewMoney,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
+if(window.__KINFOLIO_TEST__)window.__kinfolio={S,PERIODS,periodPL,periodChips,groupPL,trGroup,trLabel,trWeekKey,livingNow,incomeNow,transferNow,memShortYear,fitLiving,resOfMember,pxAutoRun,pxLast,alNewMoney,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
 document.getElementById("hdrSub").addEventListener("click",()=>{if(S.dbState==="ok"&&freshness())setTab("prices");});
 document.getElementById("syncChip").addEventListener("click",()=>{
   if(PWA&&!KinfolioPWA.clientId()){setTab("settings");return;}

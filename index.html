@@ -399,9 +399,18 @@ nav.tabs button[aria-current="page"]{color:var(--accent)}
 .kv span{font-size:11.5px;color:var(--muted)}
 @media (max-width:420px){.kv{grid-template-columns:1fr 1fr}.hero .total{font-size:28px}}
 .kv.kv4{grid-template-columns:repeat(4,1fr)}
+.kv.kv2{grid-template-columns:1fr 1fr}
+.kv small{font-size:11px;color:var(--muted)}
+.retcmp{margin-top:4px}
 @media (max-width:560px){.kv.kv4{grid-template-columns:1fr 1fr}}
 .fitbox{font-size:13px;line-height:1.5;padding:10px 12px;border-radius:10px;background:var(--warn-soft);color:var(--ink)}
 .fitbox b{font-weight:700}
+.fitbox.ok{background:var(--good-soft)}
+.chip[data-shortmo]{white-space:normal}
+.scenrow{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap}.scenrow .label{margin:0}
+details.card>summary{list-style:none}details.card>summary::-webkit-details-marker{display:none}
+details.card>summary .sum{display:block;margin-top:2px}
+.fitbox .fitbtns{margin-top:8px;align-items:center;gap:6px 12px;flex-wrap:wrap}
 
 [hidden]{display:none!important}
 .vh{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;pointer-events:none}
@@ -2120,8 +2129,6 @@ function totals(){let total=0,cost=0,cash=0;const byClass={};const byAcct=[];
     st.hs.forEach(h=>{const k=h.assetClass||"기타";byClass[k]=(byClass[k]||0)+hVal(h);});});
   if(cash)byClass["현금성"]=(byClass["현금성"]||0)+cash;
   return{total,cost,cash,invested:total-cash,byClass,byAcct};}
-// 계좌 묶음의 지금 평가손익·수익률 (예수금·현금 제외한 매입 원가 대비)
-function groupPL(accts){let v=0,c=0;for(const a of accts){const st=acctStats(a);v+=st.value;c+=st.cost;}return{pl:v-c,cost:c,r:c>0?(v-c)/c:0};}
 // 기간 손익(주간·월간·연간): 지금 평가손익 − 기간 시작일(그날이나 그 전 가장 가까운 기록)의 평가손익.
 // 기간 중에 넣거나 뺀 돈은 원금(매입 금액 + 현금)이 함께 바뀌어 손익에 들어가지 않는다. 비율은 시작일 투자 평가액(현금 제외) 대비
 // 한 달·한 해 전: 그 달에 같은 날이 없으면(3월 31일 → 2월) 그 달 마지막 날
@@ -2132,8 +2139,37 @@ function periodPL(back,tol){const t=totals();const now=t.invested-t.cost;const d
   const base=(S.snapshots||[]).filter(x=>x&&x.date&&x.date<=from&&x.date>=d2&&x.total>0&&x.cost>0).pop();
   if(!base)return null;const v=now-(base.total-base.cost);const inv=base.total-(+base.cash||0);return{d:v,r:inv>0?v/inv:null,date:base.date,from};}
 function periodChips(){if(!(S.snapshots||[]).length)return "";
-  const xs=PERIODS.map(([l,b,tol])=>[l,periodPL(b,tol)]);
-  return `<div class="chips pchips">${xs.map(([l,x])=>x?`<span class="chip" data-period="${l}" title="${esc(x.date)} 기록 대비 평가손익 변화 · 그사이 넣거나 뺀 돈은 빼고, 비율은 그때 투자 평가액(현금 제외) 대비">${l} <b class="${cls(x.d)}">${fmtM(x.d,{plus:true})}</b>${x.r==null?"":` <span class="${cls(x.d)}">${pct(x.r,2)}</span>`}</span>`:`<span class="chip" data-period="${l}" title="그만큼 오래된 평가액 기록이 없습니다">${l} –</span>`).join("")}</div>${xs.some(([,x])=>!x)?`<span class="meta pnote">‘–’는 그만큼 오래된 평가액 기록이 아직 없다는 뜻입니다. 추이 탭의 기록이 쌓이면 나옵니다.</span>`:""}`;}
+  const xs=PERIODS.map(([l,b,tol])=>[l,periodPL(b,tol)]).filter(([,x])=>x);   // 그만큼 오래된 기록이 있는 기간만
+  if(!xs.length)return "";
+  return `<div class="chips pchips">${xs.map(([l,x])=>`<span class="chip" data-period="${l}" title="${esc(x.date)} 기록 대비 평가손익 변화 · 그사이 넣거나 뺀 돈은 빼고, 비율은 그때 투자 평가액(현금 제외) 대비">${l} <b class="${cls(x.d)}">${fmtM(x.d,{plus:true})}</b>${x.r==null?"":` <span class="${cls(x.d)}">${pct(x.r,2)}</span>`}</span>`).join("")}</div>`;}
+// 기록으로 본 실제 수익률(시간가중): 기록과 기록 사이마다 원금(매입 금액 + 현금) 변화를 넣거나 뺀 돈으로 보고 빼서 수익률을 구해 곱한다
+// (수정 디에츠: 그 돈은 두 기록 사이 중간에 들어왔다고 본다). pts: 날짜순 [{date,total,cost}] (cost = 원금, 현금 포함). 원금을 모르는 기록은 건너뛴다.
+// 1년 이상이면 연평균(ann)으로 환산하고, 그보다 짧으면 환산하지 않는다(짧은 기간을 연으로 늘리면 숫자가 크게 부풀기 때문)
+function twr(pts){const xs=(pts||[]).filter(x=>x&&x.date&&x.total>0&&x.cost>0);if(xs.length<2)return null;
+  let g=1;for(let i=1;i<xs.length;i++){const a=xs[i-1],b=xs[i];const F=b.cost-a.cost;const den=a.total+F/2;if(!(den>0))continue;g*=1+(b.total-a.total-F)/den;}
+  const from=xs[0].date,to=xs[xs.length-1].date;const days=Math.round((Date.parse(to+"T00:00:00Z")-Date.parse(from+"T00:00:00Z"))/864e5);if(!(days>0)||!(g>0))return null;
+  return{r:g-1,days,from,to,n:xs.length,ann:days>=365?Math.pow(g,365/days)-1:null};}
+// 예상 연수익률 e(%)를 days일 동안의 수익률로
+function expOver(e,days){return Math.pow(1+e/100,days/365)-1;}
+// 수익률 비교에 쓸 기록: k = "__all"(가족 전체) 또는 구성원 id. live면 오늘 값(지금 장부)을 마지막 기록으로 쓴다
+function retPts(k,live){const all=(S.snapshots||[]).filter(x=>x&&x.date);
+  let pts=k==="__all"?all.map(x=>({date:x.date,total:x.total,cost:x.cost})):all.filter(x=>x.byMember&&x.byMemberCost&&x.byMember[k]>0).map(x=>({date:x.date,total:x.byMember[k],cost:x.byMemberCost[k]}));
+  if(live&&!needsFx()){const d=memo("snapNow",()=>snapDoc(false));const v=k==="__all"?{total:d.total,cost:d.cost}:{total:(d.byMember||{})[k],cost:(d.byMemberCost||{})[k]};
+    if(v.total>0&&v.cost>0)pts=pts.filter(x=>x.date<d.date).concat([{date:d.date,total:v.total,cost:v.cost}]);}
+  return pts;}
+const mdTxt=d=>d.slice(5).replace("-","/");
+// 실제 수익률과 예상 수익률을 나란히: 1년 이상 기록이면 연평균끼리, 짧으면 같은 기간끼리. e = 예상 {r, dy}
+function retCmpHtml(w,e,opt){opt=opt||{};const sc=opt.scen?` · ${esc(opt.scen)}`:"";
+  if(!w)return e?`<div class="kv kv2 retcmp"><div><span>실제 수익률</span><b class="flat">–</b><small>평가액 기록이 2개 이상이면 나옵니다</small></div><div><span>예상 연수익률</span><b>${expTxt(e.r)}</b><small>배당·분배 ${expTxt(e.dy)}${sc}</small></div></div>`:"";
+  const rng=`${mdTxt(w.from)}~${mdTxt(w.to)}`;
+  if(w.ann!=null)return `<div class="kv kv2 retcmp"><div><span>실제 연평균 수익률</span><b class="${cls(w.ann)}">${pct(w.ann,2)}</b><small>기록 ${w.from}~${w.to} (${nf.format(w.days)}일)</small></div>${e?`<div><span>예상 연수익률</span><b>${expTxt(e.r)}</b><small>배당·분배 ${expTxt(e.dy)}${sc}</small></div>`:""}</div>`;
+  const x=e?expOver(e.r,w.days):null;
+  return `<div class="kv kv2 retcmp"><div><span>실제 수익률 · ${nf.format(w.days)}일</span><b class="${cls(w.r)}">${pct(w.r,2)}</b><small>기록 ${rng}</small></div>${e?`<div><span>같은 기간 예상</span><b class="${cls(x)}">${pct(x,2)}</b><small>연 ${expTxt(e.r)}${sc}</small></div>`:""}</div>`;}
+// 구성원 줄처럼 좁은 곳: 한 줄 문구
+function retCmpTxt(w,e){if(!w)return e?`예상 수익률 연 ${expTxt(e.r)}`:"";
+  if(w.ann!=null)return `실제 연평균 <b class="${cls(w.ann)}">${pct(w.ann,1)}</b>${e?` · 예상 연 ${expTxt(e.r)}`:""}`;
+  const x=e?expOver(e.r,w.days):null;return `${nf.format(w.days)}일 실제 <b class="${cls(w.r)}">${pct(w.r,2)}</b>${e?` · 예상 <span class="${cls(x)}">${pct(x,2)}</span> (연 ${expTxt(e.r)})`:""}`;}
+const RET_NOTE="실제 수익률은 평가액 기록으로 구하고, 그사이 바뀐 원금(넣거나 뺀 돈, 팔아서 생긴 차익 포함)은 빼고 계산합니다. 기록이 1년이 안 되면 연평균으로 늘리지 않고 같은 기간끼리 비교합니다.";
 function needsFx(){return Object.values(S.holdings).some(h=>h.currency==="USD")&&!fx();}
 
 /* ---------- db ---------- */
@@ -2218,8 +2254,8 @@ function vHome(){
     <span class="label">총 평가액${priceDates()?` · ${esc(priceDateTxt())} 가격 기준`:""}</span>
     <span class="total">${eok(t.total)}</span>
     <span class="pl ${cls(pl)}">평가손익 ${fmtA(pl,{plus:true})} (${pct(plr,2)})</span>
-    ${(()=>{const fe=memberExp("__all");return fe?`<span class="meta">예상 연수익률 <b>${expTxt(fe.r)}</b> · 배당·분배 ${expTxt(fe.dy)} · 수익률 ${esc(scenLabel())}</span>`:"";})()}
     ${periodChips()}
+    ${(()=>{const fe=memberExp("__all");const w=twr(retPts("__all",true));return retCmpHtml(w,fe,{scen:"수익률 "+scenLabel()})+(w||fe?`<span class="hint rnote">${RET_NOTE}</span>`:"");})()}
     ${S.snapshots.length>1?`<button type="button" class="spark-btn" data-go="trend" aria-label="평가액 추이 보기">${sparkline(S.snapshots.slice(-120))}</button>`:""}
     </section>`;
   h+=planSummaryCard();
@@ -2232,16 +2268,8 @@ function vHome(){
   // by member
   const byMem=ownerGroups();
   if(byMem.length>1||(byMem.length===1&&byMem[0].id)){h+=`<section class="card"><h2>구성원별 자산</h2><div class="bar">${byMem.map((g,i)=>`<span style="width:${t.total?(g.total/t.total*100):0}%;background:${ACCT_COLORS[i%ACCT_COLORS.length]}"></span>`).join("")}</div>
-    <div class="list">${byMem.map((g,i)=>`<button class="item" data-mview="${esc(g.id||"__none")}"><div class="row"><div class="l"><span class="name"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ACCT_COLORS[i%ACCT_COLORS.length]};margin-right:7px"></i>${esc(g.name)}</span><span class="meta">${(()=>{const q=groupPL(g.accts);const e=groupExp(g.accts);return [q.cost>0?`현재 수익률 <b class="${cls(q.r)}">${pct(q.r)}</b>`:"",e?`예상 수익률 연 ${expTxt(e.r)}`:""].filter(Boolean).join(" · ");})()}</span></div>
+    <div class="list">${byMem.map((g,i)=>`<button class="item" data-mview="${esc(g.id||"__none")}"><div class="row"><div class="l"><span class="name"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ACCT_COLORS[i%ACCT_COLORS.length]};margin-right:7px"></i>${esc(g.name)}</span><span class="meta">${retCmpTxt(twr(retPts(g.id||"__none",true)),groupExp(g.accts))}</span></div>
     <div class="r"><b>${eok(g.total)}</b><span class="meta">비중 ${t.total?(g.total/t.total*100).toFixed(1):0}%</span></div></div></button>`).join("")}</div></section>`;}
-
-  // by account
-  const TOPN=6,moreA=t.byAcct.length>TOPN+1;const multiM=((S.plan&&S.plan.members)||[]).length>1;   // 계좌가 많으면 큰 순서로 6개만 (나머지는 ‘계좌’ 탭)
-  const byA=moreA?t.byAcct.map((x,i)=>({x,i})).sort((p,q)=>q.x.st.total-p.x.st.total).slice(0,TOPN):t.byAcct.map((x,i)=>({x,i}));
-  h+=`<section class="card"><div class="row"><h2>계좌별 비중</h2>${moreA?`<button class="btn small" data-go="accounts">전체 ${t.byAcct.length}개 보기</button>`:""}</div><div class="bar">${t.byAcct.map((x,i)=>`<span style="width:${t.total?(x.st.total/t.total*100):0}%;background:${ACCT_COLORS[i%ACCT_COLORS.length]}"></span>`).join("")}</div>
-    <div class="list">${byA.map(({x,i})=>{const r=x.st.cost?(x.st.value-x.st.cost)/x.st.cost:0;return `<button class="item" data-acct="${esc(x.a.id)}"><div class="row">
-      <div class="l"><span class="name"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ACCT_COLORS[i%ACCT_COLORS.length]};margin-right:7px"></i>${esc(x.a.name)}</span><span class="meta">${multiM&&ownerOf(x.a)?esc(memName(ownerOf(x.a)))+" · ":""}${esc(x.a.type)}${x.a.broker?" · "+esc(x.a.broker):""} · 예상 연 ${expTxt(acctExp(x.a).r)}</span></div>
-      <div class="r"><b>${eok(x.st.total)}</b><span class="meta ${cls(r)}">${pct(r)} · 비중 ${t.total?(x.st.total/t.total*100).toFixed(1):0}%</span></div></div></button>`;}).join("")}</div></section>`;
 
   // by class
   const classes=CLASSES.filter(c=>t.byClass[c]>0);
@@ -2436,7 +2464,7 @@ function srcSection(){const src=retSrc();const ms=PL().members.filter(m=>memberA
    <span class="hint">계좌 평가액으로 가중평균한 연 예상 수익률(보수·낙관 보정 포함)입니다. 굵은 값이 지금 계획에 쓰는 기준입니다.</span>`:""}</section>`;}
 /* ---------- 구글 드라이브: 시세 시트·백업 (claude.ai에 연결한 Google Drive 커넥터를 이 페이지에서 부른다) ---------- */
 const GD="Google Drive";
-const GD_KEYS=["gFolderId","gSheetId","gSheetUrl","gSheetTickers","gSheetAt","gLastBackup"];
+const GD_KEYS=["gFolderId","gSheetId","gSheetUrl","gSheetTickers","gSheetAt","gLastBackup","gWeekBackup"];
 S.gdAvail=null;S.gdBusy=null;S.gdMsg={};
 let gdNs=null;
 function gdInit(){let p;try{p=window.claude&&window.claude.use("mcp");}catch(e){p=null;}
@@ -2539,10 +2567,45 @@ async function gdPrices(){let sid=(S.settings||{}).gSheetId;
   return {n,changed:writes.length,fx:fx2,fxBad,fxOld:fx0,miss,curBad,noDate,big,notIn:notIn.map(w=>w.name||w.ticker)};}
 async function gdBackup(){const f=await gdCreate({title:`Kinfolio 백업 ${today()} ${new Date(Date.now()+9*3600e3).toISOString().slice(11,16).replace(":","-")}.json`,contentMimeType:"application/json",disableConversionToGoogleType:true,textContent:JSON.stringify(await exportDocFull())});
   if(!f||!f.id)throw{code:"tool_error",message:"백업 파일을 만들지 못했습니다"};saveRet({gLastBackup:new Date().toISOString()});return f;}
+/* 주 단위 자동 백업: 구글 드라이브 Kinfolio/backup/<연도>/‘Kinfolio 백업 2026-W40 (09-28~10-04).json’.
+   주는 월요일~일요일(한국 시간, ISO 주 번호). 그 주 파일이 이미 있으면(이 기기든 다른 기기든) 다시 만들지 않는다 */
+function isoWeek(date){const d=new Date(date+"T00:00:00Z");const dow=(d.getUTCDay()+6)%7;   // 월=0
+  const thu=new Date(d.getTime()+(3-dow)*864e5);const y=thu.getUTCFullYear();const w=Math.floor((thu-Date.UTC(y,0,1))/864e5/7)+1;
+  const mon=new Date(d.getTime()-dow*864e5).toISOString().slice(0,10),sun=new Date(d.getTime()+(6-dow)*864e5).toISOString().slice(0,10);
+  return{year:y,week:w,key:`${y}-W${String(w).padStart(2,"0")}`,from:mon,to:sun};}
+function weekTitle(wk){return `Kinfolio 백업 ${wk.key} (${wk.from.slice(5)}~${wk.to.slice(5)}).json`;}
+const GD_FOLDER="application/vnd.google-apps.folder";
+async function gdFindIn(parent,name){const r=await gdCall("search_files",{query:`parentId = '${parent}' and title = '${name}' and mimeType = '${GD_FOLDER}'`,excludeContentSnippets:true,pageSize:10});
+  const fs=((r&&r.files)||[]).filter(f=>f.title===name).sort((a,b)=>String(a.createdTime||"").localeCompare(String(b.createdTime||"")));return fs[0]?fs[0].id:null;}   // 여러 개면 먼저 만든 것
+async function gdSubFolder(parent,name){const id=await gdFindIn(parent,name);if(id)return id;
+  const f=await gdCall("create_file",{title:name,contentMimeType:GD_FOLDER,parentId:parent});if(!f||!f.id)throw{code:"tool_error",message:`‘${name}’ 폴더를 만들지 못했습니다`};return f.id;}
+async function gdWeekBackup(){const wk=isoWeek(today());const title=weekTitle(wk);
+  const go=async()=>{const root=await gdFolder();const bk=await gdSubFolder(root,"backup");const yf=await gdSubFolder(bk,String(wk.year));
+    const r=await gdCall("search_files",{query:`parentId = '${yf}' and title contains '${wk.key}'`,excludeContentSnippets:true,pageSize:10});
+    const had=((r&&r.files)||[]).find(f=>String(f.title||"").includes(wk.key));
+    if(had)return{skipped:true,title:had.title,year:wk.year,key:wk.key};
+    const f=await gdCall("create_file",{title,contentMimeType:"application/json",disableConversionToGoogleType:true,textContent:JSON.stringify(await exportDocFull()),parentId:yf});
+    if(!f||!f.id)throw{code:"tool_error",message:"백업 파일을 만들지 못했습니다"};return{title,year:wk.year,key:wk.key,id:f.id};};
+  let res;try{res=await go();}catch(e){if(e&&e.code==="tool_error"&&(S.settings||{}).gFolderId){await saveRet({gFolderId:null});res=await go();}else throw e;}   // Kinfolio 폴더가 지워졌으면 새로 만들어 한 번 더
+  await saveRet({gWeekBackup:res.key,...(res.skipped?{}:{gLastBackup:new Date().toISOString()})});return res;}
+function bkAuto(){return (S.settings||{}).bkAuto!==false;}
+let bkT=null;
+async function bkAutoRun(){clearTimeout(bkT);bkT=null;const s=S.settings||{};
+  if(!bkAuto()||!S.gdAvail||S.dbState!=="ok"||!acctList().length||document.visibilityState==="hidden")return false;
+  if(s.gWeekBackup===isoWeek(today()).key||Date.now()-(S.bkFail||0)<30*60e3)return false;   // 이번 주는 이미 했거나, 실패하고 30분이 안 됨
+  if(PWA&&!KinfolioPWA.hasToken())return false;
+  if(!snapReady()||S.gdBusy){bkT=setTimeout(bkAutoRun,5000);return false;}   // 데이터를 다 받고, 동기화·다른 드라이브 작업이 끝난 뒤에
+  return gdRun("weekly",{auto:true});}
 async function gdBackups(){return gdBackupsIn((S.settings||{}).gFolderId);}
+// 불러올 백업: Kinfolio 폴더(직접 백업)와 backup/<연도> 폴더(주 단위 자동 백업), 최근 순 30개
 async function gdBackupsIn(fid){if(!fid)return [];
-  const r=await gdCall("search_files",{query:`parentId = '${fid}' and mimeType = 'application/json' and title contains 'Kinfolio 백업'`,excludeContentSnippets:true,pageSize:30});
-  return ((r&&r.files)||[]).sort((a,b)=>String(b.createdTime).localeCompare(String(a.createdTime)));}
+  const q=p=>gdCall("search_files",{query:`parentId = '${p}' and mimeType = 'application/json' and title contains 'Kinfolio 백업'`,excludeContentSnippets:true,pageSize:30}).then(r=>(r&&r.files)||[]);
+  let out=await q(fid);
+  const bk=await gdFindIn(fid,"backup");
+  if(bk){const r=await gdCall("search_files",{query:`parentId = '${bk}' and mimeType = '${GD_FOLDER}'`,excludeContentSnippets:true,pageSize:50});
+    const ys=((r&&r.files)||[]).filter(f=>/^\d{4}$/.test(f.title||"")).sort((a,b)=>String(b.title).localeCompare(String(a.title))).slice(0,2);   // 최근 두 해
+    for(const y of ys)out=out.concat((await q(y.id)).map(f=>({...f,where:`backup/${y.title}`})));}
+  return out.sort((a,b)=>String(b.createdTime).localeCompare(String(a.createdTime))).slice(0,30);}
 function gdPriceMsg(r){return `가격 ${r.n}개${r.changed!=null&&r.changed<r.n?`(바뀐 것 ${r.changed}개)`:""}${r.fx?` · 환율 ${nf2.format(r.fx)}`:""}를 가져왔습니다.${r.miss.length?` 가격이 나오지 않은 종목: ${r.miss.join(", ")} (시트에서 종목 코드를 확인하세요).`:""}${(r.curBad||[]).length?` 통화가 달라 저장하지 않은 종목: ${r.curBad.join(", ")} (다른 거래소 가격일 수 있습니다. 종목 코드를 확인하세요).`:""}${r.fxBad?` 시트의 환율 ${nf2.format(r.fxBad)}이 ${r.fxOld?`지금 값 ${nf2.format(r.fxOld)}과 너무 달라`:"있을 수 없는 값이라"} 저장하지 않았습니다. 설정에서 직접 넣으세요.`:""}${(r.big||[]).length?` 전보다 30% 넘게 바뀐 종목: ${r.big.join(", ")} (분할·병합이 아니면 확인하세요).`:""}${(r.noDate||[]).length?` 기준 시각이 없어 오늘 날짜로 적은 종목: ${r.noDate.join(", ")}.`:""}${r.notIn.length?` 시트에 없는 종목: ${r.notIn.join(", ")} → ‘시트 다시 만들기’를 누르세요.`:""}`;}
 async function gdRun(kind,o){o=o||{};if(S.gdBusy)return false;S.gdBusy=kind;if(!o.auto)gdSet(kind,null);else render();const t0=performance.now();
   if(o.auto&&PWA)KinfolioPWA.quiet=true;   // 자동 업데이트는 로그인 창을 띄우지 않는다
@@ -2554,8 +2617,10 @@ async function gdRun(kind,o){o=o||{};if(S.gdBusy)return false;S.gdBusy=kind;if(!
     else if(kind==="sheet"){if(await gdMakeSheet()){const n=((S.settings||{}).gSheetTickers||[]).length;const r=await gdPrices();if(r)pxMark();
       gdSet(kind,`구글 드라이브 ‘Kinfolio’ 폴더에 시세 시트를 새로 만들었습니다 (종목 ${n}개). ${r?gdPriceMsg(r):""} (${secTxt(t0)})`);if(r)autoSnap(300);}}
     else if(kind==="backup"){const f=await gdBackup();gdSet(kind,`‘${f.title}’으로 백업했습니다 (${secTxt(t0)}).`);}
+    else if(kind==="weekly"){const r=await gdWeekBackup();gdSet("backup",r.skipped?`이번 주(${r.key}) 백업은 이미 있습니다: backup/${r.year}/${r.title}`:`${o.auto?`자동 백업 ${hhmm(Date.now())} · `:""}backup/${r.year}/${r.title} (${secTxt(t0)})`);}
     else if(kind==="restore"){const list=await gdBackups();if(!list.length){gdSet(kind,"드라이브의 Kinfolio 폴더에 백업이 없습니다.",true);}else{S.gdBusy=null;render();gdPickSheet(list);return;}}
-  }catch(e){gdSet(kind,(o.auto?"가격 자동 업데이트 실패: ":"")+gdErrText(e),true);if(o.auto)S.pxFail=Date.now();return false;}
+  }catch(e){if(kind==="weekly"){gdSet("backup",(o.auto?"주 단위 자동 백업 실패: ":"")+gdErrText(e),true);if(o.auto)S.bkFail=Date.now();return false;}
+    gdSet(kind,(o.auto?"가격 자동 업데이트 실패: ":"")+gdErrText(e),true);if(o.auto)S.pxFail=Date.now();return false;}
   finally{S.gdBusy=null;if(o.auto&&PWA)KinfolioPWA.quiet=false;render();}
   return true;}
 /* 가격 자동 업데이트: 시세 시트가 있으면 앱을 열 때, 다시 볼 때, 켜 둔 동안 30분마다 가져온다.
@@ -2574,8 +2639,8 @@ async function pxAutoRun(){clearTimeout(pxT);pxT=null;
   if(PWA&&!KinfolioPWA.hasToken())return false;
   if(S.gdBusy||S.sync.busy){pxT=setTimeout(pxAutoRun,5000);return false;}   // 동기화·다른 드라이브 작업이 끝난 뒤에
   return gdRun("prices",{auto:true});}
-function gdPickSheet(list){openSheet(`<h3>드라이브에서 불러오기</h3><span class="meta">구글 드라이브 ‘Kinfolio’ 폴더의 백업 ${list.length}개 (최근 순)</span>
-  <div class="list">${list.map(f=>`<button class="item" data-gdfile="${esc(f.id)}"><div class="row"><div class="l"><span class="name">${esc(f.title)}</span><span class="meta">${f.createdTime&&isFinite(Date.parse(f.createdTime))?esc(new Date(Date.parse(f.createdTime)+9*3600e3).toISOString().slice(0,16).replace("T"," ")):""}${f.fileSize?` · ${nf.format(Math.round(num(f.fileSize)/1024))}KB`:""}</span></div><span class="meta gdarr">›</span></div></button>`).join("")}</div>
+function gdPickSheet(list){openSheet(`<h3>드라이브에서 불러오기</h3><span class="meta">구글 드라이브 ‘Kinfolio’ 폴더와 backup 폴더의 백업 ${list.length}개 (최근 순)</span>
+  <div class="list">${list.map(f=>`<button class="item" data-gdfile="${esc(f.id)}"><div class="row"><div class="l"><span class="name">${esc(f.title)}</span><span class="meta">${f.createdTime&&isFinite(Date.parse(f.createdTime))?esc(new Date(Date.parse(f.createdTime)+9*3600e3).toISOString().slice(0,16).replace("T"," ")):""}${f.fileSize?` · ${nf.format(Math.round(num(f.fileSize)/1024))}KB`:""}${f.where?` · ${esc(f.where)}`:""}</span></div><span class="meta gdarr">›</span></div></button>`).join("")}</div>
   <div class="btns"><span class="grow"></span><button class="btn" id="pCancel">닫기</button></div>`,bg=>{bg.querySelector("#pCancel").onclick=closeSheet;
     bg.querySelectorAll("[data-gdfile]").forEach(b=>b.onclick=async()=>{const f=list.find(x=>x.id===b.dataset.gdfile);b.disabled=true;b.querySelector(".gdarr").textContent="불러오는 중…";
       try{const r=await gdCall("download_file_content",{fileId:f.id});closeSheetOf(bg);await importText(b64utf8(r&&r.content),f.title);}
@@ -2597,7 +2662,9 @@ function gdSection(){const s=S.settings||{};
    <span class="hint">관심 종목마다 GOOGLEFINANCE 수식을 넣은 시트를 만들고, 계산된 현재가·전일 종가·환율을 읽어 옵니다. 최대 20분 늦을 수 있습니다. 종목을 추가하거나 뺐으면 ‘시트 다시 만들기’를 누르세요. 새 시트를 만들고 가격까지 가져오며, 예전 시트는 휴지통으로 갑니다.</span>
    <h4 style="margin:4px 0 0">백업</h4>
    <div class="btns">${b("backup","드라이브에 백업")}${b("restore","드라이브에서 불러오기")}</div>${gdMsgHtml("backup")}${gdMsgHtml("restore")}
-   <span class="hint">계좌·종목·가격·계획·설정·평가액 기록 전체를 백업마다 새 파일(Kinfolio 백업 날짜 시각.json)로 저장합니다.${s.gLastBackup?` 마지막 백업 ${esc(String(s.gLastBackup).slice(0,10))}.`:""} 불러오기는 고른 백업으로 지금 데이터를 모두 바꿉니다(확인을 받습니다).</span></section>`;}
+   <label class="check"><input type="checkbox" id="bkAutoChk"${bkAuto()?" checked":""}> 주 단위 자동 백업</label>
+   <span class="hint">${bkAuto()?`한 주(월~일)에 한 번, 이번 주에 처음 앱을 열 때 전체 데이터를 드라이브 ‘Kinfolio/backup/연도’ 폴더에 ‘${esc(weekTitle(isoWeek(today())))}’ 같은 이름으로 저장합니다. 그 주 파일이 이미 있으면 다시 만들지 않습니다.${s.gWeekBackup?` 마지막 자동 백업 ${esc(s.gWeekBackup)}.`:""}`:"끄면 ‘드라이브에 백업’을 누를 때만 백업합니다."}</span>
+   <span class="hint">‘드라이브에 백업’은 누를 때마다 새 파일(Kinfolio 백업 날짜 시각.json)을 ‘Kinfolio’ 폴더에 만듭니다.${s.gLastBackup?` 마지막 백업 ${esc(String(s.gLastBackup).slice(0,10))}.`:""} 불러오기는 고른 백업으로 지금 데이터를 모두 바꿉니다(확인을 받습니다).</span></section>`;}
 
 /* ---------- 기기 간 동기화: 구글 드라이브 ‘Kinfolio 데이터.json’ ----------
    아티팩트(claude.ai 커넥터)와 PC·안드로이드 앱(PWA, 드라이브 API)이 같은 파일로 데이터를 맞춘다. 병합 규칙은 sync.js */
@@ -2832,13 +2899,14 @@ function render0(){
   if(S.tab==="trend")drawTrend();
   syncChip();navSync();
   if(!S.snapBoot&&snapReady()&&S.gdAvail!==null&&(!syncOn()||!S.gdAvail||S.sync.at||S.sync.err||(PWA&&!KinfolioPWA.hasToken()))){S.snapBoot=true;autoSnap(1500);}
-  if(!S.pxBoot&&S.gdAvail&&syncLoaded()&&(!syncOn()||S.sync.at||S.sync.err||(PWA&&!KinfolioPWA.hasToken()))){S.pxBoot=true;pxT=setTimeout(pxAutoRun,800);}   // 가격 자동 업데이트 (동기화가 켜져 있으면 첫 동기화 뒤)
+  if(!S.pxBoot&&S.gdAvail&&syncLoaded()&&(!syncOn()||S.sync.at||S.sync.err||(PWA&&!KinfolioPWA.hasToken()))){S.pxBoot=true;pxT=setTimeout(pxAutoRun,800);bkT=setTimeout(bkAutoRun,4000);}   // 주 단위 자동 백업은 가격을 가져온 뒤에   // 가격 자동 업데이트 (동기화가 켜져 있으면 첫 동기화 뒤)
   if(!S.sync.boot&&syncOn()&&S.gdAvail&&syncLoaded()){S.sync.boot=true;setTimeout(()=>syncRun(true),400);}
 }
 
 function saveRet(data,msg){const q=writeSettings({...S.settings,...data},msg);S.simCache.key=null;render();return q;}
 app.addEventListener("change",async e=>{const id=e.target.id;
   if(id==="sMonthMan"){await saveRet({monthMan:e.target.checked},e.target.checked?"월 금액을 만원으로 보여 줍니다":"월 금액도 억원으로 보여 줍니다");return;}
+  if(id==="bkAutoChk"){const on=e.target.checked;await saveRet({bkAuto:on},on?"주 단위 자동 백업을 켰습니다":"주 단위 자동 백업을 껐습니다");if(on)bkAutoRun();return;}
   if(id==="pxAutoChk"){const on=e.target.checked;await saveRet({pxAuto:on},on?"가격을 자동으로 가져옵니다":"가격 자동 업데이트를 껐습니다");if(on)pxAutoRun();return;}
   if(id==="snapAutoChk"){const on=e.target.checked;await saveRet({snapAuto:on},on?"평가액을 자동으로 기록합니다":"자동 기록을 껐습니다");if(on)autoSnap(200);return;}
   if(id==="sMinCash"){const raw=String(e.target.value).replace(/,/g,"").trim();const v=raw===""?0:parseFloat(raw);if(!(v>=0&&v<1e7)){toast("금액을 만원 단위 숫자로 넣으세요");render();return;}await saveRet({minCash:Math.round(v)*1e4},v?`생활비 통장에 최소 ${fmtA(Math.round(v)*1e4)}을 남겨 둡니다`:"생활비 통장 최소 잔액을 없앴습니다");return;}
@@ -3280,7 +3348,7 @@ function vPlanHome() {
   const allRes = [sim].concat((sim.groups || []).map(g => g.result));
   const resOf = id => allRes.find(r => (r.groupMembers || []).includes(id)) || sim;
   const r0 = sim.rows[0];
-  let h = `<div class="row"><h2>1단계 · 가족 구성원</h2><button class="btn small primary" id="addMember">구성원 추가</button></div>
+  let h = `<div class="row"><h2>가족 구성원</h2><button class="btn small primary" id="addMember">구성원 추가</button></div>
   <p class="hint" style="margin:0">구성원을 눌러 그 사람의 수입, 생활비, 계좌별 납입·수령 계획을 세웁니다. 여러 사람이 함께 쓰는 비용과 주택, 가정은 ‘가계 전체’에서 정합니다.</p>`;
   h += `<button class="card acard hhcard" data-psel="__hh"><div class="row"><div class="l"><span class="name">가계 전체</span><span class="meta">공통 지출 · 주택·대출 · 적립·인출 순서 · 가정</span></div><span class="meta">›</span></div>
     ${sm ? `<div class="row"><span>${sm.depletionYear ? `<span class="chip bad">! ${sm.depletionYear}년부터 생활비 통장 마이너스</span>` : `<span class="chip good">✓ 계획 기간 내내 자산 유지</span>`}</span><span class="meta">${sm.endYear}년 순자산 ${eok(last.netWorth / last.infl)} (현재가치)</span></div>` : ""}</button>`;
@@ -3315,6 +3383,12 @@ function transferNow(m) { let inM = 0, outM = 0, approx = false;
     const v = t.freq === "year" ? num(t.yearly) / 12 : num(t.monthly); if (t.freq === "year") approx = true;
     if (t.toId === m.id) inM += v; else outM += v; }
   return { inM, outM, approx }; }
+// 계획 결과에서 바로 바꾸는 수익률 시나리오 (설정의 ‘수익률 보정’과 같은 값). 검증용 고정 수익률이 켜져 있으면 바꿀 수 없다고 알린다
+function scenToggle() {
+  const fx = fixRet(); if (fx) return `<div class="scenrow"><button type="button" class="chip warn" data-go="settings">수익률 ${esc(planRetLabel())}</button><span class="meta">모든 계좌를 이 수익률로 계산했습니다 (설정에서 끔)</span></div>`;
+  const sc = retScen(); const src = retSrc();
+  return `<div class="scenrow"><span class="label">수익률</span><div class="seg-toggle" role="group" aria-label="수익률 시나리오">${["cons", "base", "opt"].map(k => `<button type="button" data-rscen="${k}" aria-pressed="${sc.k === k}">${RET_SCEN[k][0]}</button>`).join("")}</div><span class="meta">${sc.sign ? `주식 ${sc.sign < 0 ? "−" : "+"}${sc.w}%p` : "보정 없음"}${src !== "current" ? ` · ${src === "allocAll" ? "가족 전체 배분 후" : "배분 후"}` : ""}</span></div>`;
+}
 function realToggle() { return `<div class="seg-toggle" role="group" aria-label="금액 기준"><button type="button" data-real="1" aria-pressed="${S.real}">현재가치</button><button type="button" data-real="0" aria-pressed="${!S.real}">명목</button></div>`; }
 
 function vResult() {
@@ -3332,10 +3406,12 @@ function vResult() {
   const ok = !sm.depletionYear;
   let h = gsel + msel + `<section class="hero">
     <div class="row"><span class="label">${sim.firstYearFraction < 0.999 ? `오늘–${sm.endYear}년` : `${sm.startYear}–${sm.endYear}년`} · ${sm.years}년 계획</span>${realToggle()}</div>
+    ${scenToggle()}
     <span class="label">계획 마지막 해 순자산${S.real ? " (현재가치)" : ""}</span>
     <span class="total">${eok(last.netWorth * d(last))}</span>
-    <div class="chips">${ok ? `<span class="chip good">✓ 계획 기간 내내 자산 유지</span>` : `<span class="chip bad">! ${sm.depletionYear}년부터 생활비 통장 마이너스</span>${(() => { const dr = sim.rows.filter(r => r.debt > 0).reduce((a, r) => !a || r.debt * d(r) > a.debt * d(a) ? r : a, null); return dr ? `<span class="chip">가장 깊을 때 ${dr.year}년 ${eok(-dr.debt * d(dr))}</span>` : ""; })()}`}
-    ${ok ? (() => { const mr = sim.rows.reduce((a, r) => r.financial * d(r) < a.financial * d(a) ? r : a); return `<span class="chip">최저 금융자산 ${mr.year}년 ${eok(mr.financial * d(mr))}</span>`; })() : ""}<button type="button" class="chip${fixRet() ? " warn" : ""}" data-go="settings">수익률 ${esc(planRetLabel())}</button>${minCash() ? `<button type="button" class="chip" data-go="settings">생활비 통장 최소 ${eok(minCash())} 유지</button>` : ""}</div>
+    <div class="chips">${ok ? `<span class="chip good">✓ 계획 기간 내내 자산 유지</span>` : `<span class="chip bad">! ${sm.depletionYear}년부터 생활비 통장 마이너스</span>${(() => { const dr = sim.rows.filter(r => r.debt > 0).reduce((a, r) => !a || r.debt * d(r) > a.debt * d(a) ? r : a, null); return dr ? `<span class="chip">가장 깊을 때 ${dr.year}년 ${eok(-dr.debt * d(dr))}</span>` : ""; })()}${(() => { const q = shortMoSum(sim, r => r.overdraft); if (!q) return ""; const two = q.max.year !== q.first.year && moAmt(q.max.mo) !== moAmt(q.first.mo);
+      return `<span class="chip" data-shortmo title="그해 자기 돈으로 못 대 생활비 통장을 마이너스로 쓴 돈의 월 평균 (${S.real ? "현재가치" : "명목"})">모자라는 돈 첫해 ${moAmt(q.first.mo)}${two ? ` · 가장 많을 때 ${q.max.year}년 ${moAmt(q.max.mo)}` : ""}</span>`; })()}`}
+    ${ok ? (() => { const mr = sim.rows.reduce((a, r) => r.financial * d(r) < a.financial * d(a) ? r : a); return `<span class="chip">최저 금융자산 ${mr.year}년 ${eok(mr.financial * d(mr))}</span>`; })() : ""}${minCash() ? `<button type="button" class="chip" data-go="settings">생활비 통장 최소 ${eok(minCash())} 유지</button>` : ""}</div>
     <span class="meta">계획 기간 세금 ${eok(sim.rows.reduce((s2, r) => s2 + (r.tax - (r.credits || 0)) * d(r), 0))} (세액공제 차감 후, 배당 원천징수 포함) · 건강보험료 ${eok(sim.rows.reduce((s2, r) => s2 + r.health * d(r), 0))} · ${S.real ? "현재가치" : "명목"} 합계</span>
   </section>`;
   h += `<section class="card"><div class="row"><h2>연도별 자산</h2><span class="meta">${S.real ? "현재가치" : "명목"} · ${unitName()}</span></div>
@@ -3364,45 +3440,93 @@ function memberTaxSection(sim, d) {
   </tbody></table></div>${flowToggle(sim.rows.length)}<p class="hint" style="margin:0">세금은 계좌 명의자와 수입을 받는 사람 기준으로 계산합니다. 세액공제는 근로소득이 있는 명의자만 받습니다. 건강보험료는 세대 단위로 매겨져 가계 전체로 계산합니다.</p></section>`;
   return h;
 }
+// 모자라는 돈을 월 금액으로: 그해 자기 돈으로 못 대 생활비 통장을 마이너스로 쓴 돈 ÷ 그해 계산한 개월 수(첫해는 남은 달만).
+// 계획은 해마다 계산하므로 월 금액은 그해 평균이다. get(r): 그해 모자란 돈(명목)
+function shortMonths(sim, get) {
+  const r0 = sim.rows[0]; const part = sim.firstYearFraction != null && sim.firstYearFraction < 0.999;
+  return sim.rows.map(r => { const mN = r === r0 && part ? Math.round(sim.firstYearFraction * 12) : 12; const v = get(r) || 0;
+    return { year: r.year, v, mo: mN > 0 ? v * (S.real ? 1 / r.infl : 1) / mN : 0 }; }).filter(x => x.v > 5000 && x.mo > 0);
+}
+function moAmt(v) { const t = fmtM(v); return /[1-9]/.test(t) ? `월 약 ${t}` : "월 1만원 미만"; }
+// {first, max}: 첫해와 가장 많은 해의 월 금액. 없으면 null
+function shortMoSum(sim, get) { const xs = shortMonths(sim, get); if (!xs.length) return null; return { first: xs[0], max: xs.reduce((a, b) => b.mo > a.mo ? b : a), n: xs.length }; }
+function shortMoTxt(sim, get) { const q = shortMoSum(sim, get); if (!q) return "";
+  const two = q.max.year !== q.first.year && moAmt(q.max.mo) !== moAmt(q.first.mo);
+  return `모자라는 돈은 첫해(${q.first.year}년) <b>${moAmt(q.first.mo)}</b>${two ? `, 가장 많을 때(${q.max.year}년) <b>${moAmt(q.max.mo)}</b>` : ""}입니다(${S.real ? "현재가치" : "명목"}, 그해 모자란 돈의 월 평균). `; }
 // 구성원 돈이 모자라는 첫해: 그 사람이 계산되는 해 중 생활비 통장이 마이너스(5천원 넘게)인 해
 function memShortYear(res, mid) { const r = (res.rows || []).find(x => { if (x.ages[mid] == null) return false; const b = (x.byPerson || {})[mid] || {}; return (b.neg || 0) > 5000 || (b.overdraft || 0) > 5000; }); return r ? r.year : null; }
 function resOfMember(sim, mid) { return [sim].concat((sim.groups || []).map(g => g.result)).find(r => (r.groupMembers || []).includes(mid)) || sim; }
-// 생활비 조절: 그 사람 생활비(모든 구간)를 같은 비율로 줄여 다시 계산하고, 계획 끝까지 모자라지 않는 가장 큰 비율(정수 %)을 찾는다(이분 탐색, 8번 안팎).
+// 생활비 조절: 그 사람 생활비(모든 구간)를 같은 비율로 바꿔 다시 계산한다(정수 %).
+// 모자라면(down) 계획 끝까지 모자라지 않는 가장 큰 비율(0~99%)을, 남으면(up) 그래도 모자라지 않는 가장 큰 비율(100% 이상, 1000%까지)을 찾는다.
 // 한 번 계산에 수십 ms라 한 단계씩 나눠 돌리고, 계획·계좌·설정이 바뀌면(계산 키가 바뀌면) 버리고 다시 찾는다.
+const FIT_CAP = 1000, FIT_UP_SHARE = 0.8;   // 늘릴 때는 늘릴 수 있는 폭의 80%만 늘린다
 function fitLiving(mid) {
-  const c = S.simCache; if (!c || !c.input || !c.key) return null;
+  const c = S.simCache; if (!c || !c.input || !c.key || !c.val) return null;
   if (!S.fit || S.fit.key !== c.key) S.fit = { key: c.key, m: {} };
   const F = S.fit; if (F.m[mid]) return F.m[mid];
-  const st = F.m[mid] = { busy: true }; const inp0 = c.input; const ex0 = inp0.plan.expenses || [];
+  const inp0 = c.input; const ex0 = inp0.plan.expenses || [];
+  const short = memShortYear(resOfMember(c.val, mid), mid) != null;
+  const st = F.m[mid] = { busy: true, mode: short ? "down" : "up" };
   if (!ex0.some(e => e.memberId === mid && num(e.monthly) > 0)) { st.busy = false; st.none = true; return st; }
   const ok = pc => { const inp = { ...inp0, plan: { ...inp0.plan, expenses: ex0.map(e => e.memberId === mid ? { ...e, monthly: num(e.monthly) * pc / 100 } : e) } }; return memShortYear(resOfMember(RE.simulate(inp), mid), mid) == null; };
-  let lo = 0, hi = 100, first = true;
+  let lo = short ? 0 : 100, hi = short ? 100 : 200, phase = short ? "zero" : "grow";
   const done = () => { st.busy = false; if (S.fit === F && typeof document !== "undefined" && document.querySelector(`[data-fit="${CSS.escape(mid)}"]`)) render(); };
   const step = () => {
     if (S.fit !== F) return;   // 그사이 계획이 바뀜: 버린다(다음 화면에서 새로 찾는다)
     try {
-      if (first) { first = false; if (!ok(0)) { st.zero = true; return done(); } }
+      if (phase === "zero") { if (!ok(0)) { st.zero = true; return done(); } phase = "bis"; }
+      else if (phase === "grow") { if (ok(hi)) { lo = hi; if (hi >= FIT_CAP) { st.pc = FIT_CAP; st.cap = true; return done(); } hi = Math.min(hi * 2, FIT_CAP); } else phase = "bis"; }
       else { const md = (lo + hi) >> 1; if (ok(md)) lo = md; else hi = md; }
-      if (hi - lo <= 1) { st.pc = lo; return done(); }
+      if (phase === "bis" && hi - lo <= 1) { st.pc = lo; return done(); }
     } catch (e) { st.err = e.message || String(e); return done(); }
     setTimeout(step, 0);
   };
   setTimeout(step, 0); return st;
 }
+// 적정 생활비로 바꿀 비율: 줄일 때는 찾은 비율 그대로, 늘릴 때는 늘릴 수 있는 폭의 80%만 (정수 %, 내림)
+function fitApplyPc(st) { if (!st || st.busy || st.pc == null) return null; return st.mode === "up" ? 100 + Math.floor((st.pc - 100) * FIT_UP_SHARE) : st.pc; }
+// 바꾼 월 금액은 내림: 10만원 이상은 만원 단위, 그보다 작으면 천원 단위 (줄일 때도 늘릴 때도 찾은 비율을 넘지 않게)
+function fitRound(v) { v = Math.max(0, v); return v >= 1e5 ? Math.floor(v / 1e4 + 1e-9) * 1e4 : Math.floor(v / 1e3 + 1e-9) * 1e3; }
+function fitApply(mid, pc) {
+  const p = PL(); const m = mem(mid); pc = num(pc); if (!m || !(pc >= 0)) return;
+  const before = p.expenses.filter(e => e.memberId === mid).map(e => ({ id: e.id, monthly: e.monthly })); if (!before.length) return;
+  const A0 = livingNow(m);
+  p.expenses.forEach(e => { if (e.memberId === mid) e.monthly = fitRound(num(e.monthly) * pc / 100); });
+  S.fitUndo = { mid, before, pc };
+  savePlan(`${m.name} 생활비를 ${pc}%로 바꿨습니다${A0 > 0 ? ` (월 ${fmtM(A0)} → 월 ${fmtM(livingNow(m))})` : ""}`);
+}
+function fitUndo(mid) {
+  const u = S.fitUndo; if (!u || u.mid !== mid) return; const p = PL();
+  u.before.forEach(b => { const e = p.expenses.find(x => x.id === b.id); if (e) e.monthly = b.monthly; });
+  S.fitUndo = null; savePlan("생활비를 바꾸기 전으로 되돌렸습니다");
+}
 function fitBox(sim, m) {
-  const y = memShortYear(sim, m.id); if (y == null) return "";
-  const nm = esc(m.name); const st = fitLiving(m.id);
-  const head = `<b>${y}년부터 ${nm}의 돈이 모자랍니다</b>(생활비 통장 마이너스). `;
+  const y = memShortYear(sim, m.id); const nm = esc(m.name); const st = fitLiving(m.id);
+  const A = livingNow(m); const amt = pc => fmtM(fitRound(A * pc / 100));
+  const undo = S.fitUndo && S.fitUndo.mid === m.id ? `<button type="button" class="linkbtn" data-fitundo="${esc(m.id)}">방금 바꾼 생활비 되돌리기 (${S.fitUndo.pc}%로 바꾸기 전)</button>` : "";
   const other = "목돈 지출, 가계 공통비, 가족 간 이체, 계좌 인출 계획을 확인하세요.";
+  const note = `<span class="meta">${nm}의 모든 생활비 구간을 같은 비율로 바꿔 다시 계산한 값입니다(오늘 물가 기준). 목돈 지출·가계 공통비·이체는 그대로 둡니다.</span>`;
+  const ap = fitApplyPc(st);
+  const btn = (label, pc) => `<div class="btns fitbtns"><button type="button" class="btn small primary" data-fitapply="${esc(m.id)}" data-pc="${pc}">${label} · ${pc}%${A > 0 ? ` (월 ${amt(pc)})` : ""}</button>${undo}</div>`;
+  const box = (cls, body, busy) => `<div class="fitbox${cls}" data-fit="${esc(m.id)}"${busy ? ` aria-busy="true"` : ""}>${body}</div>`;
+  if (y == null) {   // 남는 경우: 얼마나 늘릴 수 있는지
+    if (!st || st.none) return undo ? box(" ok", undo) : "";
+    const head = `<b>계획 끝까지 ${nm}의 돈이 모자라지 않습니다.</b> `;
+    if (st.err) return box(" ok", `${head}생활비를 얼마나 늘릴 수 있는지 계산하지 못했습니다: ${esc(st.err)}.${undo ? " " + undo : ""}`);
+    if (st.busy) return box(" ok", `${head}생활비를 얼마나 늘릴 수 있는지 계산하는 중…`, true);
+    if (st.pc <= 100) return box(" ok", `${head}생활비를 1%도 더 늘릴 여유는 없습니다. ${undo}`);
+    const up = `생활비를 지금 계획의 최대 <b>${st.cap ? `${FIT_CAP}% 넘게` : `${st.pc}%`}</b>까지 늘릴 수 있습니다${A > 0 ? ` (지금 월 ${fmtM(A)} → ${st.cap ? "" : "최대 "}<b>월 ${fmtM(A * st.pc / 100)}</b>${st.cap ? " 넘게" : ""})` : ""}. `;
+    return box(" ok", head + up + note + (ap > 100 ? btn("적정 생활비로 늘리기", ap) + `<span class="meta">늘릴 수 있는 폭의 80%만 늘립니다(여유 20% 남김).</span>` : `<span class="meta"> 늘릴 수 있는 폭이 작아 그대로 두기를 권합니다.</span>${undo}`));
+  }
+  const head = `<b>${y}년부터 ${nm}의 돈이 모자랍니다</b>(생활비 통장 마이너스). ${shortMoTxt(sim, r => r.ages[m.id] != null ? ((r.byPerson || {})[m.id] || {}).overdraft : 0)}`;
   let body;
-  if (!st || st.err) body = `생활비 조절 금액을 계산하지 못했습니다${st && st.err ? `: ${esc(st.err)}` : ""}.`;
-  else if (st.busy) body = `생활비를 얼마로 줄여야 하는지 계산하는 중…`;
-  else if (st.none) body = `${nm}의 생활비가 계획에 없어 생활비로는 조절할 수 없습니다. ${other}`;
-  else if (st.zero) body = `${nm}의 생활비를 0으로 줄여도 모자랍니다. ${other}`;
-  else { const A = livingNow(m); const B = A * st.pc / 100;
-    body = st.pc === 0 ? `${nm}의 생활비를 0으로 줄여야 계획 끝까지 모자라지 않습니다. ${other}`
-      : `생활비를 지금 계획의 <b>${st.pc}%</b>로 줄이면${A > 0 ? ` (지금 월 ${fmtM(A)} → <b>월 ${fmtM(B)}</b>)` : ""} 계획 끝까지 모자라지 않습니다. <span class="meta">${nm}의 모든 생활비 구간을 같은 비율로 줄여 다시 계산한 값입니다(오늘 물가 기준). 목돈 지출·가계 공통비·이체는 그대로 둡니다.</span>`; }
-  return `<div class="fitbox" data-fit="${esc(m.id)}"${st && st.busy ? ` aria-busy="true"` : ""}>${head}${body}</div>`;
+  if (!st || st.err) body = `생활비 조절 금액을 계산하지 못했습니다${st && st.err ? `: ${esc(st.err)}` : ""}.${undo}`;
+  else if (st.busy) return box("", head + `생활비를 얼마로 줄여야 하는지 계산하는 중…`, true);
+  else if (st.none) body = `${nm}의 생활비가 계획에 없어 생활비로는 조절할 수 없습니다. ${other}${undo}`;
+  else if (st.zero) body = `${nm}의 생활비를 0으로 줄여도 모자랍니다. ${other}${undo}`;
+  else if (st.pc === 0) body = `${nm}의 생활비를 0으로 줄여야 계획 끝까지 모자라지 않습니다. ${other}${undo}`;
+  else body = `생활비를 지금 계획의 <b>${st.pc}%</b>로 줄이면${A > 0 ? ` (지금 월 ${fmtM(A)} → <b>월 ${amt(st.pc)}</b>)` : ""} 계획 끝까지 모자라지 않습니다. ${note}${btn("적정 생활비로 줄이기", st.pc)}`;
+  return box("", head + body);
 }
 function vMemberResult(sim, id) {
   const m = mem(id); const d = r => S.real ? 1 / r.infl : 1; const rows = sim.rows;
@@ -3414,12 +3538,13 @@ function vMemberResult(sim, id) {
   const shown = rows.filter(r => r.ages[id] != null);
   const hasTr = T.tIn > 1 || T.tOut > 1;
   let h = `<section class="hero"><div class="row"><span class="label">${esc(m.name)} (${esc(m.relation)}) · ${esc(m.birthYear)}년생${ended ? ` · ${num(m.birthYear) + num(m.deathAge)}년 ${m.deathAge}세까지 계산` : ""}</span>${realToggle()}</div>
+    ${scenToggle()}
     <span class="label">${ended ? `계획 끝(${m.deathAge}세)에 남는` : "계획 마지막 해"} 본인 명의 금융자산${S.real ? " (현재가치)" : ""}</span>
     <span class="total">${eok(bp(lastR).assets * d(lastR))}</span>
     <div class="kv kv4"><div><span>계획 기간 수입</span><b>${eok(T.inc)}</b></div><div><span>계획 기간 지출</span><b>${eok(T.spend)}</b></div><div><span>연금계좌 수령</span><b>${eok(T.pd)}</b></div><div><span>계획 기간 세금 <small>공제 후</small></span><b>${eok(T.tax)}</b></div></div>
     ${fitBox(sim, m)}
     ${hasTr ? `<span class="meta">가족 간 이체: ${[shows(T.tIn) ? `받음 ${eok(T.tIn)}` : "", shows(T.tOut) ? `보냄 ${eok(T.tOut)}` : ""].filter(Boolean).join(" · ") || `받음 ${eok(T.tIn)} · 보냄 ${eok(T.tOut)}`}</span>` : ""}
-    ${(() => { const fx = fixRet(); if (fx) return `<span class="meta"><span class="chip warn">수익률 ${esc(planRetLabel())}</span> 모든 계좌를 이 수익률로 계산했습니다</span>`; const al = retSrc() !== "current"; const e = al ? planMemberExp(id) : memberExp(id); return e ? `<span class="meta">${al ? `배분 후 ${esc(m.name)} 명의 계좌 예상 연수익률` : `지금 ${esc(m.name)} 명의 계좌 예상 연수익률`} <b>${expTxt(e.r)}</b> · 수익률 ${esc(planRetLabel())}</span>` : ""; })()}
+    ${(() => { if (fixRet()) return ""; const al = retSrc() !== "current"; const e = al ? planMemberExp(id) : memberExp(id); return e ? `<span class="meta">${al ? `배분 후 ${esc(m.name)} 명의 계좌 예상 연수익률` : `지금 ${esc(m.name)} 명의 계좌 예상 연수익률`} <b>${expTxt(e.r)}</b></span>` : ""; })()}
   </section>`;
   h += `<section class="card"><div class="row"><h2>${esc(m.name)} 명의 자산</h2><span class="meta">${S.real ? "현재가치" : "명목"} · ${unitName()}</span></div>
     <div class="chart-wrap" id="chartWrap"><div class="chart-tip" id="chartTip" hidden></div></div>
@@ -3596,7 +3721,7 @@ function yearSheet(year) {
   openSheet(`<h3>${year}년${part ? ` <span class="chip">남은 ${mN}개월만 계산</span>` : ""}</h3><span class="meta">${ages}${S.real ? " · 금액은 현재가치" : ""}${part ? " · 올해 지금까지의 수입·지출·수익은 현재 잔액에 이미 들어 있습니다" : ""}</span>
   ${r.events.length ? `<div class="evlist">${r.events.map((e, i) => `<span class="chip">${esc(evText(r, i, k))}</span>`).join("")}</div>` : ""}
   <div class="kvlist"><h4 class="g-in">현금 증가 <span>${f(inSum)}</span></h4>
-   ${mm("근로소득(세후)", r.salary)}${mm("국민연금", r.npension)}${mm("기초연금", r.basic || 0)}${kn("기타 수입", r.otherIncome)}${(r.transfers || []).filter(x => x.dir === "in").map(trV).join("")}${kn("주택 매각", r.propSaleCash || 0)}${kn("계좌 해지 (세후)", r.acctClose || 0)}${kn("대출 실행", r.loanIn || 0)}${kn("연금계좌 인출", r.pensionDraw)}${kn("일반·ISA·생활비 통장 인출", r.otherDraw)}${shows(r.overdraft * k) ? kv(`<span class="meta">└ 그중 잔액이 없어 생활비 통장을 마이너스로 쓴 돈</span>`, `<span class="up">${f(r.overdraft)}</span>`) : ""}${kn("연금 세액공제 환급", r.credits)}
+   ${mm("근로소득(세후)", r.salary)}${mm("국민연금", r.npension)}${mm("기초연금", r.basic || 0)}${kn("기타 수입", r.otherIncome)}${(r.transfers || []).filter(x => x.dir === "in").map(trV).join("")}${kn("주택 매각", r.propSaleCash || 0)}${kn("계좌 해지 (세후)", r.acctClose || 0)}${kn("대출 실행", r.loanIn || 0)}${kn("연금계좌 인출", r.pensionDraw)}${kn("일반·ISA·생활비 통장 인출", r.otherDraw)}${shows(r.overdraft * k) ? kv(`<span class="meta">└ 그중 잔액이 없어 생활비 통장을 마이너스로 쓴 돈${mN > 0 ? ` <span class="odmo">${monthX(r.overdraft * k, mN)}</span>` : ""}</span>`, `<span class="up">${f(r.overdraft)}</span>`) : ""}${kn("연금 세액공제 환급", r.credits)}
    <h4 class="g-out">현금 감소 <span>${f(outSum)}</span></h4>
    ${mm("생활비", r.living)}${(r.transfers || []).filter(x => x.dir === "out").map(trV).join("")}${kn("목돈 지출", r.lump)}${kn("주택 매입·대출 상환", r.housing)}${kn("계좌 납입", r.contrib)}${kn("생활비 통장 입금", r.toCash)}${kn("세금", r.taxCash)}${mm(`건강보험료 (${esc(r.healthStatus)}, 세대 합산)`, r.health)}
    ${(r.transfers || []).some(x => x.dir === "internal") ? `<h4>가계 안 이체 <span class="meta">가계 현금 변화 없음</span></h4>${(r.transfers || []).filter(x => x.dir === "internal").map(trV).join("")}` : ""}
@@ -3631,7 +3756,7 @@ function memberYearSheet(year, mid) {
   openSheet(`<h3>${year}년 · ${esc(m.name)} ${r.ages[mid] != null ? r.ages[mid] + "세" : ""}${part ? ` <span class="chip">남은 ${mN}개월만 계산</span>` : ""}</h3><span class="meta">${esc(m.name)}의 돈만 보여줍니다${S.real ? " · 금액은 현재가치" : ""}${part ? " · 올해 지금까지의 수입·지출·수익은 현재 잔액에 이미 들어 있습니다" : ""}</span>
   ${evs.length ? `<div class="evlist">${evs.map(e => `<span class="chip">${esc(e)}</span>`).join("")}</div>` : ""}
   <div class="kvlist"><h4 class="g-in">현금 증가 <span>${f(inSum)}</span></h4>
-   ${mm("근로소득(세후)", g("salary"))}${mm("국민연금", g("npension"))}${mm("기초연금", g("basic"))}${kn("기타 수입", g("other"))}${trs.filter(x => x.to === mid).map(x => trRow(trLab(x), x, mm, kn)).join("")}${kn("계좌 해지·매각·대출", g("acctClose"))}${kn("연금계좌 인출", g("pensionDraw"))}${kn("일반·ISA 인출", g("otherDraw"))}${kn("생활비 통장 인출", g("cashDraw"))}${shows(g("overdraft") * k) ? kv(`<span class="meta">└ 그중 잔액이 없어 마이너스로 쓴 돈</span>`, `<span class="up">${f(g("overdraft"))}</span>`) : ""}${kn("연금 세액공제 환급", g("credit"))}
+   ${mm("근로소득(세후)", g("salary"))}${mm("국민연금", g("npension"))}${mm("기초연금", g("basic"))}${kn("기타 수입", g("other"))}${trs.filter(x => x.to === mid).map(x => trRow(trLab(x), x, mm, kn)).join("")}${kn("계좌 해지·매각·대출", g("acctClose"))}${kn("연금계좌 인출", g("pensionDraw"))}${kn("일반·ISA 인출", g("otherDraw"))}${kn("생활비 통장 인출", g("cashDraw"))}${shows(g("overdraft") * k) ? kv(`<span class="meta">└ 그중 잔액이 없어 마이너스로 쓴 돈${mN > 0 ? ` <span class="odmo">${monthX(g("overdraft") * k, mN)}</span>` : ""}</span>`, `<span class="up">${f(g("overdraft"))}</span>`) : ""}${kn("연금 세액공제 환급", g("credit"))}
    <h4 class="g-out">현금 감소 <span>${f(outSum)}</span></h4>
    ${mm("생활비", g("living"))}${kn("목돈 지출", g("lump"))}${kn(`가계 공통비·주택·대출 <span class="meta">내는 사람으로 지정됨</span>`, g("shared"))}${mm(`건강보험료 <span class="meta">${esc(r.healthStatus)}, 세대 전체분을 냄</span>`, g("health"))}${trs.filter(x => x.from === mid).map(x => trRow(trLab(x), x, mm, kn)).join("")}${kn("계좌 납입", g("contrib"))}${kn("생활비 통장 입금", g("toCash"))}${kn("세금", g("taxCash"))}
    ${taxT}
@@ -4014,6 +4139,8 @@ function planClick(t) {
   if (t.dataset.pv) { S.draft = {}; S.planView = t.dataset.pv; try { localStorage.setItem("rf.pv", S.planView); } catch (e) {} render(); return true; }
   if (t.dataset.resg) { S.resGroup = t.dataset.resg; render(); return true; }
   if (t.dataset.psel != null) { S.draft = {}; setPlanSel(t.dataset.psel); render(); window.scrollTo(0, 0); return true; }
+  if (t.dataset.fitapply) { fitApply(t.dataset.fitapply, t.dataset.pc); return true; }
+  if (t.dataset.fitundo) { fitUndo(t.dataset.fitundo); return true; }
   if (t.dataset.real != null) { S.real = t.dataset.real === "1"; try { localStorage.setItem("rf.real", S.real ? "1" : "0"); } catch (e) {} render(); return true; }
   if (t.dataset.member) { memberSheet(mem(t.dataset.member)); return true; }
   if (t.dataset.addinc) { incomeSheet(null, t.dataset.addinc); return true; }
@@ -4046,8 +4173,19 @@ function planSummaryCard() {
   if (!S.planLoaded || !PL().members.length) return `<section class="card"><div class="row"><h2>은퇴 계획</h2><button class="btn small" data-go="plan">계획 세우기</button></div><p class="meta" style="margin:0">가족, 수입, 생활비, 계좌별 납입·수령 계획을 넣으면 계획 끝 나이까지 자산 흐름을 계산합니다.</p></section>`;
   const sim = getSim(); const sm = sim.summary; if (!sm) return "";
   const last = sim.rows[sim.rows.length - 1];
+  const all = [sim].concat((sim.groups || []).map(g => g.result));
+  // 구성원마다 계획 끝까지 버티는지 (별도 가계 포함)
+  const ms = PL().members.map(m => ({ m, y: memShortYear(resOfMember(sim, m.id), m.id) }));
+  const anyShort = ms.some(x => x.y != null);
+  // 가족 전체 모자라는 돈(월): 가계마다 그해 모자란 돈을 더한다
+  const byY = new Map(); all.forEach(g => (g.rows || []).forEach(r => { const o = byY.get(r.year) || { year: r.year, infl: r.infl, overdraft: 0 }; o.overdraft += r.overdraft || 0; byY.set(r.year, o); }));
+  const q = anyShort ? shortMoSum({ rows: [...byY.values()].sort((a, b) => a.year - b.year), firstYearFraction: sim.firstYearFraction }, r => r.overdraft) : null;
+  const nW = all.reduce((s2, g) => s2 + ((g.warnings || []).length), 0);
   return `<button class="card acard" data-go="plan" style="flex-direction:column;align-items:stretch"><div class="row"><h2>은퇴 계획</h2><span class="meta">자세히 ›</span></div>
-  <div class="row"><span>${sm.depletionYear ? `<span class="chip bad">! ${sm.depletionYear}년부터 생활비 통장 마이너스</span>` : `<span class="chip good">✓ 계획 기간 내내 자산 유지</span>`}</span><span class="meta">${sm.endYear}년 순자산 ${eok(last.netWorth / last.infl)} (현재가치${fixRet() || retScen().sign || retSrc() !== "current" ? `, 수익률 ${esc(planRetLabel())}` : ""})</span></div></button>`;
+  <div class="row"><span>${anyShort ? `<span class="chip bad">! ${Math.min(...ms.filter(x => x.y != null).map(x => x.y))}년부터 돈이 모자란 구성원이 있습니다</span>` : `<span class="chip good">✓ 모든 구성원이 계획 끝까지 유지</span>`}</span><span class="meta">${sm.endYear}년 우리 가계 순자산 ${eok(last.netWorth / last.infl)} (현재가치)</span></div>
+  <div class="chips">${ms.map(({ m, y }) => `<span class="chip${y != null ? " bad" : ""}" data-mstat="${esc(m.id)}">${esc(m.name)} ${y != null ? `${y}년부터 부족` : "✓"}</span>`).join("")}</div>
+  ${q ? `<span class="meta">모자라는 돈 (가족 합계) 첫해 ${q.first.year}년 ${moAmt(q.first.mo)}${q.max.year !== q.first.year ? ` · 가장 많을 때 ${q.max.year}년 ${moAmt(q.max.mo)}` : ""} (${S.real ? "현재가치" : "명목"}) · 구성원을 열면 적정 생활비를 계산해 바로 맞출 수 있습니다</span>` : ""}
+  <span class="meta">수익률 ${esc(planRetLabel())}${nW ? ` · <span class="up">확인할 점 ${nW}개</span>` : ""}</span></button>`;
 }
 
 /* ================= 자산 배분 ================= */
@@ -4056,6 +4194,8 @@ const AL_CASH = "__cash";
 S.alSel = null; try { const v = localStorage.getItem("rf.alsel"); if (v) S.alSel = v; } catch (e) {}
 // ‘계좌별로 담을 종목’ 카드를 펼쳐 둔 상태: 체크할 때마다 화면을 다시 그려도 펼친 채로 둔다
 S.alAllowOpen = false; try { S.alAllowOpen = localStorage.getItem("rf.alallow") === "1"; } catch (e) {}
+// 목표·목표 비중은 거의 바꾸지 않아 기본으로 접어 둔다 (펼친 상태는 이 기기에 기억)
+S.alGoalOpen = false; S.alTgtOpen = false; try { S.alGoalOpen = localStorage.getItem("rf.algoal") === "1"; S.alTgtOpen = localStorage.getItem("rf.altgt") === "1"; } catch (e) {}
 function alCfg(scope) { const p = PL(); if (!p.alloc) p.alloc = {}; return p.alloc[scope] || {}; }
 function alSet(scope, patch, msg) { const p = PL(); if (!p.alloc) p.alloc = {}; p.alloc[scope] = { ...(p.alloc[scope] || {}), ...patch }; savePlan(msg); }
 function alScopes() { const ms = PL().members.filter(m => acctList().some(a => ownerOf(a) === m.id && a.type !== "생활비")); return ms.map(m => [m.id, m.name]).concat(ms.length > 1 ? [["__all", "가족 전체"]] : []); }
@@ -4271,24 +4411,28 @@ function vAlloc() {
   // 환율이 없으면 달러 종목이 0원이 되어 ‘모두 팔기’ 같은 엉뚱한 제안이 나온다: 계산하지 않는다
   if (c.keys.some(k => k !== AL_CASH && c.info[k].cur === "USD") && !fx()) return h + `<div class="card empty">달러 종목이 있는데 환율이 없어 원화 금액을 알 수 없습니다. 설정에서 USD/KRW 환율을 넣으면 배분을 계산합니다.</div>`;
   // 목표
-  h += `<section class="card"><h2>목표</h2>
+  const goalSum = [`${c.year}년${c.years ? "" : " (올해)"}`, c.mode === "tax" ? "세금 적은 계좌 우선" : "매매 최소", `${c.lot}주 단위`,
+    { none: "입금 반영 안 함", target: "입금은 목표 비중대로", fill: "입금으로 채우기" }[c.depMode] || "", { reinvest: "배당 재투자", target: "배당은 목표 비중대로", fill: "배당은 모자란 종목에", none: "배당 반영 안 함" }[c.divMode] || ""].filter(Boolean).join(" · ");
+  h += `<details class="card" id="alGoalBox"${S.alGoalOpen ? " open" : ""}><summary style="cursor:pointer"><div class="row"><h2>목표</h2><span class="meta">${S.alGoalOpen ? "접기" : "펼치기 ›"}</span></div><span class="meta sum">${esc(goalSum)}</span></summary>
    <div>${fld("비중을 맞출 연도", "alYear", c.year, { type: "num", hint: c.years ? `${c.years}년 뒤. 종목마다 예상 수익률이 달라서, 그해에 목표 비중이 되도록 지금 비중을 거꾸로 맞춥니다` : "올해: 지금 바로 목표 비중으로 맞춥니다" })}
    ${fld("계좌에 담는 방식", "alMode", c.mode, { type: "select", options: [["keep", "지금 자리 최대한 유지 (매매 최소)"], ["tax", "세금이 적은 계좌 우선 (다시 배치)"]], hint: c.mode === "tax" ? "국내 상장 해외·채권형 ETF는 연금·ISA에, 국내 주식형은 일반계좌에 담는 쪽으로" : "지금 들고 있는 종목은 그 계좌에 두고 모자라거나 넘치는 만큼만 사고팝니다" })}
    ${fld("주식 수 단위", "alLot", c.lot, { type: "select", options: [[100, "100주"], [10, "10주"], [1, "1주"]], hint: "제안하는 보유 주식 수를 이 단위의 배수로 맞춥니다(수량을 지정한 종목은 지정한 수량). 그 때문에 생기는 목표와의 차이는 계좌마다 종목을 바꿔 가며 가장 작게 맞춥니다" })}
    ${fld("미래 입금", "alDep", c.depMode, { type: "select", options: AL_DEP, hint: !c.years ? "올해 목표라 입금을 반영할 기간이 없습니다" : c.depMode === "none" ? `목표 연도까지 들어올 입금은 계산에 넣지 않습니다${(() => { const d = alDeposits(c.scope, c.year); return d.total > 0 ? ` (계획상 ${d.from}~${d.to}년 ${eok(d.total)})` : ""; })()}` : c.dep.total > 0 ? `${c.dep.from}~${c.dep.to}년 입금 ${eok(c.dep.total)} (계획 결과: 이 계좌들의 계획 납입 + 남는 돈 적립, 명목. 인출은 넣지 않음). ${c.depMode === "fill" ? "지금 가진 종목은 목표 연도에 필요한 만큼까지 그대로 두고, 모자란 종목은 아래 ‘입금 배분’ 비율대로 입금해 채운다고 봅니다" : "입금할 때마다 그때 맞출 비중대로 산다고 봅니다. 지금 배분은 입금이 없을 때와 같고, 목표 연도 평가액만 늘어납니다"}` : "계획에 목표 연도까지 이 계좌들로 들어올 입금이 없습니다 (계획 → 계좌 계획의 납입 구간)" })}
    ${fld("미래 배당·분배", "alDiv", c.divMode, { type: "select", options: AL_DIV, hint: !c.years ? "올해 목표라 배당을 반영할 기간이 없습니다" : { reinvest: "배당은 받은 종목에 다시 사서, 예상 수익률(배당 포함)로 자란다고 봅니다", target: `배당·분배·이자를 해마다 모아서 그때 맞출 비중대로 산다고 봅니다. 종목은 가격 상승분(예상 수익률 − 배당)만큼 자라고, ${c.year}년까지 제안대로 사고판 뒤 배당 약 ${eok(c.exp.after.divT)}`, fill: `배당·분배·이자를 해마다 모아서 모자란 종목을 아래 ‘배당 배분’ 비율대로 산다고 봅니다(지금은 덜 팔기). 종목은 가격 상승분만큼 자라고, ${c.year}년까지 제안대로 사고판 뒤 배당 약 ${eok(c.exp.after.divT)}`, none: "배당·분배·이자는 꺼내 쓴다고 보고, 예상 수익률에서 배당수익률을 뺀 가격 상승분만으로 목표 연도 비중을 계산합니다. 배당이 많은 종목일수록 지금 더 담아야 합니다" }[c.divMode] })}
    ${c.lot > 1 ? fld(`${c.lot}주 금액이 이보다 크면 1주 단위로 (만원)`, "alLotCap", Math.round(c.lotCap / 1e4), { type: "num", hint: `0이면 모든 종목을 ${c.lot}주 단위로. 지금 1주 단위로 맞추는 종목: ${c.keys.filter(k => k !== AL_CASH && c.lots[k] === 1).map(k => c.info[k].name).join(", ") || "없음"}` }) : ""}</div>
-   <span class="meta">배분 대상 ${esc(c.scope === "__all" ? "가족 전체" : memName(c.scope))} 명의 계좌 ${c.accts.length}개 · ${eok(c.total)} (생활비 계좌 제외)</span></section>`;
+   <span class="meta">배분 대상 ${esc(c.scope === "__all" ? "가족 전체" : memName(c.scope))} 명의 계좌 ${c.accts.length}개 · ${eok(c.total)} (생활비 계좌 제외)</span></details>`;
   // 목표 비중
   const addable = watchList().filter(x => !c.keys.includes(x.ticker));
-  h += `<section class="card"><div class="row"><h2>목표 비중</h2><div class="btns"><button class="btn small" id="alReset">현재 비중으로</button></div></div>
+  const tgtSum = c.keys.filter(k => (c.tg[k] || 0) > 0).sort((a, b) => (c.tg[b] || 0) - (c.tg[a] || 0)).map(k => `${c.info[k].name} ${(Math.round((c.tg[k] || 0) * 100) / 100).toLocaleString("ko-KR")}%`).join(" · ");
+  h += `<details class="card" id="alTgtBox"${S.alTgtOpen ? " open" : ""}><summary style="cursor:pointer"><div class="row"><h2>목표 비중</h2><span class="meta">${S.alTgtOpen ? "접기" : "펼치기 ›"}</span></div><span class="meta sum">${esc(tgtSum || "목표 비중이 없습니다")}${Math.abs(c.tsum - 100) > 0.05 ? ` · 합계 ${(Math.round(c.tsum * 100) / 100).toLocaleString("ko-KR")}%` : ""}</span></summary>
+   <div class="btns"><button class="btn small" id="alReset">현재 비중으로</button></div>
    <div class="tbl-wrap" data-keep="alTgt"><table class="tbl in al"><thead><tr><th>종목</th><th>목표 (${c.year}년, %)</th><th>현재</th><th>예상 수익률</th></tr></thead><tbody>
    ${c.keys.map(k => { const i = c.info[k]; const rm = k !== AL_CASH && !((c.heldNow[k] || 0) > 0); return `<tr><td><span class="tgn">${esc(i.name)}${rm ? `<button type="button" class="rmx" data-alrm="${esc(k)}" aria-label="${esc(i.name)} 목록에서 빼기" title="목록에서 빼기">×</button>` : ""}</span><span class="meta">${esc(i.cls)}${k !== AL_CASH && (i.cls === "주식" || i.cls === "혼합") ? " · " + esc(RET_STYLE[styleOf({ ticker: k, name: i.name })][0]) : ""}${i.risky ? " · 위험자산" : ""}${c.lockedK[k] ? ` · 잠금 ${pct2(c.lockedK[k] / c.total)}` : ""}</span></td>
      <td><input data-altgt="${esc(k)}" inputmode="decimal" value="${esc(c.tg[k] || 0)}" aria-label="${esc(i.name)} 목표 비중(%)"></td><td>${pct2(c.cw[k] || 0)}</td><td>연 ${expTxt(i.r)}${c.divMode === "reinvest" ? "" : `<br><span class="meta">${c.pool ? "가격 상승" : "배당 빼면"} ${expTxt(c.er(k))}</span>`}</td></tr>`; }).join("")}
    <tr class="tot"><td>합계</td><td><b class="${Math.abs(c.tsum - 100) > 0.05 ? "up" : ""}">${(Math.round(c.tsum * 100) / 100).toLocaleString("ko-KR")}%</b></td><td>100%</td><td></td></tr></tbody></table></div>
    ${Math.abs(c.tsum - 100) > 0.05 ? `<span class="hint">합계가 100%가 아니어서 비율대로 나눠 계산했습니다.</span>` : ""}
    ${addable.length ? `<div class="btns"><select id="alAdd" aria-label="종목 추가"><option value="">종목 추가…</option>${addable.map(x => `<option value="${esc(x.ticker)}">${esc(x.name || x.ticker)}</option>`).join("")}</select></div>` : ""}
-   <span class="hint">예상 수익률은 ‘관심’ 메뉴의 종목별 값(없으면 자산군 가정)에 설정의 보수·낙관 보정을 더한 값입니다. 목표 비중을 0으로 두면 그 종목은 모두 팝니다. 지금 가지고 있지 않은 종목은 이름 옆 ×로 목록에서 뺍니다(그 종목에 지정한 수량도 함께 풉니다).</span></section>`;
+   <span class="hint">예상 수익률은 ‘관심’ 메뉴의 종목별 값(없으면 자산군 가정)에 설정의 보수·낙관 보정을 더한 값입니다. 목표 비중을 0으로 두면 그 종목은 모두 팝니다. 지금 가지고 있지 않은 종목은 이름 옆 ×로 목록에서 뺍니다(그 종목에 지정한 수량도 함께 풉니다).</span></details>`;
   // 기대 수익률
   const ex = c.exp; const col = (l, f) => `<tr><td>${l}</td><td>${f(ex.before)}</td><td><b>${f(ex.after)}</b></td><td>${f(ex.ideal)}</td></tr>`;
   h += `<section class="card"><div class="row"><h2>기대 수익률</h2><span class="meta">수익률 ${esc(scenLabel())}</span></div>
@@ -4431,6 +4575,8 @@ function alStay(sel, el, fn) {
   const d = n.getBoundingClientRect().top - top; if (Math.abs(d) > 0.5) window.scrollBy(0, d);
   try { n.focus({ preventScroll: true }); } catch (e) {}
 }
+app.addEventListener("toggle", e => { const id = e.target.id; const k = { alGoalBox: ["alGoalOpen", "rf.algoal"], alTgtBox: ["alTgtOpen", "rf.altgt"] }[id];
+  if (k) { if (S[k[0]] === e.target.open) return; S[k[0]] = e.target.open; try { localStorage.setItem(k[1], S[k[0]] ? "1" : "0"); } catch (er) {} const m = e.target.querySelector("summary .row .meta"); if (m) m.textContent = S[k[0]] ? "접기" : "펼치기 ›"; return; } }, true);
 app.addEventListener("toggle", e => { if (e.target.id !== "alAllowBox") return; S.alAllowOpen = e.target.open; try { localStorage.setItem("rf.alallow", S.alAllowOpen ? "1" : "0"); } catch (x) {} }, true);
 app.addEventListener("change", e => {
   const el = e.target; if (S.tab !== "alloc") return;
@@ -4538,7 +4684,9 @@ function vTrend() {
     <span class="total">${eok(last.total)}</span>
     ${last.cost ? `<span class="pl ${cls(pl)}">평가손익 ${fmtA(pl, { plus: true })}${trPlR(last) != null ? ` (${trPct(last, 2)})` : ""}</span>` : ""}
     <div class="chips">${list.length > 1 ? `<span class="chip ${chg > 0 ? "good" : chg < 0 ? "bad" : ""}">${esc(first.date)} 이후 ${fmtA(chg, { plus: true })} (${pct(chgR, 2)})</span>` : ""}
-      ${list.length > 1 ? `<span class="chip">최고 ${eok(hi.total)} · ${esc(hi.date.slice(2))}</span><span class="chip">최저 ${eok(lo.total)} · ${esc(lo.date.slice(2))}</span>` : ""}</div></section>`;
+      ${list.length > 1 ? `<span class="chip">최고 ${eok(hi.total)} · ${esc(hi.date.slice(2))}</span><span class="chip">최저 ${eok(lo.total)} · ${esc(lo.date.slice(2))}</span>` : ""}</div>
+    ${(() => { const e = memberExp(S.trMem === "__all" ? "__all" : S.trMem); const w = twr(list.map(x => ({ date: x.date, total: x.total, cost: x.cost })));
+      return retCmpHtml(w, e, { scen: "수익률 " + scenLabel() }) + (w || e ? `<span class="hint rnote">${RET_NOTE}${S.trRange !== "all" ? " 위 기간 선택에 맞춰 계산합니다." : ""} 예상 수익률은 지금 보유 종목 기준입니다.</span>` : ""); })()}</section>`;
   h += `<section class="card"><div class="row"><h2>${who ? esc(who) + " 명의 평가액" : "총 평가액"}</h2><span class="meta">${unitName()} · 기록 ${nf.format(list.length)}개</span></div>
     ${list.length > 1 ? `<div class="chart-wrap" id="trendWrap"><div class="chart-tip" id="trendTip" hidden></div></div>
     <div class="legend"><span><i style="background:var(--c1)"></i>평가액</span>${list.some(x => x.cost > 0) ? `<span><i class="dash" style="border-color:var(--c2)"></i>원금 (매입 금액 + 현금)</span>` : ""}</div>`
@@ -4617,15 +4765,15 @@ function trendClick(t) {
 app.addEventListener("click",e=>{const tr=e.target.closest("tr[data-snap]");if(tr)snapSheet(tr.dataset.snap);});
 RE.DEFAULT_ASSUMPTIONS.baseYear=new Date().getFullYear();
 // 자동 테스트에서만 내부 계산 함수를 꺼내 쓴다 (평소에는 아무 일도 하지 않음)
-if(window.__KINFOLIO_TEST__)window.__kinfolio={S,PERIODS,periodPL,periodChips,groupPL,trGroup,trLabel,trWeekKey,livingNow,incomeNow,transferNow,memShortYear,fitLiving,resOfMember,pxAutoRun,pxLast,alNewMoney,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
+if(window.__KINFOLIO_TEST__)window.__kinfolio={S,isoWeek,weekTitle,bkAutoRun,gdWeekBackup,gdBackups,twr,expOver,retPts,fitApply,fitApplyPc,fitRound,FIT_UP_SHARE,shortMonths,shortMoSum,moAmt,PERIODS,periodPL,periodChips,trGroup,trLabel,trWeekKey,livingNow,incomeNow,transferNow,memShortYear,fitLiving,resOfMember,pxAutoRun,pxLast,alNewMoney,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
 document.getElementById("hdrSub").addEventListener("click",()=>{if(S.dbState==="ok"&&freshness())setTab("prices");});
 document.getElementById("syncChip").addEventListener("click",()=>{
   if(PWA&&!KinfolioPWA.clientId()){setTab("settings");return;}
   if(PWA&&!KinfolioPWA.hasToken()){pwaConnect();return;}
   if(S.sync.err){setTab("settings");return;}
   syncRun(false);});
-document.addEventListener("visibilitychange",()=>{if(document.visibilityState!=="visible")return;if(syncOn()&&Date.now()-(S.sync.at||0)>(PWA?30e3:60e3))syncRun(true);if(S.pxBoot){clearTimeout(pxT);pxT=setTimeout(pxAutoRun,2500);}});
-setInterval(()=>{if(S.pxBoot&&!pxT)pxAutoRun();},5*60e3);   // 켜 둔 동안: 5분마다 확인해 30분이 지났으면 가져온다
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState!=="visible")return;if(syncOn()&&Date.now()-(S.sync.at||0)>(PWA?30e3:60e3))syncRun(true);if(S.pxBoot){clearTimeout(pxT);pxT=setTimeout(pxAutoRun,2500);clearTimeout(bkT);bkT=setTimeout(bkAutoRun,6000);}});
+setInterval(()=>{if(S.pxBoot&&!pxT)pxAutoRun();if(S.pxBoot&&!bkT)bkAutoRun();},5*60e3);   // 켜 둔 동안: 5분마다 확인해 30분이 지났으면 가져온다
 if(PWA){KinfolioPWA.onChange(()=>render());setInterval(()=>{if(document.visibilityState==="visible"&&syncOn())syncRun(true);},5*60e3);}
 render();initDb();gdInit();
 })();

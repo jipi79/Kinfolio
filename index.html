@@ -2134,26 +2134,38 @@ function totals(){let total=0,cost=0,cash=0;const byClass={};const byAcct=[];
 // 한 달·한 해 전: 그 달에 같은 날이 없으면(3월 31일 → 2월) 그 달 마지막 날
 function backMonths(d,n){const day=d.getUTCDate();d.setUTCDate(1);d.setUTCMonth(d.getUTCMonth()-n);const last=new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth()+1,0)).getUTCDate();d.setUTCDate(Math.min(day,last));}
 const PERIODS=[["주간",d=>{d.setUTCDate(d.getUTCDate()-7);},3],["월간",d=>backMonths(d,1),7],["연간",d=>backMonths(d,12),31]];
-function periodPL(back,tol){const t=totals();const now=t.invested-t.cost;const d=new Date(today()+"T00:00:00Z");back(d);const from=d.toISOString().slice(0,10);
+function periodPL(back,tol){const t=totals();const d=new Date(today()+"T00:00:00Z");back(d);const from=d.toISOString().slice(0,10);
   const d2=new Date(d.getTime()-tol*864e5).toISOString().slice(0,10);
   const base=(S.snapshots||[]).filter(x=>x&&x.date&&x.date<=from&&x.date>=d2&&x.total>0&&x.cost>0).pop();
-  if(!base)return null;const v=now-(base.total-base.cost);const inv=base.total-(+base.cash||0);return{d:v,r:inv>0?v/inv:null,date:base.date,from};}
+  if(!base)return null;
+  // 그사이 기록마다 넣거나 뺀 돈(기록에 있으면 그 값, 없으면 원금 변화)을 빼고 더한 손익. 마지막은 지금 장부
+  const pts=retPts("__all",false).filter(x=>x.date>=base.date&&x.date<today()).concat([{date:today(),total:t.total,cost:t.cost+t.cash}]);
+  let v=0;retSteps(pts,(a,b,F)=>{v+=b.total-a.total-F;});
+  const inv=base.total-(+base.cash||0);return{d:v,r:inv>0?v/inv:null,date:base.date,from};}
 function periodChips(){if(!(S.snapshots||[]).length)return "";
   const xs=PERIODS.map(([l,b,tol])=>[l,periodPL(b,tol)]).filter(([,x])=>x);   // 그만큼 오래된 기록이 있는 기간만
   if(!xs.length)return "";
   return `<div class="chips pchips">${xs.map(([l,x])=>`<span class="chip" data-period="${l}" title="${esc(x.date)} 기록 대비 평가손익 변화 · 그사이 넣거나 뺀 돈은 빼고, 비율은 그때 투자 평가액(현금 제외) 대비">${l} <b class="${cls(x.d)}">${fmtM(x.d,{plus:true})}</b>${x.r==null?"":` <span class="${cls(x.d)}">${pct(x.r,2)}</span>`}</span>`).join("")}</div>`;}
-// 기록으로 본 실제 수익률(시간가중): 기록과 기록 사이마다 원금(매입 금액 + 현금) 변화를 넣거나 뺀 돈으로 보고 빼서 수익률을 구해 곱한다
-// (수정 디에츠: 그 돈은 두 기록 사이 중간에 들어왔다고 본다). pts: 날짜순 [{date,total,cost}] (cost = 원금, 현금 포함). 원금을 모르는 기록은 건너뛴다.
+// 기록으로 본 실제 수익률(시간가중): 기록과 기록 사이마다 넣거나 뺀 돈을 빼고 수익률을 구해 곱한다
+// (수정 디에츠: 그 돈은 두 기록 사이 중간에 들어왔다고 본다). pts: 날짜순 [{date,total,cost,flow?}] (cost = 원금, 현금 포함).
+// 넣거나 뺀 돈: 기록에 flow(앞 기록 뒤로 그 기록까지 들어온 돈, 빼면 −)가 있으면 그 값, 없으면 원금 변화로 대신한다
+// (원금 변화에는 팔아서 생긴 차익도 들어가 그만큼 수익이 빠진다). 평가액·원금을 모르는 기록은 건너뛰고, 그날 flow는 다음 기록에 넘긴다.
 // 1년 이상이면 연평균(ann)으로 환산하고, 그보다 짧으면 환산하지 않는다(짧은 기간을 연으로 늘리면 숫자가 크게 부풀기 때문)
-function twr(pts){const xs=(pts||[]).filter(x=>x&&x.date&&x.total>0&&x.cost>0);if(xs.length<2)return null;
-  let g=1;for(let i=1;i<xs.length;i++){const a=xs[i-1],b=xs[i];const F=b.cost-a.cost;const den=a.total+F/2;if(!(den>0))continue;g*=1+(b.total-a.total-F)/den;}
-  const from=xs[0].date,to=xs[xs.length-1].date;const days=Math.round((Date.parse(to+"T00:00:00Z")-Date.parse(from+"T00:00:00Z"))/864e5);if(!(days>0)||!(g>0))return null;
-  return{r:g-1,days,from,to,n:xs.length,ann:days>=365?Math.pow(g,365/days)-1:null};}
+function retSteps(pts,fn){let a=null,carry=0;
+  for(const b of pts||[]){if(!b||!b.date)continue;
+    if(!(b.total>0&&b.cost>0)){if(a&&b.flow!=null)carry+=+b.flow||0;continue;}
+    if(a)fn(a,b,b.flow!=null?(+b.flow||0)+carry:b.cost-a.cost);
+    carry=0;a=b;}}
+function twr(pts){let g=1,n=0,from=null,to=null;
+  retSteps(pts,(a,b,F)=>{if(!n){from=a.date;n=1;}n++;to=b.date;const den=a.total+F/2;if(den>0)g*=1+(b.total-a.total-F)/den;});
+  if(n<2)return null;const days=Math.round((Date.parse(to+"T00:00:00Z")-Date.parse(from+"T00:00:00Z"))/864e5);if(!(days>0)||!(g>0))return null;
+  return{r:g-1,days,from,to,n,ann:days>=365?Math.pow(g,365/days)-1:null};}
 // 예상 연수익률 e(%)를 days일 동안의 수익률로
 function expOver(e,days){return Math.pow(1+e/100,days/365)-1;}
 // 수익률 비교에 쓸 기록: k = "__all"(가족 전체) 또는 구성원 id. live면 오늘 값(지금 장부)을 마지막 기록으로 쓴다
+// 기록마다 넣거나 뺀 돈: 가족 전체는 flow, 구성원은 byMemberFlow (복원한 기록 등에만 있다). 평가액이 0인 기록도 넘겨 그날 flow를 잇는다
 function retPts(k,live){const all=(S.snapshots||[]).filter(x=>x&&x.date);
-  let pts=k==="__all"?all.map(x=>({date:x.date,total:x.total,cost:x.cost})):all.filter(x=>x.byMember&&x.byMemberCost&&x.byMember[k]>0).map(x=>({date:x.date,total:x.byMember[k],cost:x.byMemberCost[k]}));
+  let pts=k==="__all"?all.map(x=>({date:x.date,total:x.total,cost:x.cost,flow:x.flow})):all.map(x=>({date:x.date,total:(x.byMember&&x.byMemberCost&&x.byMember[k])||0,cost:(x.byMember&&x.byMemberCost&&x.byMemberCost[k])||0,flow:x.byMemberFlow?(+x.byMemberFlow[k]||0):undefined}));
   if(live&&!needsFx()){const d=memo("snapNow",()=>snapDoc(false));const v=k==="__all"?{total:d.total,cost:d.cost}:{total:(d.byMember||{})[k],cost:(d.byMemberCost||{})[k]};
     if(v.total>0&&v.cost>0)pts=pts.filter(x=>x.date<d.date).concat([{date:d.date,total:v.total,cost:v.cost}]);}
   return pts;}
@@ -2169,7 +2181,7 @@ function retCmpHtml(w,e,opt){opt=opt||{};const sc=opt.scen?` · ${esc(opt.scen)}
 function retCmpTxt(w,e){if(!w)return e?`예상 수익률 연 ${expTxt(e.r)}`:"";
   if(w.ann!=null)return `실제 연평균 <b class="${cls(w.ann)}">${pct(w.ann,1)}</b>${e?` · 예상 연 ${expTxt(e.r)}`:""}`;
   const x=e?expOver(e.r,w.days):null;return `${nf.format(w.days)}일 실제 <b class="${cls(w.r)}">${pct(w.r,2)}</b>${e?` · 예상 <span class="${cls(x)}">${pct(x,2)}</span> (연 ${expTxt(e.r)})`:""}`;}
-const RET_NOTE="실제 수익률은 평가액 기록으로 구하고, 그사이 바뀐 원금(넣거나 뺀 돈, 팔아서 생긴 차익 포함)은 빼고 계산합니다. 기록이 1년이 안 되면 연평균으로 늘리지 않고 같은 기간끼리 비교합니다.";
+const RET_NOTE="실제 수익률은 평가액 기록으로 구하고, 그사이 넣거나 뺀 돈은 빼고 계산합니다. 입출금을 모르는 기록 사이는 바뀐 원금을 넣거나 뺀 돈으로 보므로 팔아서 생긴 차익도 빠집니다. 기록이 1년이 안 되면 연평균으로 늘리지 않고 같은 기간끼리 비교합니다.";
 function needsFx(){return Object.values(S.holdings).some(h=>h.currency==="USD")&&!fx();}
 
 /* ---------- db ---------- */
@@ -4607,7 +4619,7 @@ try { S.trRange = localStorage.getItem("rf.trr") || "all"; S.trGran = localStora
 function trPoints() {
   const all = (S.snapshots || []).filter(x => x && x.date); const m = S.trMem;
   if (!m || m === "__all") return all.filter(x => x.total > 0);
-  return all.filter(x => x.byMember && x.byMember[m] > 0).map(x => ({ ...x, total: x.byMember[m], cost: (x.byMemberCost || {})[m] || 0, cash: x.byMemberCash ? x.byMemberCash[m] || 0 : null }));
+  return all.filter(x => x.byMember && x.byMember[m] > 0).map(x => ({ ...x, total: x.byMember[m], cost: (x.byMemberCost || {})[m] || 0, cash: x.byMemberCash ? x.byMemberCash[m] || 0 : null, flow: x.byMemberFlow ? +x.byMemberFlow[m] || 0 : undefined }));
 }
 // 평가손익률: 평가손익 ÷ 매입 원금 (현금은 손익이 없어 빼고 나눈다 — 요약·계좌 화면과 같은 기준). 현금을 모르는 예전 구성원 기록은 비율을 내지 않는다
 function trPlR(x) { if (!x.cost || x.cash == null) return null; const b = x.cost - x.cash; return b > 0 ? (x.total - x.cost) / b : null; }
@@ -4685,7 +4697,7 @@ function vTrend() {
     ${last.cost ? `<span class="pl ${cls(pl)}">평가손익 ${fmtA(pl, { plus: true })}${trPlR(last) != null ? ` (${trPct(last, 2)})` : ""}</span>` : ""}
     <div class="chips">${list.length > 1 ? `<span class="chip ${chg > 0 ? "good" : chg < 0 ? "bad" : ""}">${esc(first.date)} 이후 ${fmtA(chg, { plus: true })} (${pct(chgR, 2)})</span>` : ""}
       ${list.length > 1 ? `<span class="chip">최고 ${eok(hi.total)} · ${esc(hi.date.slice(2))}</span><span class="chip">최저 ${eok(lo.total)} · ${esc(lo.date.slice(2))}</span>` : ""}</div>
-    ${(() => { const e = memberExp(S.trMem === "__all" ? "__all" : S.trMem); const w = twr(list.map(x => ({ date: x.date, total: x.total, cost: x.cost })));
+    ${(() => { const e = memberExp(S.trMem === "__all" ? "__all" : S.trMem); const w = twr(retPts(S.trMem === "__all" ? "__all" : S.trMem, false).filter(x => x.date >= first.date && x.date <= last.date));
       return retCmpHtml(w, e, { scen: "수익률 " + scenLabel() }) + (w || e ? `<span class="hint rnote">${RET_NOTE}${S.trRange !== "all" ? " 위 기간 선택에 맞춰 계산합니다." : ""} 예상 수익률은 지금 보유 종목 기준입니다.</span>` : ""); })()}</section>`;
   h += `<section class="card"><div class="row"><h2>${who ? esc(who) + " 명의 평가액" : "총 평가액"}</h2><span class="meta">${unitName()} · 기록 ${nf.format(list.length)}개</span></div>
     ${list.length > 1 ? `<div class="chart-wrap" id="trendWrap"><div class="chart-tip" id="trendTip" hidden></div></div>
@@ -4699,7 +4711,7 @@ function vTrend() {
     <div class="tbl-wrap"><table class="tbl"><thead><tr><th>${TR_GRANS.find(([k]) => k === S.trGran)[2]}</th><th>평가액</th><th>변화</th><th>평가손익</th></tr></thead><tbody>
     ${rows.map((x, i) => { const prev = rows0[i + 1]; const d = prev ? x.total - prev.total : null; const p = x.total - (x.cost || 0); const sg = v => (v > 0 ? "+" : "") + sh(v);
       const dl = trLabel(x, S.trGran);
-      return `<tr data-snap="${esc(x.date)}"><td>${esc(dl)}${x.auto ? "" : ` <span class="meta">·</span>`}${x.miss > 0 ? ` <span class="meta" title="가격이 없어 매입가로 계산한 종목 ${x.miss}개">!</span>` : ""}</td><td><b>${sh(x.total)}</b></td><td class="${d == null ? "" : cls(d)}">${d == null ? "–" : sg(d)}</td><td class="${cls(p)}">${x.cost ? `${sg(p)}${trPlR(x) != null ? `<br><small>${trPct(x, 1)}</small>` : ""}` : "–"}</td></tr>`; }).join("")}
+      return `<tr data-snap="${esc(x.date)}"><td>${esc(dl)}${x.auto || x.restored ? "" : ` <span class="meta">·</span>`}${x.miss > 0 ? ` <span class="meta" title="가격이 없어 매입가로 계산한 종목 ${x.miss}개">!</span>` : ""}</td><td><b>${sh(x.total)}</b></td><td class="${d == null ? "" : cls(d)}">${d == null ? "–" : sg(d)}</td><td class="${cls(p)}">${x.cost ? `${sg(p)}${trPlR(x) != null ? `<br><small>${trPct(x, 1)}</small>` : ""}` : "–"}</td></tr>`; }).join("")}
     </tbody></table></div>
     ${rows0.length > rows.length ? `<div class="btns"><button type="button" class="btn small" id="trMore">더 보기 (${nf.format(rows0.length - rows.length)}개 남음)</button></div>` : ""}
     <span class="hint">금액 단위 ${unitName()}. 변화는 앞 기록과의 차이이고, 주별·월별·연별은 기간마다 마지막 기록으로 앞 기간과 비교합니다.${who ? ` ${esc(who)} 명의 계좌만 더한 값이고, 평가손익은 구성원별 원금을 남긴 기록부터 나옵니다.` : ""} 평가손익률은 평가손익 ÷ 매입 원금(현금 제외)입니다. 행을 누르면 그날 구성원별 평가액을 보고 기록을 지울 수 있습니다. ‘·’ 표시는 직접 기록한 날, ‘!’ 표시는 가격이 없는 종목을 매입가로 계산한 날입니다.</span></section>`;
@@ -4712,8 +4724,8 @@ function snapSheet(date) {
   const x = (S.snapshots || []).find(s => s.date === date); if (!x) return;
   const ms = (S.plan && S.plan.members) || []; const bm = x.byMember || {};
   const rowsM = Object.entries(bm).sort((a, b) => b[1] - a[1]).map(([id, v]) => kv(id === "__none" ? "명의자 미지정" : esc((ms.find(m => m.id === id) || {}).name || id), eok(v))).join("");
-  openSheet(`<h3>${esc(date)} 평가액</h3><span class="meta">${x.auto ? "자동 기록" : "직접 기록"}${x.at ? ` · ${esc(whenTxt(x.at))}` : ""}</span>
-    <div class="kvlist">${kv("총 평가액", `<b>${eok(x.total)}</b>`)}${x.cost ? kv("원금 (매입 금액 + 현금)", eok(x.cost)) + kv("평가손익", `${fmtA(x.total - x.cost, { plus: true })}${trPlR(x) != null ? ` (${trPct(x, 2)})` : ""}`) : ""}${x.cash != null ? kv("현금", eok(x.cash)) : ""}${x.fx ? kv("USD/KRW", nf2.format(x.fx)) : ""}${x.miss > 0 ? kv("가격이 없어 매입가로 계산한 종목", `${x.miss}개`) : ""}${x.pxOld ? kv("가장 오래된 가격", esc(x.pxOld)) : ""}${rowsM}</div>
+  openSheet(`<h3>${esc(date)} 평가액</h3><span class="meta">${x.restored ? "거래내역으로 복원한 기록" : x.auto ? "자동 기록" : "직접 기록"}${x.at ? ` · ${esc(whenTxt(x.at))}` : ""}</span>
+    <div class="kvlist">${kv("총 평가액", `<b>${eok(x.total)}</b>`)}${x.cost ? kv("원금 (매입 금액 + 현금)", eok(x.cost)) + kv("평가손익", `${fmtA(x.total - x.cost, { plus: true })}${trPlR(x) != null ? ` (${trPct(x, 2)})` : ""}`) : ""}${x.cash != null ? kv("현금", eok(x.cash)) : ""}${x.fx ? kv("USD/KRW", nf2.format(x.fx)) : ""}${x.miss > 0 ? kv("가격이 없어 매입가로 계산한 종목", `${x.miss}개`) : ""}${x.pxOld ? kv("가장 오래된 가격", esc(x.pxOld)) : ""}${x.flow ? kv("앞 기록 뒤로 넣거나 뺀 돈", fmtA(x.flow, { plus: true })) : ""}${rowsM}</div>${x.note ? `<p class="meta" style="margin:8px 0 0">${esc(x.note)}</p>` : ""}
     <div class="btns"><button class="btn danger" id="snapDel">기록 지우기</button><span class="grow"></span><button class="btn" id="pCancel">닫기</button></div>`, bg => {
     bg.querySelector("#pCancel").onclick = closeSheet;
     armDelete(bg.querySelector("#snapDel"), async () => { if (await write(db => db.doc("snapshots/" + date).delete(), "기록을 지웠습니다")) closeSheet(); });

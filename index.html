@@ -2174,7 +2174,11 @@ function wonOf(t){const m=String(t).replace(/[,+원\s]/g,"").match(/^(-?[\d.]+)(
 function monthX(total,mN){const s=fmtM(total/mN);return `월 ${fmtA(wonOf(s)*mN)===fmtA(total)?"":"약 "}${s} × ${mN}개월`;}
 // 입력 칸에 넣는 숫자: 천 단위 쉼표 (소수점은 그대로)
 const fmtIn=v=>v==null||v===""?"":isFinite(+v)?(+v).toLocaleString("ko-KR",{maximumFractionDigits:6}):esc(v);
-function pct(x,d=1){if(!isFinite(x))return "–";return (x>0?"+":"")+(x*100).toFixed(d)+"%";}
+// 비율은 모두 소수점 둘째 자리까지 (d는 예전 호출과의 호환용, 쓰지 않는다)
+function pct(x,d){if(!isFinite(x))return "–";const v=Math.round(x*1e4)/100;return (v>0?"+":"")+(v===0?0:v).toFixed(2)+"%";}
+function P2(v){v=Math.round(v*100)/100;return (v===0?0:v).toLocaleString("ko-KR",{minimumFractionDigits:2,maximumFractionDigits:2});}   // 이미 %인 숫자 (7 → "7.00")
+function pctN(v){return isFinite(v)?P2(v)+"%":"–";}        // 7 → 7.00%
+function pctF(x){return isFinite(x)?P2(x*100)+"%":"–";}     // 0.07 → 7.00%
 function cls(x){return x>0.00005?"up":x<-0.00005?"down":"flat";}
 function money(n,cur){return cur==="USD"?"$"+nf2.format(n||0):nf.format(Math.round(n||0))+"원";}
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
@@ -2226,9 +2230,9 @@ function autoStyle(x){const t=tkey(x.ticker),nm=String(x.name||"");
 function styleOf(x){const a=S.assets[tkey(x.ticker)]||{};const st=a.retStyle||x.retStyle;return RET_STYLE[st]?st:autoStyle({...x,name:a.name||x.name});}
 function retAdj(c,k,st){const sc=retScen(k);const f=RET_FACTOR[c||"기타"]??0.75;const g=(c==="주식"||c==="혼합")?RET_STYLE[RET_STYLE[st]?st:"index"][1]:1;return sc.sign*sc.w*f*g;}
 function holdAdj(h,k){return retAdj(h.assetClass||"기타",k,styleOf(h));}
-function scenLabel(){const sc=retScen();return sc.sign?`${sc.name} (주식 ${sc.sign<0?"−":"+"}${sc.w}%p)`:"보통";}
-function expTxt(r){return `${(Math.round(r*100)/100).toLocaleString("ko-KR")}%`;}
-function adjTxt(v){const x=Math.round(v*100)/100;return x?`${x<0?"−":"+"}${Math.abs(x).toLocaleString("ko-KR")}%p`:"0%p";}
+function scenLabel(){const sc=retScen();return sc.sign?`${sc.name} (주식 ${sc.sign<0?"−":"+"}${P2(sc.w)}%p)`:"보통";}
+function expTxt(r){return pctN(r);}
+function adjTxt(v){const x=Math.round(v*100)/100;return x?`${x<0?"−":"+"}${P2(Math.abs(x))}%p`:"0.00%p";}
 // 계좌 예상 연수익률(%): 보유 종목 예상 수익률을 평가액으로 가중평균(계좌 계획에서 직접 넣었으면 그 값) + 수익률 보정. 예수금·생활비 현금은 ‘현금성’
 function acctExp(a,k){const as=AS();const st=acctStats(a);let rv=0,dv=0,av=0,tv=0;
   st.hs.forEach(h=>{const v=hVal(h);const e=expOf(h.ticker,h.assetClass,h);rv+=v*e.r;dv+=v*e.dy;av+=v*holdAdj(h,k);tv+=v;});
@@ -2414,17 +2418,17 @@ function vHome(){
   const byMem=ownerGroups();
   if(byMem.length>1||(byMem.length===1&&byMem[0].id)){h+=`<section class="card"><h2>구성원별 자산</h2><div class="bar">${byMem.map((g,i)=>`<span style="width:${t.total?(g.total/t.total*100):0}%;background:${ACCT_COLORS[i%ACCT_COLORS.length]}"></span>`).join("")}</div>
     <div class="list">${byMem.map((g,i)=>`<button class="item" data-mview="${esc(g.id||"__none")}"><div class="row"><div class="l"><span class="name"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ACCT_COLORS[i%ACCT_COLORS.length]};margin-right:7px"></i>${esc(g.name)}</span><span class="meta">${(()=>{const y=ytdRet(g.id||"__none");return y?`연초 대비 <b class="${cls(y.r)}">${pct(y.r,1)}</b> · `:"";})()}${retCmpTxt(twr(retPts(g.id||"__none",true)),groupExp(g.accts))}</span></div>
-    <div class="r"><b>${eok(g.total)}</b><span class="meta">비중 ${t.total?(g.total/t.total*100).toFixed(1):0}%</span></div></div></button>`).join("")}</div></section>`;}
+    <div class="r"><b>${eok(g.total)}</b><span class="meta">비중 ${t.total?P2(g.total/t.total*100):"0.00"}%</span></div></div></button>`).join("")}</div></section>`;}
 
   // by class
   const classes=CLASSES.filter(c=>t.byClass[c]>0);
   h+=`<section class="card"><h2>자산군 배분</h2><div class="bar">${classes.map(c=>`<span style="width:${t.byClass[c]/t.total*100}%;background:${CLASS_COLOR[c]}"></span>`).join("")}</div>
-    <div class="legend">${classes.map(c=>`<span><i style="background:${CLASS_COLOR[c]}"></i>${c} ${(t.byClass[c]/t.total*100).toFixed(1)}%</span>`).join("")}</div></section>`;
+    <div class="legend">${classes.map(c=>`<span><i style="background:${CLASS_COLOR[c]}"></i>${c} ${P2(t.byClass[c]/t.total*100)}%</span>`).join("")}</div></section>`;
 
   // IRP risk cap
   const capped=t.byAcct.filter(x=>RISK_CAPPED.has(x.a.type));
   if(capped.length){h+=`<section class="card"><div class="row"><h2>퇴직연금 위험자산 한도</h2><span class="meta">한도 70%</span></div><div class="list">${capped.map(x=>{const r=x.st.riskRatio;const over=r>0.7;
-    return `<div class="item" style="display:flex;flex-direction:column;gap:8px"><div class="row"><span class="name">${esc(x.a.name)}</span><span class="${over?"up":""}" style="font-weight:600">${(r*100).toFixed(1)}% ${over?'<span class="chip warn">한도 초과</span>':""}</span></div>
+    return `<div class="item" style="display:flex;flex-direction:column;gap:8px"><div class="row"><span class="name">${esc(x.a.name)}</span><span class="${over?"up":""}" style="font-weight:600">${P2(r*100)}% ${over?'<span class="chip warn">한도 초과</span>':""}</span></div>
     <div class="gauge"><span class="${over?"over":""}" style="width:${Math.min(r,1)*100}%"></span><em style="left:70%"></em></div></div>`;}).join("")}</div>
     <p class="hint" style="margin:0">종목마다 ‘위험자산’ 표시를 기준으로 계산합니다. 채권혼합형 등 안전자산으로 인정되는 ETF는 표시를 해제하세요.</p></section>`;}
 
@@ -2481,7 +2485,7 @@ function consolidate(mid){
   return{accts,list,cash,total,byClass};}
 function conRow(x,total,detail){const r=x.cost?(x.value-x.cost)/x.cost:0;const w=total?x.value/total:0;const p=S.prices[x.ticker];
   return `<div class="item conrow"><div class="row"><div class="l"><span class="name">${esc(x.name||x.ticker)}</span><span class="meta">${esc(x.ticker)} · ${nf2.format(x.qty)}주${detail?` · 평균 ${money(x.qty?x.costNative/x.qty:0,x.currency)}${p?` · 현재 ${money(p.price,x.currency)}`:""}`:""}</span></div>
-    <div class="r"><b>${(w*100).toFixed(1)}%</b><span class="meta">${eok(x.value)} · <span class="${cls(r)}">${pct(r)}</span></span></div></div>
+    <div class="r"><b>${P2(w*100)}%</b><span class="meta">${eok(x.value)} · <span class="${cls(r)}">${pct(r)}</span></span></div></div>
     <div class="wbar"><span style="width:${Math.min(100,w*100).toFixed(2)}%"></span></div>
     ${detail&&x.accts.length>1?`<span class="meta">${x.accts.map(a=>`${esc(a.name)} ${nf2.format(a.qty)}주`).join(" · ")}</span>`:detail?`<span class="meta">${esc(x.accts[0].name)}</span>`:""}</div>`;}
 const TK_COLORS=["#0E6655","#4E8FD6","#D2A43C","#C8625B","#7E6BC4","#5AA88F","#B98FC6","#8C9A5B"];
@@ -2498,11 +2502,11 @@ function vMemberView(){
   if(!con.list.length&&!con.cash)return h+`<div class="card empty">보유 종목이 없습니다.</div>`;
   const top=con.list.slice(0,TK_COLORS.length);const restV=con.list.slice(TK_COLORS.length).reduce((s,x)=>s+x.value,0)+con.cash;
   h+=`<section class="card"><h2>종목 비중</h2><div class="bar">${top.map((x,i)=>`<span style="width:${con.total?x.value/con.total*100:0}%;background:${TK_COLORS[i]}"></span>`).join("")}${restV>0?`<span style="width:${con.total?restV/con.total*100:0}%;background:var(--line)"></span>`:""}</div>
-    <div class="legend">${top.map((x,i)=>`<span><i style="background:${TK_COLORS[i]}"></i>${esc(x.name||x.ticker)} ${con.total?(x.value/con.total*100).toFixed(1)+"%":"–"}</span>`).join("")}${restV>0?`<span><i style="background:var(--line)"></i>${con.list.length>TK_COLORS.length?"그 외·":""}예수금 ${con.total?(restV/con.total*100).toFixed(1)+"%":"–"}</span>`:""}</div>
-    <div class="list">${con.list.map(x=>conRow(x,con.total,true)).join("")}${con.cash?`<div class="item conrow"><div class="row"><div class="l"><span class="name">예수금</span><span class="meta">계좌 안 현금</span></div><div class="r"><b>${(con.cash/con.total*100).toFixed(1)}%</b><span class="meta">${eok(con.cash)}</span></div></div><div class="wbar"><span style="width:${(con.cash/con.total*100).toFixed(2)}%;background:var(--muted)"></span></div></div>`:""}</div></section>`;
+    <div class="legend">${top.map((x,i)=>`<span><i style="background:${TK_COLORS[i]}"></i>${esc(x.name||x.ticker)} ${con.total?P2(x.value/con.total*100)+"%":"–"}</span>`).join("")}${restV>0?`<span><i style="background:var(--line)"></i>${con.list.length>TK_COLORS.length?"그 외·":""}예수금 ${con.total?P2(restV/con.total*100)+"%":"–"}</span>`:""}</div>
+    <div class="list">${con.list.map(x=>conRow(x,con.total,true)).join("")}${con.cash?`<div class="item conrow"><div class="row"><div class="l"><span class="name">예수금</span><span class="meta">계좌 안 현금</span></div><div class="r"><b>${P2(con.cash/con.total*100)}%</b><span class="meta">${eok(con.cash)}</span></div></div><div class="wbar"><span style="width:${(con.cash/con.total*100).toFixed(2)}%;background:var(--muted)"></span></div></div>`:""}</div></section>`;
   const classes=CLASSES.filter(c=>con.byClass[c]>0);
   h+=`<section class="card"><h2>자산군 배분</h2><div class="bar">${classes.map(c=>`<span style="width:${con.byClass[c]/con.total*100}%;background:${CLASS_COLOR[c]}"></span>`).join("")}</div>
-    <div class="legend">${classes.map(c=>`<span><i style="background:${CLASS_COLOR[c]}"></i>${c} ${(con.byClass[c]/con.total*100).toFixed(1)}%</span>`).join("")}</div></section>`;
+    <div class="legend">${classes.map(c=>`<span><i style="background:${CLASS_COLOR[c]}"></i>${c} ${P2(con.byClass[c]/con.total*100)}%</span>`).join("")}</div></section>`;
   h+=`<p class="hint" style="margin:0">같은 종목은 여러 계좌에 나뉘어 있어도 하나로 합쳐 보여줍니다. 비중은 예수금을 포함한 ${esc(title)} 총 평가액 기준이고, 평균단가는 계좌별 매입가를 수량으로 가중평균한 값입니다.</p>`;
   return h;}
 function ownerOf(a){
@@ -2521,7 +2525,7 @@ function ownerGroups(){
 function vAccountDetail(a){const st=acctStats(a);const pl=st.value-st.cost;const r=st.cost?pl/st.cost:0;
   let h=`<div class="row"><button class="btn small" id="back">‹ 계좌 목록</button><button class="btn small" id="editAcct">계좌 수정</button></div>
   <section class="hero"><div class="acct-head"><div class="l" style="display:flex;flex-direction:column"><span class="label">${esc(a.type)}${a.broker?" · "+esc(a.broker):""}${ownerOf(a)&&S.plan?" · "+esc(memName(ownerOf(a)))+" 명의":""}</span><span class="name" style="font-size:18px">${esc(a.name)}</span></div>
-  ${RISK_CAPPED.has(a.type)?`<span class="chip ${st.riskRatio>0.7?"warn":"acc"}">위험자산 ${(st.riskRatio*100).toFixed(1)}%</span>`:""}</div>
+  ${RISK_CAPPED.has(a.type)?`<span class="chip ${st.riskRatio>0.7?"warn":"acc"}">위험자산 ${P2(st.riskRatio*100)}%</span>`:""}</div>
   <span class="total">${eok(st.total)}</span>
   <div class="kv"><div><span>평가손익</span><b class="${cls(pl)}">${fmtA(pl,{plus:true})}</b></div><div><span>수익률</span><b class="${cls(r)}">${pct(r,2)}</b></div><div><span>${a.type==="생활비"?"현금 잔액":"예수금"}</span><b>${eok(st.cash)}</b></div></div>
   ${(()=>{if(a.type==="생활비")return "";const pts=acctPts(a.id,true);const w=twr(pts);const y=ytdRet(null,pts);const e=acctExp(a);
@@ -2564,7 +2568,7 @@ function vPrices(){
     const badge=!p?'<span class="chip warn">가격 없음</span>':!isFinite(age)?'<span class="chip warn">날짜 없음</span>':age<=0?'<span class="chip acc">오늘</span>':age<=3?`<span class="chip">${age}일 전</span>`:`<span class="chip warn">${age}일 전</span>`;
     const chg=p&&num(p.prevClose)>0?(num(p.price)-num(p.prevClose))/num(p.prevClose):null;
     const ex=expOf(r.ticker,r.assetClass);
-    const left=`<div class="l"><span class="name">${esc(r.name||r.ticker)} ${r.held?`<span class="chip acc">보유 ${nf2.format(r.held.qty)}주</span>`:""}</span><span class="meta">${esc(r.ticker)} · ${esc(r.assetClass||"기타")} · ${esc(r.currency||"KRW")}</span><span class="meta">예상 수익률 <b class="${ex.autoR?"":"accent"}">${nf2.format(ex.r)}%</b>${ex.autoR?" (기본값)":""} · 배당 ${nf2.format(ex.dy)}%${r.assetClass==="주식"||r.assetClass==="혼합"?` · ${esc(RET_STYLE[styleOf(r)][0])}`:""}</span>${(()=>{const h=pxHistTxt(r.ticker);return h?`<span class="meta">${h}</span>`:"";})()}</div>`;
+    const left=`<div class="l"><span class="name">${esc(r.name||r.ticker)} ${r.held?`<span class="chip acc">보유 ${nf2.format(r.held.qty)}주</span>`:""}</span><span class="meta">${esc(r.ticker)} · ${esc(r.assetClass||"기타")} · ${esc(r.currency||"KRW")}</span><span class="meta">예상 수익률 <b class="${ex.autoR?"":"accent"}">${P2(ex.r)}%</b>${ex.autoR?" (기본값)":""} · 배당 ${P2(ex.dy)}%${r.assetClass==="주식"||r.assetClass==="혼합"?` · ${esc(RET_STYLE[styleOf(r)][0])}`:""}</span>${(()=>{const h=pxHistTxt(r.ticker);return h?`<span class="meta">${h}</span>`:"";})()}</div>`;
     if(ro)return `<div class="item"><div class="row">${left}<div class="mvb"><button class="btn small" data-mv="asset" data-id="${esc(r.ticker)}" data-dir="-1" aria-label="위로"${i===0?" disabled":""}>↑</button><button class="btn small" data-mv="asset" data-id="${esc(r.ticker)}" data-dir="1" aria-label="아래로"${i===rows.length-1?" disabled":""}>↓</button></div></div></div>`;
     return `<button class="item" data-price="${esc(r.ticker)}"><div class="row">${left}
     <div class="r"><b>${p?money(p.price,p.currency||r.currency):"–"}</b><span class="meta">${chg!==null?`<span class="${cls(chg)}">${pct(chg,2)}</span> `:""}${badge}</span></div></div></button>`;}).join("")}</div></section>
@@ -3236,8 +3240,8 @@ function assetSheet(ticker){const isNew=!ticker;const wl=watchList();const w=(ti
   <div class="grid2"><div class="field"><label for="pPrice">현재가</label><input id="pPrice" inputmode="decimal" value="${p.price?fmtIn(p.price):""}"></div>
   <div class="field"><label for="pDate">기준일</label><input id="pDate" type="date" value="${esc(p.asOf||today())}"></div></div>
   <h4>은퇴 계획용 기대치</h4>
-  <div class="grid2"><div class="field"><label for="pExp">예상 수익률 (%/년)</label><input id="pExp" inputmode="decimal" value="${esc(as0.expReturn??"")}" placeholder="기본 ${nf2.format(num(A0.returns[cls0]))}"></div>
-  <div class="field"><label for="pDiv">배당·분배 수익률 (%/년)</label><input id="pDiv" inputmode="decimal" value="${esc(as0.expDiv??"")}" placeholder="기본 ${nf2.format(num(A0.divYield[cls0]))}"></div></div>
+  <div class="grid2"><div class="field"><label for="pExp">예상 수익률 (%/년)</label><input id="pExp" inputmode="decimal" value="${esc(as0.expReturn??"")}" placeholder="기본 ${P2(num(A0.returns[cls0]))}"></div>
+  <div class="field"><label for="pDiv">배당·분배 수익률 (%/년)</label><input id="pDiv" inputmode="decimal" value="${esc(as0.expDiv??"")}" placeholder="기본 ${P2(num(A0.divYield[cls0]))}"></div></div>
   <span class="hint">예상 수익률은 배당을 포함한 명목 연수익률입니다. 비워두면 ‘설정 → 물가와 수익률’의 자산군별 값을 씁니다.${ticker&&pxHistTxt(ticker)?` 참고(가격만, 배당 제외): ${pxHistTxt(ticker)}.`:""}</span>
   <div class="field"><label for="aStyle">보수·낙관 보정 유형 (주식·혼합)</label><select id="aStyle">${[["",`자동: ${RET_STYLE[autoStyle({ticker:ticker||"",name:w.name||""})][0]}`]].concat(Object.entries(RET_STYLE).map(([k,[l,g]])=>[k,`${l} (${g}배)`])).map(([v,l])=>`<option value="${v}"${(as0.retStyle||"")===v?" selected":""}>${esc(l)}</option>`).join("")}</select><span class="hint">설정의 보수·낙관 보정 폭에 곱하는 배율입니다. 변동성이 큰 종목일수록 크게 잡습니다.</span></div>
   ${held?`<span class="hint">보유 중: ${esc(held.accts.join(", "))} · ${nf2.format(held.qty)}주. 보유 중인 종목은 삭제할 수 없습니다.</span>`:""}
@@ -3594,7 +3598,7 @@ function wagePrevHtml(w, own) {
   const r = v => fmtA(v), mo = v => fmtM(v / 12);
   return `<b>올해 기준 ${esc(memName(own))}의 실수령 연 ${r(w.net)} (월 약 ${mo(w.net)})</b><br>
   <span class="meta">4대보험 ${r(w.ins)} (국민연금 ${r(w.np)} · 건강 ${r(w.hi)} · 장기요양 ${r(w.ltc)}${w.ei ? ` · 고용 ${r(w.ei)}` : ""}) · 근로소득세 ${r(w.it)} · 지방소득세 ${r(w.local)}<br>
-  과세표준 ${r(w.base)} (근로소득공제 ${r(w.earnedDed)} · 인적공제 ${r(w.personal)}) · 세액공제 ${r(w.ec + w.kc + w.sc)} · 한계세율 ${(w.mr * 100).toFixed(1)}%(지방세 포함) · 실효 ${(w.gross ? (w.ins + w.tax) / w.gross * 100 : 0).toFixed(1)}%</span>`;
+  과세표준 ${r(w.base)} (근로소득공제 ${r(w.earnedDed)} · 인적공제 ${r(w.personal)}) · 세액공제 ${r(w.ec + w.kc + w.sc)} · 한계세율 ${P2(w.mr * 100)}%(지방세 포함) · 실효 ${P2(w.gross ? (w.ins + w.tax) / w.gross * 100 : 0)}%</span>`;
 }
 function incomeNow(m) { const a = ageNow(m); let mo = 0, approx = false, next = null;
   for (const i of PL().incomes.filter(x => x.ownerId === m.id)) { if (i.type === "severance") continue;
@@ -3615,7 +3619,7 @@ function transferNow(m) { let inM = 0, outM = 0, approx = false;
 function scenToggle() {
   const fx = fixRet(); if (fx) return `<div class="scenrow"><button type="button" class="chip warn" data-go="settings">수익률 ${esc(planRetLabel())}</button><span class="meta">모든 계좌를 이 수익률로 계산했습니다 (설정에서 끔)</span></div>`;
   const sc = retScen(); const src = retSrc();
-  return `<div class="scenrow"><span class="label">수익률</span><div class="seg-toggle" role="group" aria-label="수익률 시나리오">${["cons", "base", "opt"].map(k => `<button type="button" data-rscen="${k}" aria-pressed="${sc.k === k}">${RET_SCEN[k][0]}</button>`).join("")}</div><span class="meta">${sc.sign ? `주식 ${sc.sign < 0 ? "−" : "+"}${sc.w}%p` : "보정 없음"}${src !== "current" ? ` · ${src === "allocAll" ? "가족 전체 배분 후" : "배분 후"}` : ""}</span></div>`;
+  return `<div class="scenrow"><span class="label">수익률</span><div class="seg-toggle" role="group" aria-label="수익률 시나리오">${["cons", "base", "opt"].map(k => `<button type="button" data-rscen="${k}" aria-pressed="${sc.k === k}">${RET_SCEN[k][0]}</button>`).join("")}</div><span class="meta">${sc.sign ? `주식 ${sc.sign < 0 ? "−" : "+"}${P2(sc.w)}%p` : "보정 없음"}${src !== "current" ? ` · ${src === "allocAll" ? "가족 전체 배분 후" : "배분 후"}` : ""}</span></div>`;
 }
 function realToggle() { return `<div class="seg-toggle" role="group" aria-label="금액 기준"><button type="button" data-real="1" aria-pressed="${S.real}">현재가치</button><button type="button" data-real="0" aria-pressed="${!S.real}">명목</button></div>`; }
 
@@ -3639,7 +3643,7 @@ function vResult() {
     <span class="total">${eok(last.netWorth * d(last))}</span>
     <div class="chips">${ok ? `<span class="chip good">✓ 계획 기간 내내 자산 유지</span>` : `<span class="chip bad">! ${sm.depletionYear}년부터 생활비 통장 마이너스</span>${(() => { const dr = sim.rows.filter(r => r.debt > 0).reduce((a, r) => !a || r.debt * d(r) > a.debt * d(a) ? r : a, null); return dr ? `<span class="chip">가장 깊을 때 ${dr.year}년 ${eok(-dr.debt * d(dr))}</span>` : ""; })()}${(() => { const q = shortMoSum(sim, r => r.overdraft); if (!q) return ""; const two = q.max.year !== q.first.year && moAmt(q.max.mo) !== moAmt(q.first.mo);
       return `<span class="chip" data-shortmo title="그해 자기 돈으로 못 대 생활비 통장을 마이너스로 쓴 돈의 월 평균 (${S.real ? "현재가치" : "명목"})">모자라는 돈 첫해 ${moAmt(q.first.mo)}${two ? ` · 가장 많을 때 ${q.max.year}년 ${moAmt(q.max.mo)}` : ""}</span>`; })()}`}
-    ${ok ? (() => { const mr = sim.rows.reduce((a, r) => r.financial * d(r) < a.financial * d(a) ? r : a); return `<span class="chip">최저 금융자산 ${mr.year}년 ${eok(mr.financial * d(mr))}</span>`; })() : ""}${minCash() ? `<button type="button" class="chip" data-go="settings">생활비 통장 최소 ${eok(minCash())} 유지</button>` : ""}<button type="button" class="chip" data-go="settings" title="물가·수익률·세금·건강보험 가정은 설정에서 바꿉니다">물가 연 ${nf2.format(AS().inflation)}% · 가정은 설정</button></div>
+    ${ok ? (() => { const mr = sim.rows.reduce((a, r) => r.financial * d(r) < a.financial * d(a) ? r : a); return `<span class="chip">최저 금융자산 ${mr.year}년 ${eok(mr.financial * d(mr))}</span>`; })() : ""}${minCash() ? `<button type="button" class="chip" data-go="settings">생활비 통장 최소 ${eok(minCash())} 유지</button>` : ""}<button type="button" class="chip" data-go="settings" title="물가·수익률·세금·건강보험 가정은 설정에서 바꿉니다">물가 연 ${P2(num(AS().inflation))}% · 가정은 설정</button></div>
     ${(() => { const memL = gm.reduce((s2, m) => s2 + livingNow(m), 0); const hhL = (sim.groupKey || "main") === "main" ? hhLivingNow() : 0; if (!(memL + hhL > 0)) return "";
       return `<div class="kv kv1 livcell"><div><span>지금 월 생활비 합계 · 오늘 물가 기준</span><b>월 ${fmtM(memL + hhL)}</b><small>${gm.filter(m => livingNow(m) > 0).map(m => `${esc(m.name)} ${fmtM(livingNow(m))}`).join(" · ")}${hhL > 0 ? `${memL > 0 ? " · " : ""}가구 공통 ${fmtM(hhL)}` : ""}</small></div></div>`; })()}
     <span class="meta">계획 기간 세금 ${eok(sim.rows.reduce((s2, r) => s2 + (r.tax - (r.credits || 0)) * d(r), 0))} (세액공제 차감 후, 배당 원천징수 포함) · 건강보험료 ${eok(sim.rows.reduce((s2, r) => s2 + r.health * d(r), 0))} · ${S.real ? "현재가치" : "명목"} 합계</span>
@@ -3725,7 +3729,7 @@ function fitApply(mid, pc) {
   const A0 = livingNow(m);
   p.expenses.forEach(e => { if (e.memberId === mid) e.monthly = fitRound(num(e.monthly) * pc / 100); });
   S.fitUndo = { mid, before, pc };
-  savePlan(`${m.name} 생활비를 ${pc}%로 바꿨습니다${A0 > 0 ? ` (월 ${fmtM(A0)} → 월 ${fmtM(livingNow(m))})` : ""}`);
+  savePlan(`${m.name} 생활비를 ${P2(pc)}%로 바꿨습니다${A0 > 0 ? ` (월 ${fmtM(A0)} → 월 ${fmtM(livingNow(m))})` : ""}`);
 }
 function fitUndo(mid) {
   const u = S.fitUndo; if (!u || u.mid !== mid) return; const p = PL();
@@ -3735,11 +3739,11 @@ function fitUndo(mid) {
 function fitBox(sim, m) {
   const y = memShortYear(sim, m.id); const nm = esc(m.name); const st = fitLiving(m.id);
   const A = livingNow(m); const amt = pc => fmtM(fitRound(A * pc / 100));
-  const undo = S.fitUndo && S.fitUndo.mid === m.id ? `<button type="button" class="linkbtn" data-fitundo="${esc(m.id)}">방금 바꾼 생활비 되돌리기 (${S.fitUndo.pc}%로 바꾸기 전)</button>` : "";
+  const undo = S.fitUndo && S.fitUndo.mid === m.id ? `<button type="button" class="linkbtn" data-fitundo="${esc(m.id)}">방금 바꾼 생활비 되돌리기 (${P2(S.fitUndo.pc)}%로 바꾸기 전)</button>` : "";
   const other = "목돈 지출, 가계 공통비, 가족 간 이체, 계좌 인출 계획을 확인하세요.";
   const note = `<span class="meta">${nm}의 모든 생활비 구간을 같은 비율로 바꿔 다시 계산한 값입니다(오늘 물가 기준). 목돈 지출·가계 공통비·이체는 그대로 둡니다.</span>`;
   const ap = fitApplyPc(st);
-  const btn = (label, pc) => `<div class="btns fitbtns"><button type="button" class="btn small primary" data-fitapply="${esc(m.id)}" data-pc="${pc}">${label} · ${pc}%${A > 0 ? ` (월 ${amt(pc)})` : ""}</button>${undo}</div>`;
+  const btn = (label, pc) => `<div class="btns fitbtns"><button type="button" class="btn small primary" data-fitapply="${esc(m.id)}" data-pc="${pc}">${label} · ${P2(pc)}%${A > 0 ? ` (월 ${amt(pc)})` : ""}</button>${undo}</div>`;
   const box = (cls, body, busy) => `<div class="fitbox${cls}" data-fit="${esc(m.id)}"${busy ? ` aria-busy="true"` : ""}>${body}</div>`;
   if (y == null) {   // 남는 경우: 얼마나 늘릴 수 있는지
     if (!st || st.none) return undo ? box(" ok", undo) : "";
@@ -3747,7 +3751,7 @@ function fitBox(sim, m) {
     if (st.err) return box(" ok", `${head}생활비를 얼마나 늘릴 수 있는지 계산하지 못했습니다: ${esc(st.err)}.${undo ? " " + undo : ""}`);
     if (st.busy) return box(" ok", `${head}생활비를 얼마나 늘릴 수 있는지 계산하는 중…`, true);
     if (st.pc <= 100) return box(" ok", `${head}생활비를 1%도 더 늘릴 여유는 없습니다. ${undo}`);
-    const up = `생활비를 지금 계획의 최대 <b>${st.cap ? `${FIT_CAP}% 넘게` : `${st.pc}%`}</b>까지 늘릴 수 있습니다${A > 0 ? ` (지금 월 ${fmtM(A)} → ${st.cap ? "" : "최대 "}<b>월 ${fmtM(A * st.pc / 100)}</b>${st.cap ? " 넘게" : ""})` : ""}. `;
+    const up = `생활비를 지금 계획의 최대 <b>${st.cap ? `${P2(FIT_CAP)}% 넘게` : `${P2(st.pc)}%`}</b>까지 늘릴 수 있습니다${A > 0 ? ` (지금 월 ${fmtM(A)} → ${st.cap ? "" : "최대 "}<b>월 ${fmtM(A * st.pc / 100)}</b>${st.cap ? " 넘게" : ""})` : ""}. `;
     return box(" ok", head + up + note + (ap > 100 ? btn("적정 생활비로 늘리기", ap) + `<span class="meta">늘릴 수 있는 폭의 80%만 늘립니다(여유 20% 남김).</span>` : `<span class="meta"> 늘릴 수 있는 폭이 작아 그대로 두기를 권합니다.</span>${undo}`));
   }
   const head = `<b>${y}년부터 ${nm}의 돈이 모자랍니다</b>(생활비 통장 마이너스). ${shortMoTxt(sim, r => r.ages[m.id] != null ? ((r.byPerson || {})[m.id] || {}).overdraft : 0)}`;
@@ -3757,7 +3761,7 @@ function fitBox(sim, m) {
   else if (st.none) body = `${nm}의 생활비가 계획에 없어 생활비로는 조절할 수 없습니다. ${other}${undo}`;
   else if (st.zero) body = `${nm}의 생활비를 0으로 줄여도 모자랍니다. ${other}${undo}`;
   else if (st.pc === 0) body = `${nm}의 생활비를 0으로 줄여야 계획 끝까지 모자라지 않습니다. ${other}${undo}`;
-  else body = `생활비를 지금 계획의 <b>${st.pc}%</b>로 줄이면${A > 0 ? ` (지금 월 ${fmtM(A)} → <b>월 ${amt(st.pc)}</b>)` : ""} 계획 끝까지 모자라지 않습니다. ${note}${btn("적정 생활비로 줄이기", st.pc)}`;
+  else body = `생활비를 지금 계획의 <b>${P2(st.pc)}%</b>로 줄이면${A > 0 ? ` (지금 월 ${fmtM(A)} → <b>월 ${amt(st.pc)}</b>)` : ""} 계획 끝까지 모자라지 않습니다. ${note}${btn("적정 생활비로 줄이기", st.pc)}`;
   return box("", head + body);
 }
 function vMemberResult(sim, id) {
@@ -3839,9 +3843,8 @@ function flowTable(rows, cols, d, ageFn, opts = {}) {
     if (c.pct) return `<td${cl}>${pctTxt(c.get(r))}</td>`; const v = c.get(r) * k; return `<td${cl}>${c.bold ? `<b>${sh(v)}</b>` : sh(v)}</td>`; }).join("")).join("")}</tr>`; }).join("");
   return `<div class="tbl-wrap"><table class="tbl ft"><thead>${head1}${head2}</thead><tbody>${body}</tbody></table></div>${flowToggle(allRows.length)}`;
 }
-// 인출률 표시: 표와 연도 상세가 같은 규칙 (소수 첫째 자리, 0이면 –)
-function pctTxt(v) { if (v == null || !isFinite(v)) return "–"; const r1 = Math.round(v * 1000) / 10, r2 = Math.round(v * 10000) / 100;   // 0.1% 미만은 소수 둘째 자리까지
-  return r1 > 0 ? `${r1.toLocaleString("ko-KR")}%` : r2 > 0 ? `${r2.toLocaleString("ko-KR")}%` : "–"; }
+// 인출률 표시: 표와 연도 상세가 같은 규칙 (소수 둘째 자리, 0이면 –)
+function pctTxt(v) { if (v == null || !isFinite(v)) return "–"; return Math.round(v * 10000) > 0 ? pctF(v) : "–"; }
 const CAT_KEYS = [["pension", "연금계좌", "--c1"], ["isa", "ISA", "--c2"], ["general", "일반·생활비", "--c3"], ["house", "주택 순가치", "--c4"]];
 
 function axLbl(v, step) { const div = unitCfg().u === "eok" ? 1e8 : 1e4; const st = step / div; const dd = st >= 1 ? 0 : Math.min(4, Math.ceil(-Math.log10(st) - 1e-9)); return (v / div).toLocaleString("ko-KR", { minimumFractionDigits: dd, maximumFractionDigits: dd }); }
@@ -3890,25 +3893,25 @@ function drawChart() {
 }
 function niceStep(raw) { if (raw <= 0) return 1e8; const p = Math.pow(10, Math.floor(Math.log10(raw))); const f = raw / p; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p; }
 
-const pctS = x => `${(Math.round(x * 10000) / 100).toLocaleString("ko-KR")}%`;
+const pctS = x => pctF(x);
 function rateInfo(id) {
   const as = AS(); const ap = PL().accountPlans[id] || {};
   const fx = fixRet(); if (fx) return `설정에서 모든 계좌 수익률을 연 ${expTxt(fx.r)}(배당·분배 ${expTxt(fx.dy)})로 고정했습니다(검증용).`;
   const adjNote = v => Math.abs(v) >= 0.005 ? ` 여기에 수익률 보정(${esc(retScen().name)}) ${adjTxt(v)}를 더했습니다(설정).` : "";
-  if (String(id).startsWith("__cash")) return `‘현금성’ 자산 가정 ${num(as.returns["현금성"])}% (가정 탭)`;
+  if (String(id).startsWith("__cash")) return `‘현금성’ 자산 가정 ${P2(num(as.returns["현금성"]))}% (가정 탭)`;
   const fut = PL().futureAccounts.find(x => x.id === id);
-  if (fut) { const c = fut.assetClass || "혼합"; return `개설 예정 계좌: 주로 담을 자산 ‘${esc(c)}’ 가정 ${num(as.returns[c])}% (가정 탭).${adjNote(retAdj(c))}`; }
+  if (fut) { const c = fut.assetClass || "혼합"; return `개설 예정 계좌: 주로 담을 자산 ‘${esc(c)}’ 가정 ${P2(num(as.returns[c]))}% (가정 탭).${adjNote(retAdj(c))}`; }
   const a = S.accounts[id]; if (!a) return "";
   const al = allocAcctExp(a, retSrc());
-  if (al) { const top = al.parts.slice(0, 4).map(q => `${esc(q.n)} ${expTxt(q.r)}×비중 ${Math.round(q.w * 100)}%`).join(" + ");
-    return `${has(ap.returnOverride) ? `계좌 계획에서 직접 넣은 수익률 ${num(ap.returnOverride)}%.` : `배분 탭 제안(${al.scope === "__all" ? "가족 전체" : esc(memName(al.scope))})대로 사고판 뒤의 비중으로 가중평균: ${top}${al.parts.length > 4 ? ` 외 ${al.parts.length - 4}개` : ""} = ${expTxt(al.auto)}.`}${adjNote(al.adj)} 설정에서 ‘배분 후’ 기준을 골랐습니다.`; }
+  if (al) { const top = al.parts.slice(0, 4).map(q => `${esc(q.n)} ${expTxt(q.r)}×비중 ${P2(q.w * 100)}%`).join(" + ");
+    return `${has(ap.returnOverride) ? `계좌 계획에서 직접 넣은 수익률 ${P2(num(ap.returnOverride))}%.` : `배분 탭 제안(${al.scope === "__all" ? "가족 전체" : esc(memName(al.scope))})대로 사고판 뒤의 비중으로 가중평균: ${top}${al.parts.length > 4 ? ` 외 ${al.parts.length - 4}개` : ""} = ${expTxt(al.auto)}.`}${adjNote(al.adj)} 설정에서 ‘배분 후’ 기준을 골랐습니다.`; }
   const ea = acctExp(a);
-  if (has(ap.returnOverride)) return `계좌 계획에서 직접 넣은 수익률 ${num(ap.returnOverride)}%.${adjNote(ea.adj)}`;
-  const st = acctStats(a); const tot = st.total; if (!(tot > 0)) { const dc = a.type === "생활비" ? "현금성" : "혼합"; return `‘${dc}’ 가정 ${num(as.returns[dc])}%.${adjNote(ea.adj)}`; }
+  if (has(ap.returnOverride)) return `계좌 계획에서 직접 넣은 수익률 ${P2(num(ap.returnOverride))}%.${adjNote(ea.adj)}`;
+  const st = acctStats(a); const tot = st.total; if (!(tot > 0)) { const dc = a.type === "생활비" ? "현금성" : "혼합"; return `‘${dc}’ 가정 ${P2(num(as.returns[dc]))}%.${adjNote(ea.adj)}`; }
   const parts = st.hs.map(h => { const e = expOf(h.ticker, h.assetClass, h); return { n: h.name || h.ticker, w: hVal(h) / tot, r: e.r, auto: e.autoR, cls: h.assetClass || "기타" }; });
   if (st.cash > 0) parts.push({ n: a.type === "생활비" ? "현금" : "예수금", w: st.cash / tot, r: num(as.returns["현금성"]), auto: true, cls: "현금성" });
   parts.sort((x, y) => y.w - x.w);
-  const top = parts.slice(0, 4).map(q => `${esc(q.n)} ${num(q.r)}%${q.auto ? `(‘${esc(q.cls)}’ 가정)` : ""}×비중 ${Math.round(q.w * 100)}%`).join(" + ");
+  const top = parts.slice(0, 4).map(q => `${esc(q.n)} ${P2(num(q.r))}%${q.auto ? `(‘${esc(q.cls)}’ 가정)` : ""}×비중 ${P2(q.w * 100)}%`).join(" + ");
   return `지금 보유 비중으로 가중평균: ${top}${parts.length > 4 ? ` 외 ${parts.length - 4}개` : ""} = ${expTxt(ea.auto)}.${adjNote(ea.adj)} 종목별 수익률은 ‘관심’ 메뉴, 자산군 가정은 가정 탭에서 바꿉니다.`;
 }
 function acctFlowHtml(a, x, f, sim, k) {
@@ -3926,7 +3929,7 @@ function acctFlowHtml(a, x, f, sim, k) {
     b += kv(`운용수익 <span class="meta">평균 잔액 ${f(x.avg)} × 연 ${pctS(x.r)}${mo(x.pr)}</span>`, sg(x.growth));
     b += `<span class="hint acf-h">가정: ${rateInfo(a.id)} 연초에 옮겨 온 돈은 1년 내내, 연중에 넣고 뺀 돈은 반년만 굴린 것으로 봅니다.</span>`;
   }
-  if (big(x.odInt)) b += kv(`마이너스 이자 <span class="meta">연 ${num(AS().overdraftRate)}%</span>`, sg(x.odInt));
+  if (big(x.odInt)) b += kv(`마이너스 이자 <span class="meta">연 ${P2(num(AS().overdraftRate))}%</span>`, sg(x.odInt));
   if (!pen && !isa && big(x.divTax)) b += kv(`배당·이자 원천징수 <span class="meta">${cash ? "이자" : "배당"} ${f(x.div)}(연 ${pctS(x.dy)}) × 15.4%</span>`, sg(-x.divTax));
   if (pen && big(x.growth)) b += `<span class="hint acf-h">연금계좌 안의 배당·매매차익은 세금 없이 굴러가고, 꺼낼 때 연금소득세 등으로 과세합니다.</span>`;
   if (isa && big(x.growth)) b += `<span class="hint acf-h">ISA 안의 수익은 세금 없이 굴러가고, 해지하거나 꺼낼 때 비과세 한도를 넘는 부분만 9.9%로 과세합니다.</span>`;
@@ -4063,12 +4066,12 @@ const INC_T = { salary: "근로소득", npension: "국민연금", basic: "기초
 function vIncome() {
   const pmid = S.planMember; const its = PL().incomes.filter(i => !pmid || i.ownerId === pmid);
   const desc = i => { const o = esc(memName(i.ownerId));
-    if (i.type === "salary") return `${o} · ${num(i.fromAge) ? i.fromAge + "~" : "지금~"}${i.toAge}세 · 연 ${eok(i.amount)} (${i.gross ? `세전 → 올해 실수령 약 ${eok(wageNow(i.ownerId).net)}` : "세후"}) · 매년 ${num(i.growth)}% 인상`;
-    if (i.type === "basic") return `${o} · ${i.fromAge}~${has(i.toAge) ? i.toAge + "세" : "계획 끝까지"} · 월 ${fmtM(i.amount)} (현재가치) · ${has(i.indexRate) ? `매년 ${num(i.indexRate)}% 인상` : "물가만큼 인상"}`;
-    if (i.type === "npension") return `${o} · ${i.fromAge}세부터 월 ${fmtM(i.amount)} (현재가치) · ${has(i.indexRate) ? `매년 ${num(i.indexRate)}% 인상` : "물가만큼 인상"}`;
+    if (i.type === "salary") return `${o} · ${num(i.fromAge) ? i.fromAge + "~" : "지금~"}${i.toAge}세 · 연 ${eok(i.amount)} (${i.gross ? `세전 → 올해 실수령 약 ${eok(wageNow(i.ownerId).net)}` : "세후"}) · 매년 ${P2(num(i.growth))}% 인상`;
+    if (i.type === "basic") return `${o} · ${i.fromAge}~${has(i.toAge) ? i.toAge + "세" : "계획 끝까지"} · 월 ${fmtM(i.amount)} (현재가치) · ${has(i.indexRate) ? `매년 ${P2(num(i.indexRate))}% 인상` : "물가만큼 인상"}`;
+    if (i.type === "npension") return `${o} · ${i.fromAge}세부터 월 ${fmtM(i.amount)} (현재가치) · ${has(i.indexRate) ? `매년 ${P2(num(i.indexRate))}% 인상` : "물가만큼 인상"}`;
     if (i.type === "severance") return `${o} · ${i.fromAge}세에 ${eok(i.amount)} → ${esc(acctName(i.destAccountId) || "현금")}`;
     const wr = i.wage ? wageItemRatio(i.id) : null;
-    return `${o} · ${i.fromAge}~${i.toAge ?? "계획 끝"}세 · 연 ${eok(i.amount)} (${i.wage ? `세전 근로소득${wr ? ` → ${wr.age}세에 실수령 약 ${eok(num(i.amount) * wr.r)} (세금·보험 ${Math.round((1 - wr.r) * 100)}%)` : ""}` : "세후"})`; };
+    return `${o} · ${i.fromAge}~${i.toAge ?? "계획 끝"}세 · 연 ${eok(i.amount)} (${i.wage ? `세전 근로소득${wr ? ` → ${wr.age}세에 실수령 약 ${eok(num(i.amount) * wr.r)} (세금·보험 ${P2((1 - wr.r) * 100)}%)` : ""}` : "세후"})`; };
   return `<div class="row"><h2>${pmid ? esc(memName(pmid)) + " " : ""}수입 ${its.length}건</h2></div>
   <div class="btns">${Object.entries(INC_T).map(([k, l]) => `<button class="btn small" data-addinc="${k}">+ ${l}</button>`).join("")}</div>
   <section class="card"><div class="list">${its.length ? its.map(i => `<button class="item" data-inc="${esc(i.id)}"><div class="row"><div class="l"><span class="name">${esc(i.name || INC_T[i.type])}</span><span class="meta">${desc(i)}</span></div><span class="chip">${INC_T[i.type]}</span></div></button>`).join("") : `<div class="empty">등록된 수입이 없습니다.</div>`}</div></section>
@@ -4087,9 +4090,9 @@ function incomeSheet(i, type) {
       <div class="grid2">${fld("기타 소득공제 (만원)", "iDed", i.otherDed ? man(i.otherDed) : "", { type: "num", ph: "0", hint: "신용카드 등·주택자금·청약 등" })}${fld("특별세액공제 등 (만원)", "iCr", i.otherCredit ? man(i.otherCredit) : "", { type: "num", ph: "표준 13", hint: "보험료·의료비·교육비·기부금 세액공제 합계" })}</div>
       <div class="fitbox ok" id="iWagePrev"></div></div>
     <div class="grid2">${fld("시작 나이", "iFrom", i.fromAge || "", { type: "num", ph: "지금부터" })}${fld("은퇴 나이 (이 나이까지 근무)", "iTo", i.toAge, { type: "num", ph: "예: 60" })}</div>`;
-  else if (t === "basic") f += `<div class="grid2">${fld("월 수령액 (만원, 현재가치)", "iAmt", man(i.amount), { type: "num", hint: "2026년 단독가구 최대 월 34.97만원, 부부는 각 20% 감액" })}${fld("연 인상률 (%)", "iIdx", i.indexRate ?? "", { type: "num", ph: `물가 ${num(AS().inflation)}` })}</div><div class="grid2">${fld("받기 시작하는 나이", "iFrom", i.fromAge ?? 65, { type: "num" })}${fld("끝 나이", "iTo", i.toAge ?? "", { type: "num", ph: "계획 끝까지", hint: "제도가 바뀌거나 소득·재산 기준을 넘을 것 같으면 이 나이 뒤로 빠집니다" })}</div><span class="hint">기초연금은 비과세이고 건강보험료 소득에도 들어가지 않습니다.</span>`;
+  else if (t === "basic") f += `<div class="grid2">${fld("월 수령액 (만원, 현재가치)", "iAmt", man(i.amount), { type: "num", hint: "2026년 단독가구 최대 월 34.97만원, 부부는 각 20% 감액" })}${fld("연 인상률 (%)", "iIdx", i.indexRate ?? "", { type: "num", ph: `물가 ${P2(num(AS().inflation))}` })}</div><div class="grid2">${fld("받기 시작하는 나이", "iFrom", i.fromAge ?? 65, { type: "num" })}${fld("끝 나이", "iTo", i.toAge ?? "", { type: "num", ph: "계획 끝까지", hint: "제도가 바뀌거나 소득·재산 기준을 넘을 것 같으면 이 나이 뒤로 빠집니다" })}</div><span class="hint">기초연금은 비과세이고 건강보험료 소득에도 들어가지 않습니다.</span>`;
   else if (t === "npension") f += `<div class="grid2">${fld("월 수령액 (만원, 현재가치)", "iAmt", man(i.amount), { type: "num", hint: "국민연금공단 예상연금 조회액. 기초연금은 따로 넣으세요" })}${fld("수령 시작 나이", "iFrom", i.fromAge, { type: "num" })}</div>
-  ${fld("연금액 연 인상률 (%)", "iIdx", i.indexRate ?? "", { type: "num", ph: `물가 ${num(AS().inflation)} 따라감`, hint: "국민연금은 매년 전년도 물가만큼 오릅니다(2026년 2.1%). 보수적으로 보려면 물가보다 낮게 넣으세요. 0이면 금액이 그대로입니다" })}`;
+  ${fld("연금액 연 인상률 (%)", "iIdx", i.indexRate ?? "", { type: "num", ph: `물가 ${P2(num(AS().inflation))} 따라감`, hint: "국민연금은 매년 전년도 물가만큼 오릅니다(2026년 2.1%). 보수적으로 보려면 물가보다 낮게 넣으세요. 0이면 금액이 그대로입니다" })}`;
   else if (t === "severance") f += `<div class="grid2">${fld("퇴직금 (만원, 현재가치)", "iAmt", man(i.amount), { type: "num" })}${fld("받는 나이", "iFrom", i.fromAge, { type: "num" })}</div><div class="grid2">${fld("퇴직소득세 실효세율 (%)", "iRt", i.retTaxRate ?? 5, { type: "num", hint: "IRP로 받으면 이 세금이 연금 수령 때로 미뤄지고 30~50% 줄어듭니다" })}${fld("입금 계좌", "iDest", i.destAccountId || "", { type: "select", options: [["", "현금으로 수령"]].concat(pens.map(a => [a.id, a.name])) })}</div>`;
   else f += `${fld("이름", "iName", i.name, { ph: "예: 임대 수입, LTI" })}
     ${fld("세금", "iWage", i.wage ? "wage" : "", { type: "select", options: [["", "세후 금액 (그대로 받음)"], ["wage", "세전 근로소득 (성과급·LTI·RSU 등)"]] })}
@@ -4259,7 +4262,7 @@ function acctPlanSheet(id) {
   const owner = acctOwner(id); const om = mem(owner);
   if (t === "생활비") {
     openSheet(`<h3>${esc(a.name)}</h3><span class="meta">생활비 계좌${fut ? " · 개설 예정" : ` · 현재 ${eok(a.balance)}`}</span>
-    <div class="grid2">${fld("명의자", "aOwner", owner, { type: "select", options: memberOpts() })}${fld("예상 수익률 (%)", "aRet", ap.returnOverride ?? "", { type: "num", ph: `자동 ${(a.r * 100).toFixed(1)}`, hint: "이자는 금융소득(15.4%)으로 과세" })}</div>
+    <div class="grid2">${fld("명의자", "aOwner", owner, { type: "select", options: memberOpts() })}${fld("예상 수익률 (%)", "aRet", ap.returnOverride ?? "", { type: "num", ph: `자동 ${P2(a.r * 100)}`, hint: "이자는 금융소득(15.4%)으로 과세" })}</div>
     <span class="hint">생활비 계좌는 명의자의 현금 지갑입니다. 명의자의 급여·연금·받은 이체가 들어오고 생활비·세금·보낸 이체가 나갑니다. 돈이 모자라면 가장 먼저 여기서 꺼내고, 남는 돈은 ‘남는 돈을 쌓을 순서’에 넣은 계좌를 채운 뒤 여기에 쌓입니다. 그래서 납입·수령 계획은 따로 세우지 않습니다.</span>
     ${fut ? sheetBtns(false) : sheetBtns(true)}`, bg => wireSheet(bg, () => {
       const o = { ...ap, ownerId: gv(bg, "aOwner"), returnOverride: gn(bg, "aRet") };
@@ -4273,7 +4276,7 @@ function acctPlanSheet(id) {
   const wCols = [{ k: "fromAge", label: "시작 나이", req: true }, { k: "toAge", label: "끝 나이", ph: "계속" }, { k: "mode", label: "방식", type: "select", options: pen ? WD_MODES : WD_MODES.filter(m => m[0] !== "limit"), w: 1.4 }, { k: "val", label: "금액(만원)/%", get: r => r.mode === "pct" ? r.pct : man(r.amount), w: 1.2 }, { k: "inflate", label: "물가 반영", type: "check", get: r => r.inflate !== false }];
   let f = "";
   if (fut) f += `<div class="grid2">${fld("계좌 이름", "fName", fut.name)}${fld("유형", "fType", fut.type, { type: "select", options: ACCOUNT_TYPES })}</div><div class="grid2">${fld("개설 연도", "fOpen", fut.openYear, { type: "num" })}${fld("주로 담을 자산", "fClass", fut.assetClass || "혼합", { type: "select", options: CLASSES })}</div>`;
-  f += `<div class="grid2">${fld("명의자", "aOwner", owner, { type: "select", options: memberOpts() })}${fld("예상 수익률 (%)", "aRet", ap.returnOverride ?? "", { type: "num", ph: `자동 ${(a.r * 100).toFixed(1)}`, hint: "비우면 보유 종목의 자산군별 가정으로 계산" })}</div>`;
+  f += `<div class="grid2">${fld("명의자", "aOwner", owner, { type: "select", options: memberOpts() })}${fld("예상 수익률 (%)", "aRet", ap.returnOverride ?? "", { type: "num", ph: `자동 ${P2(a.r * 100)}`, hint: "비우면 보유 종목의 자산군별 가정으로 계산" })}</div>`;
   if (t.startsWith("일반") || t === "기타") f += `${fld("매매차익 과세", "aTax", ap.taxKind || autoTaxKind(S.accounts[id]) || (t === "일반(해외)" ? "foreign" : "dividend"), { type: "select", options: TAXKIND, hint: ap.taxKind ? "직접 고른 값" : "보유 종목으로 자동 판단한 값입니다. 다르면 바꾸세요" })}${fld("배당수익률 (%)", "aDiv", ap.divOverride ?? "", { type: "num", ph: `자동 ${(a.dy * 100).toFixed(1)}` })}`;
   if (pen) f += `<div class="grid2">${fld("가입 연도", "aJoin", ap.joinYear ?? "", { type: "num", hint: "가입 5년이 지나야 연금으로 받을 수 있습니다" })}${fld("이미 연금 수령 중이면 개시 연도", "aFirst", ap.firstWdYear ?? "", { type: "num" })}</div>
     <div class="grid2">${fld("세액공제 안 받은 원금 (만원)", "aFree", man(ap.freeBasis), { type: "num", hint: "꺼낼 때 세금이 없습니다" })}${fld("이연퇴직소득 (만원)", "aRetB", man(ap.retBasis), { type: "num" })}</div>
@@ -4322,14 +4325,14 @@ function futureSheet() {
 function vHouse() {
   const p = PL();
   return `<div class="row"><h2>주택 ${p.properties.length}건</h2><button class="btn small primary" id="addProp">주택 추가</button></div>
-  <section class="card"><div class="list">${p.properties.length ? p.properties.map(x => `<button class="item" data-prop="${esc(x.id)}"><div class="row"><div class="l"><span class="name">${esc(x.name)}</span><span class="meta">${has(x.buyYear) ? `${x.buyYear}년 매입 예정` : "보유 중"}${has(x.sellYear) ? ` · ${x.sellYear}년 매각` : ""} · 연 ${has(x.growth) ? x.growth : num(AS().inflation)}% 상승</span></div><b>${eok(x.value)}</b></div></button>`).join("") : `<div class="empty">주택을 넣으면 순자산과 은퇴 후 건강보험료(재산 점수)에 반영됩니다.</div>`}</div></section>
+  <section class="card"><div class="list">${p.properties.length ? p.properties.map(x => `<button class="item" data-prop="${esc(x.id)}"><div class="row"><div class="l"><span class="name">${esc(x.name)}</span><span class="meta">${has(x.buyYear) ? `${x.buyYear}년 매입 예정` : "보유 중"}${has(x.sellYear) ? ` · ${x.sellYear}년 매각` : ""} · 연 ${P2(has(x.growth) ? num(x.growth) : num(AS().inflation))}% 상승</span></div><b>${eok(x.value)}</b></div></button>`).join("") : `<div class="empty">주택을 넣으면 순자산과 은퇴 후 건강보험료(재산 점수)에 반영됩니다.</div>`}</div></section>
   <div class="row"><h2>대출 ${p.loans.length}건</h2><button class="btn small primary" id="addLoan">대출 추가</button></div>
-  <section class="card"><div class="list">${p.loans.length ? p.loans.map(l => `<button class="item" data-loan="${esc(l.id)}"><div class="row"><div class="l"><span class="name">${esc(l.name)}</span><span class="meta">금리 ${num(l.rate)}% · ${l.endYear}년 만기 · 원리금 균등</span></div><b>${eok(l.balance)}</b></div></button>`).join("") : `<div class="empty">대출이 없으면 비워두세요.</div>`}</div></section>`;
+  <section class="card"><div class="list">${p.loans.length ? p.loans.map(l => `<button class="item" data-loan="${esc(l.id)}"><div class="row"><div class="l"><span class="name">${esc(l.name)}</span><span class="meta">금리 ${P2(num(l.rate))}% · ${l.endYear}년 만기 · 원리금 균등</span></div><b>${eok(l.balance)}</b></div></button>`).join("") : `<div class="empty">대출이 없으면 비워두세요.</div>`}</div></section>`;
 }
 function propSheet(x) {
   const isNew = !x; x = x || {}; const accts = allPlanAccounts().filter(a => !PENSION_T.has(a.type));
   openSheet(`<h3>주택 ${isNew ? "추가" : "수정"}</h3>${fld("이름", "hName", x.name, { ph: "예: 자가 아파트" })}
-  <div class="grid2">${fld("현재 시세 (만원)", "hVal", man(x.value), { type: "num", hint: "매입 예정이면 오늘 기준 가격" })}${fld("연 상승률 (%)", "hG", x.growth ?? "", { type: "num", ph: `물가 ${num(AS().inflation)}` })}</div>
+  <div class="grid2">${fld("현재 시세 (만원)", "hVal", man(x.value), { type: "num", hint: "매입 예정이면 오늘 기준 가격" })}${fld("연 상승률 (%)", "hG", x.growth ?? "", { type: "num", ph: `물가 ${P2(num(AS().inflation))}` })}</div>
   <div class="grid2">${fld("매입 연도", "hBuy", x.buyYear ?? "", { type: "num", ph: "이미 보유" })}${fld("공시가격 / 시세 (%)", "hOff", x.officialRatio ?? "", { type: "num", ph: `${num(AS().health.officialRatio)}` })}</div>
   <h4>매각</h4><div class="grid2">${fld("매각 연도", "hSell", x.sellYear ?? "", { type: "num", ph: "매각 안 함" })}${fld("매각 비용·세금 (%)", "hCost", x.sellCostPct ?? 1, { type: "num" })}</div>
   ${fld("매각 대금 입금", "hTo", x.proceedsTo || "", { type: "select", options: [["", "현금"]].concat(accts.map(a => [a.id, a.name])) })}
@@ -4356,8 +4359,8 @@ function loanSheet(l) {
 function vAssume() {
   const a = AS(); const h = a.health;
   const rows = CLASSES.map(c => `<tr><td>${c}</td><td><input id="asR_${c}" inputmode="decimal" value="${esc(a.returns[c])}" aria-label="${c} 예상 수익률"></td><td><input id="asD_${c}" inputmode="decimal" value="${esc(a.divYield[c])}" aria-label="${c} 배당수익률"></td></tr>`).join("");
-  const tsum = `연금 세액공제 ${nf2.format(a.creditRate)}% · 사적연금 저율과세 ${fmtM(a.pensionSepLimit)} · 연금 납입한도 ${fmtM(a.pensionContribLimit)} · ISA 연 ${fmtM(a.isaAnnualLimit)}`;
-  const hsum = `요율 ${nf2.format(h.rate)}% · 장기요양 ${nf2.format(h.ltc)}%${h.currentMonthly ? ` · 지금 월 ${nf.format(h.currentMonthly)}원` : ""}${num(h.continueMonths) ? ` · 임의계속 ${h.continueMonths}개월` : ""}`;
+  const tsum = `연금 세액공제 ${P2(num(a.creditRate))}% · 사적연금 저율과세 ${fmtM(a.pensionSepLimit)} · 연금 납입한도 ${fmtM(a.pensionContribLimit)} · ISA 연 ${fmtM(a.isaAnnualLimit)}`;
+  const hsum = `요율 ${P2(num(h.rate))}% · 장기요양 ${P2(num(h.ltc))}%${h.currentMonthly ? ` · 지금 월 ${nf.format(h.currentMonthly)}원` : ""}${num(h.continueMonths) ? ` · 임의계속 ${h.continueMonths}개월` : ""}`;
   const fold = (id, open, title, sum) => `<details class="card" id="${id}"${open ? " open" : ""}><summary style="cursor:pointer"><div class="row"><h2>${title}</h2><span class="meta">${open ? "접기" : "펼치기 ›"}</span></div><span class="meta sum">${esc(sum)}</span></summary>`;
   return `<section class="card"><div class="row"><h2>물가와 수익률</h2><span class="meta">계획 가정</span></div>
   <div class="grid2">${fld("물가상승률 (%/년)", "asInf", a.inflation, { type: "num" })}${fld("기준 연도", "asBase", num((PL().assumptions || {}).baseYear) > curY() ? PL().assumptions.baseYear : "", { type: "num", ph: `${curY()} (올해)`, hint: "비워 두면 해마다 올해부터 계산합니다" })}</div>
@@ -4687,8 +4690,8 @@ function alCompute0(scope, depIn) {
     lockQ, lockVal, cellV, isFixed, fixCut, lockedK, lockTot, lockOver, irpOver, free, nb, nowTrade, heldNow, heldAfter, pr,
     lotIn, futIdeal: proj(demand).F, depMode, dep, depRatio: (pf.bySrc || {}).dep || {}, divRatio: (pf.bySrc || {}).div || {}, divTotal: pf.divTotal || 0, divMode, divOn, pool, er, rr, mode: cfg.mode === "tax" ? "tax" : "keep" };
 }
-const pct1 = v => `${(Math.round(v * 1000) / 10).toLocaleString("ko-KR")}%`;
-const pct2 = v => `${(Math.round(v * 10000) / 100).toLocaleString("ko-KR")}%`;
+const pct1 = v => pctF(v);   // 비율은 모두 소수 둘째 자리까지
+const pct2 = v => pctF(v);
 function vAlloc() {
   if (!S.planLoaded) return `<div class="card empty">계획을 불러오는 중…</div>`;
   const scopes = alScopes();
@@ -4713,13 +4716,13 @@ function vAlloc() {
    <span class="meta">배분 대상 ${esc(c.scope === "__all" ? "가족 전체" : memName(c.scope))} 명의 계좌 ${c.accts.length}개 · ${eok(c.total)} (생활비 계좌 제외)</span></details>`;
   // 목표 비중
   const addable = watchList().filter(x => !c.keys.includes(x.ticker));
-  const tgtSum = c.keys.filter(k => (c.tg[k] || 0) > 0).sort((a, b) => (c.tg[b] || 0) - (c.tg[a] || 0)).map(k => `${c.info[k].name} ${(Math.round((c.tg[k] || 0) * 100) / 100).toLocaleString("ko-KR")}%`).join(" · ");
-  h += `<details class="card" id="alTgtBox"${S.alTgtOpen ? " open" : ""}><summary style="cursor:pointer"><div class="row"><h2>목표 비중</h2><span class="meta">${S.alTgtOpen ? "접기" : "펼치기 ›"}</span></div><span class="meta sum">${esc(tgtSum || "목표 비중이 없습니다")}${Math.abs(c.tsum - 100) > 0.05 ? ` · 합계 ${(Math.round(c.tsum * 100) / 100).toLocaleString("ko-KR")}%` : ""}</span></summary>
+  const tgtSum = c.keys.filter(k => (c.tg[k] || 0) > 0).sort((a, b) => (c.tg[b] || 0) - (c.tg[a] || 0)).map(k => `${c.info[k].name} ${P2((c.tg[k] || 0))}%`).join(" · ");
+  h += `<details class="card" id="alTgtBox"${S.alTgtOpen ? " open" : ""}><summary style="cursor:pointer"><div class="row"><h2>목표 비중</h2><span class="meta">${S.alTgtOpen ? "접기" : "펼치기 ›"}</span></div><span class="meta sum">${esc(tgtSum || "목표 비중이 없습니다")}${Math.abs(c.tsum - 100) > 0.05 ? ` · 합계 ${P2(c.tsum)}%` : ""}</span></summary>
    <div class="btns"><button class="btn small" id="alReset">현재 비중으로</button></div>
    <div class="tbl-wrap" data-keep="alTgt"><table class="tbl in al"><thead><tr><th>종목</th><th>목표 (${c.year}년, %)</th><th>현재</th><th>예상 수익률</th></tr></thead><tbody>
    ${c.keys.map(k => { const i = c.info[k]; const rm = k !== AL_CASH && !((c.heldNow[k] || 0) > 0); return `<tr><td><span class="tgn">${esc(i.name)}${rm ? `<button type="button" class="rmx" data-alrm="${esc(k)}" aria-label="${esc(i.name)} 목록에서 빼기" title="목록에서 빼기">×</button>` : ""}</span><span class="meta">${esc(i.cls)}${k !== AL_CASH && (i.cls === "주식" || i.cls === "혼합") ? " · " + esc(RET_STYLE[styleOf({ ticker: k, name: i.name })][0]) : ""}${i.risky ? " · 위험자산" : ""}${c.lockedK[k] ? ` · 잠금 ${pct2(c.lockedK[k] / c.total)}` : ""}</span></td>
      <td><input data-altgt="${esc(k)}" inputmode="decimal" value="${esc(c.tg[k] || 0)}" aria-label="${esc(i.name)} 목표 비중(%)"></td><td>${pct2(c.cw[k] || 0)}</td><td>연 ${expTxt(i.r)}${c.divMode === "reinvest" ? "" : `<br><span class="meta">${c.pool ? "가격 상승" : "배당 빼면"} ${expTxt(c.er(k))}</span>`}</td></tr>`; }).join("")}
-   <tr class="tot"><td>합계</td><td><b class="${Math.abs(c.tsum - 100) > 0.05 ? "up" : ""}">${(Math.round(c.tsum * 100) / 100).toLocaleString("ko-KR")}%</b></td><td>100%</td><td></td></tr></tbody></table></div>
+   <tr class="tot"><td>합계</td><td><b class="${Math.abs(c.tsum - 100) > 0.05 ? "up" : ""}">${P2(c.tsum)}%</b></td><td>100%</td><td></td></tr></tbody></table></div>
    ${Math.abs(c.tsum - 100) > 0.05 ? `<span class="hint">합계가 100%가 아니어서 비율대로 나눠 계산했습니다.</span>` : ""}
    ${addable.length ? `<div class="btns"><select id="alAdd" aria-label="종목 추가"><option value="">종목 추가…</option>${addable.map(x => `<option value="${esc(x.ticker)}">${esc(x.name || x.ticker)}</option>`).join("")}</select></div>` : ""}
    <span class="hint">예상 수익률은 ‘관심’ 메뉴의 종목별 값(없으면 자산군 가정)에 설정의 보수·낙관 보정을 더한 값입니다. 목표 비중을 0으로 두면 그 종목은 모두 팝니다. 지금 가지고 있지 않은 종목은 이름 옆 ×로 목록에서 뺍니다(그 종목에 지정한 수량도 함께 풉니다).</span></details>`;
@@ -4734,8 +4737,8 @@ function vAlloc() {
   // 결과: 비중
   h += `<section class="card"><h2>지금 맞출 비중</h2>
    <div class="tbl-wrap" data-keep="alRes"><table class="tbl in al"><thead><tr><th>종목</th><th>${c.year}년 예상</th><th>목표</th><th>차이</th><th>현재</th><th>지금 맞출</th><th>주식 수 반영</th><th>단위</th>${c.dep.total > 0 ? "<th>입금 배분</th>" : ""}${c.divTotal > 0 ? "<th>배당 배분</th>" : ""}</tr></thead><tbody>
-   ${c.keys.map(k => { const t = c.pt.find(x => x.key === k); return `<tr><td>${esc(c.info[k].name)}</td><td><b>${pct1(c.futSum ? c.fut[k] / c.futSum : 0)}</b></td><td>${pct1(c.tsum ? c.tg[k] / c.tsum : 0)}</td><td>${(() => { const d = (c.futSum ? c.fut[k] / c.futSum : 0) - (c.tsum ? c.tg[k] / c.tsum : 0); return Math.abs(d) < 0.0005 ? "–" : `<span class="${d > 0 ? "up" : "down"}">${d > 0 ? "+" : "−"}${(Math.round(Math.abs(d) * 1000) / 10).toLocaleString("ko-KR")}%p</span>`; })()}</td><td>${pct1(c.cw[k] || 0)}</td><td>${pct1(t ? t.now : 0)}</td><td>${pct1((c.after[k] || 0) / c.total)}</td><td>${k === AL_CASH ? "" : c.info[k].price > 0 ? `${c.lots[k]}주 · ${eok(c.info[k].price * c.lots[k])}` : "–"}</td>${c.dep.total > 0 ? `<td>${(c.depRatio[k] || 0) > 0.0005 ? pct1(c.depRatio[k]) : "–"}</td>` : ""}${c.divTotal > 0 ? `<td>${(c.divRatio[k] || 0) > 0.0005 ? pct1(c.divRatio[k]) : "–"}</td>` : ""}</tr>`; }).join("")}
-   <tr class="tot"><td>차이 합계</td><td colspan="2"></td><td><b>${(Math.round(c.keys.reduce((s2, k) => s2 + Math.abs((c.futSum ? c.fut[k] / c.futSum : 0) - (c.tsum ? c.tg[k] / c.tsum : 0)), 0) * 1000) / 10).toLocaleString("ko-KR")}%p</b></td><td colspan="${4 + (c.dep.total > 0 ? 1 : 0) + (c.divTotal > 0 ? 1 : 0)}"></td></tr></tbody></table></div>
+   ${c.keys.map(k => { const t = c.pt.find(x => x.key === k); return `<tr><td>${esc(c.info[k].name)}</td><td><b>${pct1(c.futSum ? c.fut[k] / c.futSum : 0)}</b></td><td>${pct1(c.tsum ? c.tg[k] / c.tsum : 0)}</td><td>${(() => { const d = (c.futSum ? c.fut[k] / c.futSum : 0) - (c.tsum ? c.tg[k] / c.tsum : 0); return Math.abs(d) < 0.0005 ? "–" : `<span class="${d > 0 ? "up" : "down"}">${d > 0 ? "+" : "−"}${P2((Math.abs(d)) * 100)}%p</span>`; })()}</td><td>${pct1(c.cw[k] || 0)}</td><td>${pct1(t ? t.now : 0)}</td><td>${pct1((c.after[k] || 0) / c.total)}</td><td>${k === AL_CASH ? "" : c.info[k].price > 0 ? `${c.lots[k]}주 · ${eok(c.info[k].price * c.lots[k])}` : "–"}</td>${c.dep.total > 0 ? `<td>${(c.depRatio[k] || 0) > 0.0005 ? pct1(c.depRatio[k]) : "–"}</td>` : ""}${c.divTotal > 0 ? `<td>${(c.divRatio[k] || 0) > 0.0005 ? pct1(c.divRatio[k]) : "–"}</td>` : ""}</tr>`; }).join("")}
+   <tr class="tot"><td>차이 합계</td><td colspan="2"></td><td><b>${P2((c.keys.reduce((s2, k) => s2 + Math.abs((c.futSum ? c.fut[k] / c.futSum : 0) - (c.tsum ? c.tg[k] / c.tsum : 0)), 0)) * 100)}%p</b></td><td colspan="${4 + (c.dep.total > 0 ? 1 : 0) + (c.divTotal > 0 ? 1 : 0)}"></td></tr></tbody></table></div>
    <span class="hint">‘${c.year}년 예상’은 제안대로 사고판 뒤 인출·세금 없이 종목마다 ${{ reinvest: "예상 수익률(배당 재투자)로", target: "가격 상승분만큼 자라고 배당은 모아서 그때 맞출 비중대로 산다고", fill: "가격 상승분만큼 자라고 배당은 모아서 ‘배당 배분’ 비율대로 산다고", none: "가격 상승분(배당 제외)만큼" }[c.divMode]} 자란다고 본 값입니다${c.dep.total > 0 ? `. 입금 ${eok(c.dep.total)}도 넣었고, 입금은 ${c.depMode === "fill" ? "해마다 ‘입금 배분’ 비율대로" : "그때 맞출 비중대로(‘입금 배분’은 전체 평균)"} 산다고 봅니다` : ""}. 보유 주식 수는 종목마다 ‘단위’의 배수로 맞추고(${c.lot}주, ${c.lot}주 금액이 ${eok(c.lotCap)}을 넘는 종목은 1주), 그 때문에 생기는 차이(목표 연도 기준)가 가장 작도록 계좌마다 종목 수량을 고릅니다. 남는 돈은 예수금입니다.</span></section>`;
   // 경고
   const warns = [];
@@ -5116,7 +5119,7 @@ function drawTrend() {
   const vals = val.concat(...lines.map(l => l.vals.filter(v => v != null))).concat(pctMode ? [0] : []);
   let mn = Math.min(...vals), mx = Math.max(...vals); const pad = (mx - mn) * 0.1 || Math.abs(mx) * 0.02 || (pctMode ? 0.01 : 1); mn -= pad; mx += pad;
   const step = niceStep((mx - mn) / 4); mn = Math.floor(mn / step) * step; mx = Math.ceil(mx / step) * step;
-  const pl = v => { const d = step * 100 >= 1 ? 0 : 1; return `${v > 1e-12 ? "+" : ""}${(v * 100).toFixed(d)}%`; };
+  const pl = v => `${v > 1e-12 ? "+" : ""}${(Math.abs(v) < 1e-12 ? 0 : v * 100).toFixed(2)}%`;   // 비율은 소수 둘째 자리까지
   const lbl = v => pctMode ? pl(v) : axLbl(v, step);
   let L = 36; { let w = 0; for (let v = mn; v <= mx + step / 2; v += step) w = Math.max(w, lbl(v).length); L = Math.max(36, w * 7 + 12); }
   const x = t => L + (W - L - R) * (t1 > t0 ? (t - t0) / (t1 - t0) : 0.5), y = v => T + (Hh - T - B) * (1 - (v - mn) / (mx - mn));

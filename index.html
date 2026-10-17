@@ -436,6 +436,10 @@ label.btn{display:inline-flex;align-items:center}
 .wbar>span{display:block;height:100%;background:var(--accent);border-radius:3px}
 .mvrow>.row{width:100%}
 .mvb{display:flex;gap:6px;flex-shrink:0}
+.ordb{display:inline-flex;gap:4px;margin-right:6px;vertical-align:middle}.ordb .btn.small{min-height:28px;padding:2px 8px}
+textarea.alnote{display:block;width:100%;box-sizing:border-box;resize:none;overflow:hidden;font:inherit;font-size:13.5px;line-height:1.45;padding:6px 9px;margin:6px 0 2px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);min-height:0}
+textarea.alnote:placeholder-shown{border-style:dashed}
+.subnav button.hh+button:not(.hh){margin-left:10px}
 .mvb .btn{min-width:40px}
 b.accent{color:var(--accent)}
 .grp{display:flex;flex-direction:column;gap:8px}
@@ -2145,6 +2149,27 @@ const ACCT_COLORS=["#0E6655","#4E8FD6","#D2A43C","#C8625B","#7E6BC4","#5AA88F","
 
 const S={db:null,dbState:"loading",accounts:{},holdings:{},prices:{},assets:{},holdingsRaw:{},reorder:null,memberView:null,settings:{},snapshots:[],tab:"home",openAcct:null};
 try{const t=localStorage.getItem("rf.tab");if(t)S.tab=t;}catch(e){}
+/* 보기 설정: 메뉴마다 고른 보기(탭, 추이의 대상·기간·그래프·단위, 계획의 대상·화면·현재가치, 배분의 대상·펼침 등)를
+   이 기기(localStorage)와 장부(prefs/view, 동기화하지 않는 개인 설정)에 함께 남긴다. 다음에 열 때 장부 값으로 되살린다
+   (브라우저 저장소가 비워지는 환경에서도 그대로). 이번 실행에서 이미 바꾼 항목은 덮지 않는다 */
+const VIEW_KEYS=["rf.tab","rf.trr","rf.trg","rf.trm","rf.trc","rf.trshow","rf.psel","rf.pv","rf.real","rf.flowall","rf.astax","rf.ashl","rf.alsel","rf.alallow","rf.algoal","rf.altgt"];
+S.viewP={};S.viewTouched={};S.viewLoaded=false;
+for(const k of VIEW_KEYS){try{const v=localStorage.getItem(k);if(v!=null)S.viewP[k]=v;}catch(e){}}
+let vsT=null;
+function vset(k,v){v=String(v);try{localStorage.setItem(k,v);}catch(e){}if(!VIEW_KEYS.includes(k))return;if(S.viewP[k]===v&&S.viewTouched[k])return;S.viewP[k]=v;S.viewTouched[k]=1;viewSaveSoon();}
+function viewSaveSoon(){clearTimeout(vsT);vsT=setTimeout(viewSave,800);}
+function viewSave(){if(S.dbState!=="ok"||!S.dbRaw)return;try{Promise.resolve(S.dbRaw.doc("prefs/view").set({v:{...S.viewP},at:new Date().toISOString()})).catch(()=>{});}catch(e){}}
+// 장부에 남은 보기 설정을 화면 상태에 넣는다. 바뀐 게 있으면 true
+function viewApply(v){let ch=false;v=v||{};
+  for(const k of VIEW_KEYS){if(v[k]==null||S.viewTouched[k]||S.viewP[k]===String(v[k]))continue;S.viewP[k]=String(v[k]);try{localStorage.setItem(k,S.viewP[k]);}catch(e){}ch=true;}
+  if(ch)viewState();return ch;}
+function viewState(){const g=k=>S.viewP[k],on=k=>g(k)==="1";
+  if(g("rf.tab")&&document.querySelector(`nav.tabs button[data-tab="${CSS.escape(g("rf.tab"))}"]`))S.tab=g("rf.tab");
+  if(g("rf.trr"))S.trRange=g("rf.trr");if(g("rf.trg"))S.trGran=g("rf.trg");if(g("rf.trm"))S.trMem=g("rf.trm");if(g("rf.trc"))S.trChart=g("rf.trc")==="pct"?"pct":"amt";
+  if(g("rf.trshow")){try{S.trShow=JSON.parse(g("rf.trshow"))||{};}catch(e){}}
+  if(g("rf.psel")!=null)S.planSel=g("rf.psel")||null;if(g("rf.pv"))S.planView=g("rf.pv");if(g("rf.real")!=null)S.real=on("rf.real");
+  if(g("rf.flowall")!=null)S.flowAll=on("rf.flowall");if(g("rf.astax")!=null)S.asTaxOpen=on("rf.astax");if(g("rf.ashl")!=null)S.asHlOpen=on("rf.ashl");
+  if(g("rf.alsel"))S.alSel=g("rf.alsel");if(g("rf.alallow")!=null)S.alAllowOpen=on("rf.alallow");if(g("rf.algoal")!=null)S.alGoalOpen=on("rf.algoal");if(g("rf.altgt")!=null)S.alTgtOpen=on("rf.altgt");}
 
 /* ---------- formatting ---------- */
 const nf=new Intl.NumberFormat("ko-KR");
@@ -2243,7 +2268,17 @@ function acctExp(a,k){const as=AS();const st=acctStats(a);let rv=0,dv=0,av=0,tv=
   return{auto,adj,dyAuto,base:ov??auto,r:(ov??auto)+adj,dy:has(ap.divOverride)?num(ap.divOverride):dyAuto,override:ov!=null,value:st.total};}
 // 여러 계좌를 평가액으로 가중평균 (구성원·가족 전체)
 function groupExp(accts,k){let v=0,rv=0,dv=0;accts.forEach(a=>{const e=acctExp(a,k);v+=e.value;rv+=e.value*e.r;dv+=e.value*e.dy;});return v>0?{r:rv/v,dy:dv/v,value:v}:null;}
-function memberAccts(mid){return acctList().filter(a=>mid==="__all"||(mid==="__none"?!ownerOf(a):ownerOf(a)===mid));}
+function memberAccts(mid){const ids=hhIds(mid);return acctList().filter(a=>mid==="__all"||(ids?ids.includes(ownerOf(a)||"__none"):mid==="__none"?!ownerOf(a):ownerOf(a)===mid));}
+// 가계: 본인과 ‘우리 가계’ 구성원(명의자 미지정 포함)은 main, 별도 가계로 정한 구성원은 그 가계. 키는 "hh:main"·"hh:parents" 등
+function hhOf(m){return m&&m.relation!=="본인"&&m.household&&m.household!=="main"?m.household:"main";}
+function hhIds(k){if(!k||!String(k).startsWith("hh:"))return null;const h=String(k).slice(3);const ms=(S.plan&&S.plan.members)||[];
+  const ids=ms.filter(m=>hhOf(m)===h).map(m=>m.id);if(h==="main")ids.push("__none");return ids;}
+const HH_NAMES={main:"우리 가계",parents:"부모님 가계",child:"자녀 가계",other:"기타 가계"};
+// 가계가 둘 이상일 때만 고를 수 있게: [["hh:main","우리 가계"],…]
+function hhList(){const ms=(S.plan&&S.plan.members)||[];const ks=[...new Set(ms.map(hhOf))];if(ks.length<2)return [];
+  return ["main","parents","child","other"].filter(k=>ks.includes(k)).map(k=>["hh:"+k,HH_NAMES[k]]);}
+// 기록 하나에서 여러 구성원 값을 더한다 (byMember·byMemberCost·byMemberCash·byMemberFlow)
+function hhSum(o,ids){if(!o)return 0;let v=0;for(const id of ids)v+=+o[id]||0;return v;}
 function memberExp(mid,k){return groupExp(memberAccts(mid),k);}
 function acctStats(a){return {...memo("st:"+a.id+":"+num(a.cash),()=>{const hs=acctHoldings(a.id);let v=0,c=0,risky=0;
   hs.forEach(h=>{const x=hVal(h);v+=x;c+=hCost(h);if(h.risky)risky+=x;});
@@ -2294,8 +2329,11 @@ function expOver(e,days){return Math.pow(1+e/100,days/365)-1;}
 // 수익률 비교에 쓸 기록: k = "__all"(가족 전체) 또는 구성원 id. live면 오늘 값(지금 장부)을 마지막 기록으로 쓴다
 // 기록마다 넣거나 뺀 돈: 가족 전체는 flow, 구성원은 byMemberFlow (복원한 기록 등에만 있다). 평가액이 0인 기록도 넘겨 그날 flow를 잇는다
 function retPts(k,live){const all=(S.snapshots||[]).filter(x=>x&&x.date);
-  let pts=k==="__all"?all.map(x=>({date:x.date,total:x.total,cost:x.cost,flow:x.flow})):all.map(x=>({date:x.date,total:(x.byMember&&x.byMemberCost&&x.byMember[k])||0,cost:(x.byMember&&x.byMemberCost&&x.byMemberCost[k])||0,flow:x.byMemberFlow?(+x.byMemberFlow[k]||0):undefined}));
-  if(live&&!needsFx()){const d=memo("snapNow",()=>snapDoc(false));const v=k==="__all"?{total:d.total,cost:d.cost,flow:d.flow}:{total:(d.byMember||{})[k],cost:(d.byMemberCost||{})[k],flow:d.byMemberFlow?(+d.byMemberFlow[k]||0):undefined};
+  const ids=hhIds(k);   // 가계: 그 가계 구성원 값을 더한다
+  const one=x=>ids?{total:x.byMember&&x.byMemberCost?hhSum(x.byMember,ids):0,cost:x.byMember&&x.byMemberCost?hhSum(x.byMemberCost,ids):0,flow:x.byMemberFlow?hhSum(x.byMemberFlow,ids):undefined}
+    :{total:(x.byMember&&x.byMemberCost&&x.byMember[k])||0,cost:(x.byMember&&x.byMemberCost&&x.byMemberCost[k])||0,flow:x.byMemberFlow?(+x.byMemberFlow[k]||0):undefined};
+  let pts=k==="__all"?all.map(x=>({date:x.date,total:x.total,cost:x.cost,flow:x.flow})):all.map(x=>({date:x.date,...one(x)}));
+  if(live&&!needsFx()){const d=memo("snapNow",()=>snapDoc(false));const v=k==="__all"?{total:d.total,cost:d.cost,flow:d.flow}:one(d);
     if(v.total>0&&v.cost>0)pts=pts.filter(x=>x.date<d.date).concat([{date:d.date,total:v.total,cost:v.cost,flow:v.flow}]);}
   return pts;}
 // 계좌 하나의 기록: 계좌별 값(byAcct)을 남긴 기록만. live면 오늘 장부를 마지막 값으로
@@ -2327,6 +2365,12 @@ async function initDb(){
   let db=null;try{db=window.claude&&await window.claude.use("db");}catch(e){db=null;}
   if(!db){S.dbState="none";render();return;}
   S.dbRaw=db;S.db=hookDb(db);S.dbState="ok";
+  // 보기 설정은 처음 한 번만 받는다 (다른 기기에서 바꾼 보기가 쓰는 도중에 화면을 바꾸지 않게)
+  let vDone=false;const vEnd=ch=>{if(vDone)return;vDone=true;S.viewLoaded=true;navRestoring=true;try{render();}finally{navRestoring=false;}};
+  try{db.doc("prefs/view").onSnapshot(d=>{if(vDone)return;const v=d.exists?((d.data()||{}).v||{}):{};viewApply(v);
+    if(VIEW_KEYS.some(k=>S.viewP[k]!=null&&(v[k]==null||String(v[k])!==S.viewP[k])))viewSaveSoon();   // 장부에 없거나 이 기기에서 이미 바꾼 값은 올려 둔다
+    vEnd();},()=>vEnd());}catch(e){vEnd();}
+  setTimeout(()=>vEnd(),2500);
   const onErr=e=>{if(e&&e.code==="revoked"){S.dbState="none";render();}};
   const sub=(col,key)=>db.collection(col).onSnapshot(snap=>{const o={};snap.docs.forEach(d=>{o[d.id]={...d.data(),id:d.id};});applyOrdPend(col,o);S[key]=o;S.loaded[key]=true;if(key==="holdingsRaw"||key==="assets")hydrate();render();},onErr);
   S.loaded={};
@@ -2374,7 +2418,7 @@ const app=document.getElementById("app");
 app.addEventListener("input",e=>{const k=inKey(e.target);if(k)S.draft[k]=e.target.value;},true);
 app.addEventListener("change",e=>{const k=inKey(e.target);if(k&&!DRAFT_BTN.test(k))delete S.draft[k];},true);
 let toastT;function toast(m,ms){let t=document.querySelector(".toast");if(!t){t=document.createElement("div");t.className="toast";t.setAttribute("role","status");document.body.appendChild(t);}t.textContent=m;t.hidden=false;clearTimeout(toastT);toastT=setTimeout(()=>{t.hidden=true;},ms||2200);}
-function setTab(t){S.draft={};S.tab=t;S.openAcct=null;S.reorder=null;S.memberView=null;try{localStorage.setItem("rf.tab",t);}catch(e){}render();window.scrollTo(0,0);}
+function setTab(t){S.draft={};S.tab=t;S.openAcct=null;S.reorder=null;S.memberView=null;try{vset("rf.tab",t);}catch(e){}render();window.scrollTo(0,0);}
 document.querySelectorAll("nav.tabs button").forEach(b=>b.addEventListener("click",()=>setTab(b.dataset.tab)));
 
 function sparkline(points){if(points.length<2)return "";
@@ -3078,6 +3122,7 @@ function render0(){
   const pd=priceDates(),f=pd&&pd.old;const hs=document.getElementById("hdrSub");hs.textContent=S.dbState==="ok"?(pd?`가격 ${priceDateTxt()}`:""):"";
   const old=f&&daysAgo(f)>3;   // 보유 종목 가격 중 가장 오래된 날 기준hs.classList.toggle("stale",!!old);hs.title=f?(old?"가격이 오래되었습니다. 눌러서 가격을 업데이트하세요":"누르면 관심 종목·가격 화면으로"):"";   // 머리글 가격 날짜: 누르면 가격 화면
   if(S.dbState==="loading"){app.innerHTML=`<div class="card empty">장부를 불러오는 중…</div>`;syncChip();return;}
+  if(S.dbState==="ok"&&!S.viewLoaded){app.innerHTML=`<div class="card empty">장부를 불러오는 중…</div>`;syncChip();return;}   // 저장한 보기 설정을 받기 전에는 그리지 않는다 (화면이 바로 바뀌어 보이지 않게)
   if(S.dbState==="none"){app.innerHTML=`<div class="banner">저장소에 연결할 수 없어 장부를 열 수 없습니다. 이 장부는 소유자 계정으로 로그인해야 볼 수 있습니다.</div>`;return;}
   const v={home:vHome,trend:vTrend,accounts:vAccounts,plan:vPlan,alloc:vAlloc,prices:vPrices,settings:vSettings}[S.tab]||vHome;
   // 다시 그려도 가로로 스크롤한 표(data-keep)는 그 자리를 유지한다
@@ -3129,7 +3174,10 @@ function openSheet(html,onMount){const had=!!root.firstChild;root.innerHTML=`<di
 // 그린 뒤 손질: 오른쪽으로 넘치는 표 표시, 긴 설명은 두 줄로 접기(누르면 펼침)
 S.hintOpen=new Set();
 function markMore(w){w.classList.toggle("more",w.scrollWidth-w.clientWidth-w.scrollLeft>4);}
-function postRender(){
+// 여러 줄 노트: 적은 줄 수(줄바꿈으로 넘친 줄 포함)만큼만 높이를 잡는다
+function fitTa(el){el.style.height="auto";el.style.height=el.scrollHeight+(el.offsetHeight-el.clientHeight)+"px";}
+app.addEventListener("input",e=>{if(e.target.classList&&e.target.classList.contains("autosz"))fitTa(e.target);});
+function postRender(){app.querySelectorAll("textarea.autosz").forEach(fitTa);
   app.querySelectorAll(".hint").forEach(h=>{const t=h.textContent.trim();if(t.length<110||h.querySelector("a,button,input,select"))return;
     const key=t.slice(0,60);if(S.hintOpen.has(key))return;h.classList.add("clamp");h.dataset.hk=key;if(!h.closest(".card,.hero,.sheet"))h.classList.add("on-bg");});
   requestAnimationFrame(()=>app.querySelectorAll(".tbl-wrap").forEach(markMore));}
@@ -3152,8 +3200,8 @@ function navSync(){if(!NAV||navBack)return;const cur=history.state&&history.stat
   if(cur.up&&navSame(cur.up,k)){navBack=true;history.back();return;}   // 바로 앞 화면으로 돌아간 것이면(‹ 계좌 목록, 앞 탭) 기록을 쌓지 않고 뒤로
   history.pushState({kf:1,...k,d:(cur.d||0)+1,up:{tab:cur.tab,acct:cur.acct||null,mv:cur.mv||null,ps:cur.ps||null,pv:cur.pv||null},sheet:false},"");}
 function applyNav(st){navRestoring=true;try{S.tab=st.tab||"home";S.openAcct=st.acct&&S.accounts[st.acct]?st.acct:null;S.memberView=st.mv||null;S.reorder=null;
-  if(S.tab==="plan"){S.planSel=st.ps||null;if(st.pv)S.planView=st.pv;try{localStorage.setItem("rf.psel",S.planSel||"");localStorage.setItem("rf.pv",S.planView);}catch(e){}}
-  try{localStorage.setItem("rf.tab",S.tab);}catch(e){}render();}finally{navRestoring=false;}window.scrollTo(0,0);}
+  if(S.tab==="plan"){S.planSel=st.ps||null;if(st.pv)S.planView=st.pv;try{vset("rf.psel",S.planSel||"");vset("rf.pv",S.planView);}catch(e){}}
+  try{vset("rf.tab",S.tab);}catch(e){}render();}finally{navRestoring=false;}window.scrollTo(0,0);}
 if(NAV){try{history.scrollRestoration="manual";}catch(e){}
   if(history.state&&history.state.kf&&history.state.sheet&&!root.firstChild)history.replaceState({...history.state,sheet:false},"");   // 시트가 열린 채 새로 고친 경우
   window.addEventListener("popstate",e=>{const st=e.state&&e.state.kf?e.state:null;
@@ -3316,7 +3364,7 @@ app.addEventListener("click",async e=>{const t=e.target.closest("button");if(!t)
   if(t.dataset.gd){gdRun(t.dataset.gd);return;}
   if(trendClick(t))return;
   if(t.dataset.warnall){S.warnAll=t.dataset.warnall==="1";render();return;}
-  if(t.dataset.flowall){S.flowAll=t.dataset.flowall==="1";try{localStorage.setItem("rf.flowall",S.flowAll?"1":"0");}catch(e){}render();return;}
+  if(t.dataset.flowall){S.flowAll=t.dataset.flowall==="1";try{vset("rf.flowall",S.flowAll?"1":"0");}catch(e){}render();return;}
   if(t.dataset.sync){const k=t.dataset.sync;
     if(k==="start"||k==="now")syncRun(false);
     else if(k==="off")syncOff();
@@ -3522,7 +3570,7 @@ function wireSheet(bg, onSave, onDel) {
 /* ---------- 화면: 계획 ---------- */
 const MEMBER_VIEWS = [["result", "결과"], ["income", "수입"], ["spend", "지출"], ["accts", "계좌 계획"]];
 const HH_VIEWS = [["result", "결과"], ["spend", "공통 지출"], ["house", "주택·대출"], ["rules", "적립·인출 순서"]];   // 가정(물가·수익률·세금·건강보험)은 설정으로 옮겼다
-function setPlanSel(v) { S.planSel = v || null; S.planView = "result"; try { localStorage.setItem("rf.psel", S.planSel || ""); localStorage.setItem("rf.pv", "result"); } catch (e) {} }
+function setPlanSel(v) { S.planSel = v || null; S.planView = "result"; try { vset("rf.psel", S.planSel || ""); vset("rf.pv", "result"); } catch (e) {} }
 function vPlan() {
   if (!S.planLoaded) return `<div class="card empty">계획을 불러오는 중…</div>`;
   const p = PL();
@@ -4397,12 +4445,12 @@ function planClick(t) {
   if (t.dataset.warnlist != null) { warnSheet(); return true; }
   if (t.dataset.wack || t.dataset.wunack) { ackWarns([t.dataset.wack || t.dataset.wunack], !!t.dataset.wack); return true; }
   if (t.dataset.wacked) { S.warnAcked = t.dataset.wacked === "1"; render(); return true; }
-  if (t.dataset.pv) { S.draft = {}; S.planView = t.dataset.pv; try { localStorage.setItem("rf.pv", S.planView); } catch (e) {} render(); return true; }
+  if (t.dataset.pv) { S.draft = {}; S.planView = t.dataset.pv; try { vset("rf.pv", S.planView); } catch (e) {} render(); return true; }
   if (t.dataset.resg) { S.resGroup = t.dataset.resg; render(); return true; }
   if (t.dataset.psel != null) { S.draft = {}; setPlanSel(t.dataset.psel); render(); window.scrollTo(0, 0); return true; }
   if (t.dataset.fitapply) { fitApply(t.dataset.fitapply, t.dataset.pc); return true; }
   if (t.dataset.fitundo) { fitUndo(t.dataset.fitundo); return true; }
-  if (t.dataset.real != null) { S.real = t.dataset.real === "1"; try { localStorage.setItem("rf.real", S.real ? "1" : "0"); } catch (e) {} render(); return true; }
+  if (t.dataset.real != null) { S.real = t.dataset.real === "1"; try { vset("rf.real", S.real ? "1" : "0"); } catch (e) {} render(); return true; }
   if (t.dataset.member) { memberSheet(mem(t.dataset.member)); return true; }
   if (t.dataset.addinc) { incomeSheet(null, t.dataset.addinc); return true; }
   if (t.dataset.inc) { incomeSheet(PL().incomes.find(x => x.id === t.dataset.inc)); return true; }
@@ -4477,7 +4525,7 @@ function warnSheet() {
     const all = bg.querySelector("#wAckAll"); if (all) all.onclick = () => { ackWarns(un.map(w => w.id), true); closeSheet(); toast(`확인할 점 ${un.length}개를 확인했습니다`); };
     bg.querySelector(".sheet").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return;
       if (b.dataset.wack || b.dataset.wunack) { ackWarns([b.dataset.wack || b.dataset.wunack], !!b.dataset.wack); if (b.dataset.wack && un.length === 1) { closeSheet(); toast("확인할 점을 모두 확인했습니다"); } else { const st = bg.querySelector(".sheet").scrollTop; warnSheet(); const sh = document.querySelector("#sheetRoot .sheet"); if (sh) sh.scrollTop = st; } return; }
-      if (b.dataset.wgo) { closeSheet(); S.tab = "plan"; try { localStorage.setItem("rf.tab", "plan"); } catch (e2) {} if (b.dataset.wgo === "__hh") S.resGroup = b.dataset.wgk || "main"; setPlanSel(b.dataset.wgo); render(); window.scrollTo(0, 0); } });
+      if (b.dataset.wgo) { closeSheet(); S.tab = "plan"; try { vset("rf.tab", "plan"); } catch (e2) {} if (b.dataset.wgo === "__hh") S.resGroup = b.dataset.wgk || "main"; setPlanSel(b.dataset.wgo); render(); window.scrollTo(0, 0); } });
   });
 }
 
@@ -4558,6 +4606,10 @@ function alAcctPlanExp(c, aid) {
   const tk = Object.entries(kv).sort((x, y) => y[1] - x[1])[0];
   return { auto: rv / tv, adj: av / tv, dyAuto: dv / tv, taxKind: tk ? tk[0] : null, value: tv, parts: parts.map(q => ({ ...q, w: q.v / tv })).sort((x, y) => y.w - x.w) };
 }
+// 화면에 보이는 종목 순서: 목표 비중 카드에서 정한 순서(cfg.order), 정하지 않은 종목은 뒤에 원래 순서대로, 예수금은 맨 끝. 계산에는 쓰지 않는다
+function alOrd(order, keys) { const o = Array.isArray(order) ? order : []; const ix = k => { const i = o.indexOf(k); return i < 0 ? 1e6 + keys.indexOf(k) : i; };
+  return keys.filter(k => k !== AL_CASH).sort((a, b) => ix(a) - ix(b)).concat(keys.includes(AL_CASH) ? [AL_CASH] : []); }
+S.alOrdMode = false;
 function alCompute(scope) { return memo("alc:" + scope, () => alCompute1(scope)); }
 function alCompute1(scope) {
   const cfg = alCfg(scope); const year = has(cfg.year) ? num(cfg.year) : yr() + 10;
@@ -4686,7 +4738,7 @@ function alCompute0(scope, depIn) {
     for (const k in qty[a.id]) { const n0 = qty[a.id][k], n1 = sh[a.id].shares[k] || 0; if (n1 >= n0 || !n0) continue;
       const gainPer = (current[a.id][k] - cost[a.id][k]) / n0; if (gainPer <= 0) continue; const rt = info[k].kind === "foreign" ? 0.22 : info[k].kind === "dividend" ? 0.154 : 0; if (rt && info[k].cur === "USD" && st0[a.id].noFx[k]) sellUsd[a.id] = true; t += (n0 - n1) * gainPer * rt; }
     if (t > 0) sellTax[a.id] = t; }
-  return { scope, cfg, accts, V, current, qty, total, cw, keys, info, tg, tsum, year, years, demand, pt, pl, sh, after, fut, futSum, allowed, sellTax, sellUsd, lot, lots, lotCap, exp, tradeB, tradeS, acctB, acctS,
+  return { scope, cfg, accts, V, current, qty, total, cw, keys: alOrd(cfg.order, keys), info, tg, tsum, year, years, demand, pt, pl, sh, after, fut, futSum, allowed, sellTax, sellUsd, lot, lots, lotCap, exp, tradeB, tradeS, acctB, acctS,
     lockQ, lockVal, cellV, isFixed, fixCut, lockedK, lockTot, lockOver, irpOver, free, nb, nowTrade, heldNow, heldAfter, pr,
     lotIn, futIdeal: proj(demand).F, depMode, dep, depRatio: (pf.bySrc || {}).dep || {}, divRatio: (pf.bySrc || {}).div || {}, divTotal: pf.divTotal || 0, divMode, divOn, pool, er, rr, mode: cfg.mode === "tax" ? "tax" : "keep" };
 }
@@ -4716,11 +4768,14 @@ function vAlloc() {
    <span class="meta">배분 대상 ${esc(c.scope === "__all" ? "가족 전체" : memName(c.scope))} 명의 계좌 ${c.accts.length}개 · ${eok(c.total)} (생활비 계좌 제외)</span></details>`;
   // 목표 비중
   const addable = watchList().filter(x => !c.keys.includes(x.ticker));
-  const tgtSum = c.keys.filter(k => (c.tg[k] || 0) > 0).sort((a, b) => (c.tg[b] || 0) - (c.tg[a] || 0)).map(k => `${c.info[k].name} ${P2((c.tg[k] || 0))}%`).join(" · ");
+  const tgtSum = c.keys.filter(k => (c.tg[k] || 0) > 0).sort((a, b) => (c.cfg.order || []).length ? 0 : (c.tg[b] || 0) - (c.tg[a] || 0)).map(k => `${c.info[k].name} ${P2((c.tg[k] || 0))}%`).join(" · ");
   h += `<details class="card" id="alTgtBox"${S.alTgtOpen ? " open" : ""}><summary style="cursor:pointer"><div class="row"><h2>목표 비중</h2><span class="meta">${S.alTgtOpen ? "접기" : "펼치기 ›"}</span></div><span class="meta sum">${esc(tgtSum || "목표 비중이 없습니다")}${Math.abs(c.tsum - 100) > 0.05 ? ` · 합계 ${P2(c.tsum)}%` : ""}</span></summary>
-   <div class="btns"><button class="btn small" id="alReset">현재 비중으로</button></div>
+   <div class="btns"><button class="btn small" id="alReset">현재 비중으로</button><button class="btn small${S.alOrdMode ? " primary" : ""}" id="alOrdMode">${S.alOrdMode ? "순서 변경 완료" : "순서 변경"}</button></div>
+   ${S.alOrdMode ? `<span class="hint">↑↓로 종목 순서를 바꿉니다. 이 순서는 아래 계좌별 제안·결과 표에도 그대로 씁니다.</span>` : ""}
    <div class="tbl-wrap" data-keep="alTgt"><table class="tbl in al"><thead><tr><th>종목</th><th>목표 (${c.year}년, %)</th><th>현재</th><th>예상 수익률</th></tr></thead><tbody>
-   ${c.keys.map(k => { const i = c.info[k]; const rm = k !== AL_CASH && !((c.heldNow[k] || 0) > 0); return `<tr><td><span class="tgn">${esc(i.name)}${rm ? `<button type="button" class="rmx" data-alrm="${esc(k)}" aria-label="${esc(i.name)} 목록에서 빼기" title="목록에서 빼기">×</button>` : ""}</span><span class="meta">${esc(i.cls)}${k !== AL_CASH && (i.cls === "주식" || i.cls === "혼합") ? " · " + esc(RET_STYLE[styleOf({ ticker: k, name: i.name })][0]) : ""}${i.risky ? " · 위험자산" : ""}${c.lockedK[k] ? ` · 잠금 ${pct2(c.lockedK[k] / c.total)}` : ""}</span></td>
+   ${c.keys.map((k, j) => { const i = c.info[k]; const rm = k !== AL_CASH && !((c.heldNow[k] || 0) > 0); const nk = c.keys.filter(x => x !== AL_CASH).length;
+     const ord = S.alOrdMode && k !== AL_CASH ? `<span class="ordb"><button type="button" class="btn small" data-alord="${esc(k)}|-1" aria-label="${esc(i.name)} 위로"${j === 0 ? " disabled" : ""}>↑</button><button type="button" class="btn small" data-alord="${esc(k)}|1" aria-label="${esc(i.name)} 아래로"${j >= nk - 1 ? " disabled" : ""}>↓</button></span>` : "";
+     return `<tr><td>${ord}<span class="tgn">${esc(i.name)}${rm ? `<button type="button" class="rmx" data-alrm="${esc(k)}" aria-label="${esc(i.name)} 목록에서 빼기" title="목록에서 빼기">×</button>` : ""}</span><span class="meta">${esc(i.cls)}${k !== AL_CASH && (i.cls === "주식" || i.cls === "혼합") ? " · " + esc(RET_STYLE[styleOf({ ticker: k, name: i.name })][0]) : ""}${i.risky ? " · 위험자산" : ""}${c.lockedK[k] ? ` · 잠금 ${pct2(c.lockedK[k] / c.total)}` : ""}</span></td>
      <td><input data-altgt="${esc(k)}" inputmode="decimal" value="${esc(c.tg[k] || 0)}" aria-label="${esc(i.name)} 목표 비중(%)"></td><td>${pct2(c.cw[k] || 0)}</td><td>연 ${expTxt(i.r)}${c.divMode === "reinvest" ? "" : `<br><span class="meta">${c.pool ? "가격 상승" : "배당 빼면"} ${expTxt(c.er(k))}</span>`}</td></tr>`; }).join("")}
    <tr class="tot"><td>합계</td><td><b class="${Math.abs(c.tsum - 100) > 0.05 ? "up" : ""}">${P2(c.tsum)}%</b></td><td>100%</td><td></td></tr></tbody></table></div>
    ${Math.abs(c.tsum - 100) > 0.05 ? `<span class="hint">합계가 100%가 아니어서 비율대로 나눠 계산했습니다.</span>` : ""}
@@ -4755,7 +4810,8 @@ function vAlloc() {
   // 계좌별
   h += `<p class="hint" style="margin:0">계좌별 제안 · 오른쪽 끝 열은 다음 해 이 계좌에 들어올 돈(계획 납입 + 예상 배당·이자)으로 지금 가격에 살 수 있는 주식 수입니다(입금은 ‘미래 입금’, 배당은 ‘미래 배당·분배’ 설정의 비율대로, 이 계좌에 담을 수 있는 종목만). 종목 앞 자물쇠를 누르면 그 계좌의 그 종목 수량을 지정합니다(처음엔 지금 수량). 수량을 바꾸면 지금보다 많든 적든 그 수량으로 사거나 팔고 더는 건드리지 않으며, 나머지 돈으로 목표 비중을 맞춥니다. 지금 없는 종목은 ‘수량 지정할 종목 추가’로 넣습니다.${c.lockTot > 0 ? ` 수량을 지정한 금액 ${eok(c.lockTot)}.` : ""}</p>`;
   h += c.accts.map(a => { const o = c.sh[a.id]; const nm = alNewMoney(c, a);
-    const ks = [...new Set(Object.keys(c.qty[a.id]).concat(Object.keys(o.shares), c.keys.filter(k => c.isFixed(a.id, k)), Object.keys(nm.sh)))].filter(k => k !== AL_CASH);
+    const kix = k => { const i = c.keys.indexOf(k); return i < 0 ? 1e6 : i; };   // 목표 비중 카드의 종목 순서대로
+    const ks = [...new Set(Object.keys(c.qty[a.id]).concat(Object.keys(o.shares), c.keys.filter(k => c.isFixed(a.id, k)), Object.keys(nm.sh)))].filter(k => k !== AL_CASH).sort((x, y) => kix(x) - kix(y));
     const nmOn = nm.total > 0.5;
     const nmCell = k => { const n = nm.sh[k] || 0; return `<td class="${n ? "up" : ""}">${n ? `+${nf.format(n)}주<br><span class="meta">${fmtM(n * c.info[k].price)}</span>` : "–"}</td>`; };
     const rows = ks.map(k => { const i = c.info[k]; const n0 = c.qty[a.id][k] || 0, n1 = o.shares[k] || 0, d = n1 - n0; const fx = c.isFixed(a.id, k);
@@ -4765,7 +4821,9 @@ function vAlloc() {
       return `<tr${fx ? ' class="fixed"' : ""}><td><span class="lkc">${btn}<span>${esc(i.name)}${q}</span></span></td><td>${nf2.format(n0)}</td><td><b>${nf2.format(n1)}</b></td><td class="${d > 0 ? "up" : d < 0 ? "down" : ""}">${dTxt}${fx ? ` <span class="chip">지정</span>` : ""}</td><td>${eok(c.cellV(a.id, k))}</td>${nmOn ? nmCell(k) : ""}</tr>`; }).join("");
     const addable = watchList().map(x => x.ticker).concat(c.keys).filter((k, j, arr) => arr.indexOf(k) === j && k !== AL_CASH && !ks.includes(k)).map(k => ({ k, inf: c.info[k] || alInfo(k) })).filter(x => !alRule(a, x.inf) && x.inf.price > 0);
     const cash0 = c.current[a.id][AL_CASH] || 0; const riskyPct = a.type === "IRP" && c.V[a.id] > 0 ? o.riskyV / c.V[a.id] : null;
+    const note = (PL().allocNote || {})[a.id] || "";
     return `<section class="card"><div class="row"><div class="l"><span class="name">${esc(a.name)}</span><span class="meta">${esc(a.type)}${c.scope === "__all" ? " · " + esc(memName(ownerOf(a))) : ""}</span></div><b>${eok(c.V[a.id])}</b></div>
+     <textarea class="alnote autosz" data-alnote="${esc(a.id)}" rows="${Math.max(1, note.split("\n").length)}" placeholder="노트 (여러 줄로 적을 수 있습니다)" aria-label="${esc(a.name)} 노트">${esc(note)}</textarea>
      <div class="tbl-wrap" data-keep="alAc:${esc(a.id)}"><table class="tbl in al lkt"><thead><tr><th>종목</th><th>지금</th><th>제안</th><th>사고팔 수</th><th>금액</th>${nmOn ? `<th>${nm.year}년 ${nm.divUse ? "입금·배당" : "입금"}으로<br><small>살 수 (지금 가격)</small></th>` : ""}</tr></thead><tbody>${rows}
      <tr><td>예수금</td><td>${eok(cash0)}</td><td><b>${eok(o.cash)}</b></td><td></td><td>${eok(o.cash)}</td>${nmOn ? `<td>${nm.left > 0.5 ? `+${fmtM(nm.left)}<br><span class="meta">남는 돈</span>` : "–"}</td>` : ""}</tr></tbody></table></div>
      ${nmOn ? `<span class="meta">${nm.year}년에 들어올 돈 <b>${fmtM(nm.total)}</b> = 계획 납입 ${fmtM(nm.dep)}${nm.dep > 0.5 ? ` (월 약 ${fmtM(nm.dep / 12)})` : ""} + 예상 배당·이자 ${fmtM(nm.divUse ? nm.div : 0)}${nm.gen && nm.div > 0.5 ? " (원천징수 뒤)" : ""} → 주식 매수 ${fmtM(nm.spent)}${nm.left > 0.5 ? ` · 남는 돈 ${fmtM(nm.left)}` : ""}${!nm.divUse && nm.div > 0.5 ? ` · 예상 배당 ${fmtM(nm.div)}은 ‘배당 반영 안 함’ 설정이라 넣지 않음` : ""}${nm.capped ? " · 위험자산이 70%를 넘지 않게 일부는 안전자산으로" : ""}</span>` : ""}
@@ -4848,7 +4906,7 @@ function alFutureCard(c) {
    <span class="hint">‘지금 자금’은 아래 계좌별 제안대로 지금 사고파는 수량입니다. ${hasDep ? `입금은 ${srcTxt.dep}, ` : ""}${hasDiv ? `배당은 ${srcTxt.div} ` : ""}산다고 보고 ${c.year}년까지 살 수량을 어림했습니다. 앞으로 살 주식 수는 그때 예상 가격(지금 가격이 가격 상승분 = 예상 수익률 − 배당만큼 오른다고 봄) 기준입니다. 입금은 들어오는 계좌에서, 배당은 받은 계좌에서 사야 하니 실제로 어느 계좌에서 살지는 계좌 규칙(해외 상장은 일반계좌 등)에 맞춰 정하세요.</span></section>`;
 }
 function allocClick(t) {
-  if (t.dataset.alsel) { S.alSel = t.dataset.alsel; try { localStorage.setItem("rf.alsel", S.alSel); } catch (e) {} render(); return true; }
+  if (t.dataset.alsel) { S.alSel = t.dataset.alsel; try { vset("rf.alsel", S.alSel); } catch (e) {} render(); return true; }
   if (t.dataset.allock) { const [aid, k] = t.dataset.allock.split("|"); const p = PL(); const L = JSON.parse(JSON.stringify(p.allocLock || {}));
     const on = !(L[aid] && k in L[aid]); const c = alCompute(S.alSel); const n0 = ((c.qty[aid] || {})[k]) || 0;
     if (on) (L[aid] = L[aid] || {})[k] = n0; else { delete L[aid][k]; if (!Object.keys(L[aid]).length) delete L[aid]; }
@@ -4858,6 +4916,10 @@ function allocClick(t) {
     const p = PL(); const L = JSON.parse(JSON.stringify(p.allocLock || {})); let fx = 0;
     for (const a of c.accts) if (L[a.id] && k in L[a.id]) { delete L[a.id][k]; fx++; if (!Object.keys(L[a.id]).length) delete L[a.id]; }
     p.allocLock = L; alSet(S.alSel, { targets: tg }, `‘${name}’ 종목을 목록에서 뺐습니다${fx ? " (지정한 수량도 풀었습니다)" : ""}`); return true; }
+  if (t.id === "alOrdMode") { S.alOrdMode = !S.alOrdMode; render(); return true; }
+  if (t.dataset.alord) { const [k, dir] = t.dataset.alord.split("|"); const c = alCompute(S.alSel); const D = c.keys.filter(x => x !== AL_CASH); const i = D.indexOf(k), j = i + Number(dir);
+    if (i < 0 || j < 0 || j >= D.length) return true; [D[i], D[j]] = [D[j], D[i]];
+    alStay(`[data-alord="${CSS.escape(k + "|" + dir)}"]`, t, () => alSet(S.alSel, { order: D })); return true; }
   if (t.id === "alReset") { const c = alCompute(S.alSel); const tg = {}; for (const k of c.keys) tg[k] = Math.round((c.cw[k] || 0) * 10000) / 100; alSet(S.alSel, { targets: tg }, "현재 비중으로 채웠습니다"); return true; }
   return false;
 }
@@ -4869,8 +4931,8 @@ function alStay(sel, el, fn) {
   try { n.focus({ preventScroll: true }); } catch (e) {}
 }
 app.addEventListener("toggle", e => { const id = e.target.id; const k = { alGoalBox: ["alGoalOpen", "rf.algoal"], alTgtBox: ["alTgtOpen", "rf.altgt"], asTaxBox: ["asTaxOpen", "rf.astax"], asHlBox: ["asHlOpen", "rf.ashl"] }[id];
-  if (k) { if (S[k[0]] === e.target.open) return; S[k[0]] = e.target.open; try { localStorage.setItem(k[1], S[k[0]] ? "1" : "0"); } catch (er) {} const m = e.target.querySelector("summary .row .meta"); if (m) m.textContent = S[k[0]] ? "접기" : "펼치기 ›"; return; } }, true);
-app.addEventListener("toggle", e => { if (e.target.id !== "alAllowBox") return; S.alAllowOpen = e.target.open; try { localStorage.setItem("rf.alallow", S.alAllowOpen ? "1" : "0"); } catch (x) {} }, true);
+  if (k) { if (S[k[0]] === e.target.open) return; S[k[0]] = e.target.open; vset(k[1], S[k[0]] ? "1" : "0"); const m = e.target.querySelector("summary .row .meta"); if (m) m.textContent = S[k[0]] ? "접기" : "펼치기 ›"; return; } }, true);
+app.addEventListener("toggle", e => { if (e.target.id !== "alAllowBox") return; S.alAllowOpen = e.target.open; try { vset("rf.alallow", S.alAllowOpen ? "1" : "0"); } catch (x) {} }, true);
 app.addEventListener("change", e => {
   const el = e.target; if (S.tab !== "alloc") return;
   if (el.id === "alYear") { const v = parseInt(el.value, 10); if (!(v >= yr() && v <= yr() + 80)) { toast(`연도는 ${yr()}~${yr() + 80} 사이로 넣으세요`); render(); return; } alSet(S.alSel, { year: v }); return; }
@@ -4887,6 +4949,8 @@ app.addEventListener("change", e => {
     p.allocLock = L; savePlan("종목을 넣었습니다. 지정할 주식 수를 넣으세요"); return; }
   if (el.id === "alLotCap") { const v = parseFloat(String(el.value).replace(/,/g, "")); if (!(v >= 0)) { toast("금액을 만원 단위 숫자로 넣으세요"); render(); return; } alSet(S.alSel, { lotCap: Math.round(v) * 1e4 }); return; }
   if (el.dataset.altgt != null) { const c = alCompute(S.alSel); const tg = { ...c.tg }; const v = parseFloat(String(el.value).replace(",", ".")); if (!(v >= 0 && v <= 100)) { toast("비중은 0~100 사이로 넣으세요"); render(); return; } tg[el.dataset.altgt] = v; alSet(S.alSel, { targets: tg }); return; }
+  if (el.dataset.alnote != null) { const p = PL(); const v = String(el.value).replace(/\s+$/, ""); const n = { ...(p.allocNote || {}) }; if (v) n[el.dataset.alnote] = v; else delete n[el.dataset.alnote];
+    if ((p.allocNote || {})[el.dataset.alnote] === n[el.dataset.alnote]) return; p.allocNote = n; savePlan(v ? "노트를 저장했습니다" : "노트를 지웠습니다"); return; }
   if (el.dataset.alallow) { const [aid, k] = el.dataset.alallow.split("|"); const cfg = alCfg(S.alSel); const allow = JSON.parse(JSON.stringify(cfg.allow || {})); (allow[aid] = allow[aid] || {})[k] = el.checked ? true : false; if (el.checked) delete allow[aid][k];
     alStay(`[data-alallow="${CSS.escape(el.dataset.alallow)}"]`, el, () => alSet(S.alSel, { allow })); return; }
   if (el.id === "alAdd" && el.value) { const c = alCompute(S.alSel); const tg = { ...c.tg, [el.value]: 0 }; alSet(S.alSel, { targets: tg }, "종목을 넣었습니다. 목표 비중을 정하세요"); return; }
@@ -4900,6 +4964,8 @@ try { S.trRange = localStorage.getItem("rf.trr") || "all"; S.trGran = localStora
 function trPoints() {
   const all = (S.snapshots || []).filter(x => x && x.date); const m = S.trMem;
   if (!m || m === "__all") return all.filter(x => x.total > 0);
+  const ids = hhIds(m);   // 가계: 그 가계 구성원(명의자 미지정은 우리 가계) 값을 더한다
+  if (ids) return all.filter(x => x.byMember && hhSum(x.byMember, ids) > 0).map(x => ({ ...x, total: hhSum(x.byMember, ids), cost: hhSum(x.byMemberCost, ids), cash: x.byMemberCash ? hhSum(x.byMemberCash, ids) : null, flow: x.byMemberFlow ? hhSum(x.byMemberFlow, ids) : undefined }));
   return all.filter(x => x.byMember && x.byMember[m] > 0).map(x => ({ ...x, total: x.byMember[m], cost: (x.byMemberCost || {})[m] || 0, cash: x.byMemberCash ? x.byMemberCash[m] || 0 : null, flow: x.byMemberFlow ? +x.byMemberFlow[m] || 0 : undefined }));
 }
 // 평가손익률: 평가손익 ÷ 매입 원금 (현금은 손익이 없어 빼고 나눈다 — 요약·계좌 화면과 같은 기준). 현금을 모르는 예전 구성원 기록은 비율을 내지 않는다
@@ -5003,14 +5069,15 @@ function trMonthly(list) { return trGroup(list, "month"); }
 function trLabel(x, g) { const k = trKey(x, g); return g === "week" ? k.slice(2).replace(/-/g, ".") + "~" : g === "month" ? k.slice(2).replace("-", ".") : g === "year" ? k : k.slice(2).replace(/-/g, "."); }
 function vTrend() {
   if (trBench().length) setTimeout(pxHistEnsure, 0);   // 비교 종목 가격 기록이 모자라면 가져온다 (그리기를 막지 않게 나중에)
-  const mems = trMembers(); if (S.trMem !== "__all" && !mems.some(([id]) => id === S.trMem)) S.trMem = "__all";
+  const mems = hhList().concat(trMembers()); if (S.trMem !== "__all" && !mems.some(([id]) => id === S.trMem)) S.trMem = "__all";
   const who = S.trMem === "__all" ? "" : (mems.find(([id]) => id === S.trMem) || [, ""])[1];
-  const msel = mems.length > 1 ? `<div class="subnav">${[["__all", "가족 전체"]].concat(mems).map(([id, l]) => `<button type="button" data-trm="${esc(id)}" aria-selected="${id === S.trMem}">${esc(l)}</button>`).join("")}</div>` : "";
+  const isHH = !!hhIds(S.trMem); const whoOf = who ? (isHH ? who : who + " 명의") : "";   // 가계는 ‘명의’를 붙이지 않는다
+  const msel = mems.length > 1 ? `<div class="subnav">${[["__all", "가족 전체"]].concat(mems).map(([id, l]) => `<button type="button" data-trm="${esc(id)}" aria-selected="${id === S.trMem}"${id.startsWith("hh:") ? ' class="hh"' : ""}>${esc(l)}</button>`).join("")}</div>` : "";
   const all = trPoints();
   const auto = snapAuto(); const last = all[all.length - 1];
   const autoBox = `<label class="check"><input type="checkbox" id="snapAutoChk"${auto ? " checked" : ""}> 자동으로 기록</label>
     <span class="hint">켜 두면 장부를 열 때, 가격을 가져온 뒤, 다른 기기에서 바뀐 내용을 받은 뒤에 오늘 평가액을 기록합니다. 하루에 한 번만 남고, 같은 날 다시 기록하면 그날 값이 바뀝니다.</span>`;
-  if (!all.length && S.trMem !== "__all") return msel + `<section class="card empty" style="text-align:left"><h2>${esc(who)} 평가액 추이</h2><p style="margin:0">${esc(who)} 명의의 기록이 아직 없습니다. 구성원별 평가액은 이 기능을 넣은 뒤의 기록부터 남습니다. 오늘 기록을 남기면 여기부터 쌓입니다.</p>
+  if (!all.length && S.trMem !== "__all") return msel + `<section class="card empty" style="text-align:left"><h2>${esc(who)} 평가액 추이</h2><p style="margin:0">${esc(whoOf)}의 기록이 아직 없습니다. 구성원·가계별 평가액은 구성원별 값을 남긴 기록부터 나옵니다. 오늘 기록을 남기면 여기부터 쌓입니다.</p>
     <div class="btns"><button class="btn primary" id="snapNow">지금 평가액 기록</button></div></section>`;
   if (!all.length) return `<section class="card empty" style="text-align:left"><h2>평가액 추이</h2><p style="margin:0">아직 기록이 없습니다. 날마다 총 평가액을 남겨 두면 여기에서 추이와 표로 볼 수 있습니다.</p>
     <div class="btns"><button class="btn primary" id="snapNow">지금 평가액 기록</button></div>${autoBox}</section>`;
@@ -5032,7 +5099,7 @@ function vTrend() {
     ${(() => { const e = memberExp(S.trMem === "__all" ? "__all" : S.trMem); const w = twr(retPts(S.trMem === "__all" ? "__all" : S.trMem, false).filter(x => x.date >= first.date && x.date <= last.date));
       return retCmpHtml(w, e, { scen: "수익률 " + scenLabel() }) + (w || e ? `<span class="hint rnote">${RET_NOTE}${S.trRange !== "all" ? " 위 기간 선택에 맞춰 계산합니다." : ""} 예상 수익률은 지금 보유 종목 기준입니다.</span>` : ""); })()}</section>`;
   const pctMode = S.trChart === "pct"; const eX = memberExp(S.trMem === "__all" ? "__all" : S.trMem);
-  h += `<section class="card"><div class="row"><h2>${who ? esc(who) + " 명의 " : ""}${pctMode ? "수익률" : who ? "평가액" : "총 평가액"}</h2><div class="seg-toggle" role="group" aria-label="그래프">${[["amt", "금액"], ["pct", "수익률"]].map(([k, l]) => `<button type="button" data-trc="${k}" aria-pressed="${(pctMode ? "pct" : "amt") === k}">${l}</button>`).join("")}</div></div>
+  h += `<section class="card"><div class="row"><h2>${who ? esc(whoOf) + " " : ""}${pctMode ? "수익률" : who ? "평가액" : "총 평가액"}</h2><div class="seg-toggle" role="group" aria-label="그래프">${[["amt", "금액"], ["pct", "수익률"]].map(([k, l]) => `<button type="button" data-trc="${k}" aria-pressed="${(pctMode ? "pct" : "amt") === k}">${l}</button>`).join("")}</div></div>
     ${list.length > 1 ? `<div class="chart-wrap" id="trendWrap"><div class="chart-tip" id="trendTip" hidden></div></div>
     ${trToggles(pctMode, list, first)}
     <span class="meta">${pctMode ? "기간 첫 기록을 0%로 놓고, 넣거나 뺀 돈을 뺀 시간가중 수익률을 이어 그립니다." : `${unitName()} · 기록 ${nf.format(list.length)}개.`} 항목을 누르면 그래프에서 켜고 끕니다. ▲ 최고 ▼ 최저.${eX ? ` 기대선은 ${pctMode ? "예상 연수익률대로 갔을 때" : "첫 기록부터 예상 수익률로 불어나고 실제로 넣거나 뺀 돈은 그때 더한 금액"}이고, 예상 수익률은 지금 보유 종목 기준입니다.` : ""}${trBench().length ? ` 비교 종목은 ${pctMode ? "기간 첫 기록부터 그 종목 가격이 오르내린 만큼" : "기간 첫 기록의 평가액과 그 뒤 넣거나 뺀 돈을 모두 그 종목에 넣었다면"}이며, 가격만 본 값(배당 제외, 달러 종목은 그날 환율)입니다.` : ""}</span>${S.pxHistMsg ? `<span class="meta${S.pxHistErr ? " up" : ""}">${esc(S.pxHistMsg)}</span>` : ""}`
@@ -5048,7 +5115,7 @@ function vTrend() {
       return `<tr data-snap="${esc(x.date)}"><td>${esc(dl)}${x.auto || x.restored ? "" : ` <span class="meta">·</span>`}${x.miss > 0 ? ` <span class="meta" title="가격이 없어 매입가로 계산한 종목 ${x.miss}개">!</span>` : ""}</td><td><b>${sh(x.total)}</b></td><td class="${d == null ? "" : cls(d)}">${d == null ? "–" : sg(d)}${gn && (gn.r != null || shows(gn.f)) ? `<br><small>${gn.r != null ? `<span class="${cls(gn.r)}">${pct(gn.r, 1)}</span>` : ""}${gn.r != null && shows(gn.f) ? " · " : ""}${shows(gn.f) ? `<span class="flat">입출금 ${sg(gn.f)}</span>` : ""}</small>` : ""}</td><td class="${cls(p)}">${x.cost ? `${sg(p)}${trPlR(x) != null ? `<br><small>${trPct(x, 1)}</small>` : ""}` : "–"}</td></tr>`; }).join("")}
     </tbody></table></div>
     ${rows0.length > rows.length ? `<div class="btns"><button type="button" class="btn small" id="trMore">더 보기 (${nf.format(rows0.length - rows.length)}개 남음)</button></div>` : ""}
-    <span class="hint">금액 단위 ${unitName()}. 손익은 앞 기록과의 평가액 차이에서 넣거나 뺀 돈(입금·출금·이체, 아래 작은 글씨)을 뺀 값이고, 그 아래 %는 같은 기간 시간가중 수익률입니다. 주별·월별·연별은 기간마다 마지막 기록으로 앞 기간과 비교합니다.${who ? ` ${esc(who)} 명의 계좌만 더한 값이고, 평가손익은 구성원별 원금을 남긴 기록부터 나옵니다.` : ""} 평가손익률은 평가손익 ÷ 매입 원금(현금 제외)입니다. 행을 누르면 그날 구성원별 평가액을 보고 기록을 지울 수 있습니다. ‘·’ 표시는 직접 기록한 날, ‘!’ 표시는 가격이 없는 종목을 매입가로 계산한 날입니다.</span></section>`;
+    <span class="hint">금액 단위 ${unitName()}. 손익은 앞 기록과의 평가액 차이에서 넣거나 뺀 돈(입금·출금·이체, 아래 작은 글씨)을 뺀 값이고, 그 아래 %는 같은 기간 시간가중 수익률입니다. 주별·월별·연별은 기간마다 마지막 기록으로 앞 기간과 비교합니다.${who ? ` ${isHH ? `${esc(who)} 구성원 명의 계좌만 더한 값이고` : `${esc(who)} 명의 계좌만 더한 값이고`}, 평가손익은 구성원별 원금을 남긴 기록부터 나옵니다.` : ""} 평가손익률은 평가손익 ÷ 매입 원금(현금 제외)입니다. 행을 누르면 그날 구성원별 평가액을 보고 기록을 지울 수 있습니다. ‘·’ 표시는 직접 기록한 날, ‘!’ 표시는 가격이 없는 종목을 매입가로 계산한 날입니다.</span></section>`;
   const td = (S.snapshots || []).find(x => x.date === today());
   h += `<section class="card"><h2>기록하기</h2>${td ? `<p class="meta" style="margin:0">오늘(${esc(td.date)}) ${td.auto ? "자동으로" : "직접"} 기록됨 · ${eok(td.total)}${td.at ? ` · ${esc(whenTxt(td.at))}` : ""}</p>` : `<p class="meta" style="margin:0">오늘 기록은 아직 없습니다.</p>`}
     <div class="btns"><button class="btn${td ? "" : " primary"}" id="snapNow">${td ? "지금 값으로 다시 기록" : "지금 평가액 기록"}</button></div>${autoBox}</section>`;
@@ -5157,13 +5224,13 @@ function drawTrend() {
   hit.addEventListener("pointermove", show); hit.addEventListener("pointerdown", show); hit.addEventListener("pointerleave", hide);
 }
 function trendClick(t) {
-  if (t.dataset.trr) { S.trRange = t.dataset.trr; S.trMore = 0; try { localStorage.setItem("rf.trr", S.trRange); } catch (e) {} render(); return true; }
-  if (t.dataset.trm) { S.trMem = t.dataset.trm; S.trMore = 0; try { localStorage.setItem("rf.trm", S.trMem); } catch (e) {} render(); return true; }
-  if (t.dataset.trshow) { const k = t.dataset.trshow; S.trShow = { ...(S.trShow || {}), [k]: !trShowOn(k) }; try { localStorage.setItem("rf.trshow", JSON.stringify(S.trShow)); } catch (e) {} render(); return true; }
+  if (t.dataset.trr) { S.trRange = t.dataset.trr; S.trMore = 0; try { vset("rf.trr", S.trRange); } catch (e) {} render(); return true; }
+  if (t.dataset.trm) { S.trMem = t.dataset.trm; S.trMore = 0; try { vset("rf.trm", S.trMem); } catch (e) {} render(); return true; }
+  if (t.dataset.trshow) { const k = t.dataset.trshow; S.trShow = { ...(S.trShow || {}), [k]: !trShowOn(k) }; try { vset("rf.trshow", JSON.stringify(S.trShow)); } catch (e) {} render(); return true; }
   if (t.dataset.trbx) { const l = ((S.settings || {}).trBench || []).filter(x => x !== t.dataset.trbx); writeSettings({ ...S.settings, trBench: l }); render(); return true; }
   if (t.dataset.trbadd != null) { benchSheet(); return true; }
-  if (t.dataset.trc) { S.trChart = t.dataset.trc === "pct" ? "pct" : "amt"; try { localStorage.setItem("rf.trc", S.trChart); } catch (e) {} render(); return true; }
-  if (t.dataset.trg) { S.trGran = t.dataset.trg; S.trMore = 0; try { localStorage.setItem("rf.trg", S.trGran); } catch (e) {} render(); return true; }
+  if (t.dataset.trc) { S.trChart = t.dataset.trc === "pct" ? "pct" : "amt"; try { vset("rf.trc", S.trChart); } catch (e) {} render(); return true; }
+  if (t.dataset.trg) { S.trGran = t.dataset.trg; S.trMore = 0; try { vset("rf.trg", S.trGran); } catch (e) {} render(); return true; }
   if (t.id === "trMore") { S.trMore++; render(); return true; }
   if (t.id === "snapNow") { if (!acctList().length || !(totals().total > 0)) toast("기록할 평가액이 없습니다. 계좌와 보유 종목을 먼저 넣으세요."); else recordSnap(false); return true; }
   return false;
@@ -5200,7 +5267,7 @@ function pxHistEnsure() {
 app.addEventListener("click",e=>{const tr=e.target.closest("tr[data-snap]");if(tr)snapSheet(tr.dataset.snap);});
 RE.DEFAULT_ASSUMPTIONS.baseYear=new Date().getFullYear();
 // 자동 테스트에서만 내부 계산 함수를 꺼내 쓴다 (평소에는 아무 일도 하지 않음)
-if(window.__KINFOLIO_TEST__)window.__kinfolio={S,trFrom,hCost,fmtU,pxHist,pxHistTxt,sheetCsv,SHEET_VER,acctPts,acctRetTxt,ytdRet,ytdBase,trSeries,trCum,allWarns,warnSheet,warnId,ackWarns,livingSteps,livingCell,hhLivingNow,snapFlow,isoWeek,weekTitle,bkAutoRun,gdWeekBackup,gdBackups,twr,expOver,retPts,fitApply,fitApplyPc,fitRound,FIT_UP_SHARE,shortMonths,shortMoSum,moAmt,PERIODS,periodPL,periodChips,trGroup,trLabel,trWeekKey,livingNow,incomeNow,transferNow,memShortYear,fitLiving,resOfMember,pxAutoRun,pxLast,alNewMoney,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
+if(window.__KINFOLIO_TEST__)window.__kinfolio={S,trFrom,hhIds,hhList,hCost,fmtU,pxHist,pxHistTxt,sheetCsv,SHEET_VER,acctPts,acctRetTxt,ytdRet,ytdBase,trSeries,trCum,allWarns,warnSheet,warnId,ackWarns,livingSteps,livingCell,hhLivingNow,snapFlow,isoWeek,weekTitle,bkAutoRun,gdWeekBackup,gdBackups,twr,expOver,retPts,fitApply,fitApplyPc,fitRound,FIT_UP_SHARE,shortMonths,shortMoSum,moAmt,PERIODS,periodPL,periodChips,trGroup,trLabel,trWeekKey,livingNow,incomeNow,transferNow,memShortYear,fitLiving,resOfMember,pxAutoRun,pxLast,alNewMoney,fmtA,fmtM,shows,wonOf,monthX,pctTxt,evText,fx,needsFx,priceDates,priceDateTxt,trPlR,exportDoc,exportDocFull,importText,man,neg,num,badNum,holdSheet,acctSheet,syncRun,gdRun,recordSnap,autoSnap,snapDoc,syncOff,KSync,parseCsv,gfDate,gfSymbol,sheetCsv,applyImport,alDeposits,wdStats,retSrc,planAcctExp,planMemberExp,allocAcctExp,getSimBase,unitCfg,eok,monthsLeft,yearFrac,engineAccounts,autoTaxKind,holdTaxKind,trRange,trAmt,acctStats,acctExp,memberExp,groupExp,alCompute,alInfo,alRule,retAdj,retScen,autoStyle,styleOf,holdAdj,fixRet,minCash,totals,hVal,consolidate,getSim,AS,PL,render};
 document.getElementById("hdrSub").addEventListener("click",()=>{if(S.dbState==="ok"&&freshness())setTab("prices");});
 document.getElementById("syncChip").addEventListener("click",()=>{
   if(PWA&&!KinfolioPWA.clientId()){setTab("settings");return;}

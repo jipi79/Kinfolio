@@ -448,6 +448,12 @@ b.accent{color:var(--accent)}
 .grp{display:flex;flex-direction:column;gap:8px}
 .grp-h{padding:4px 2px 0}
 .chip.good{background:var(--good-soft);color:var(--good);border-color:transparent}
+/* 화면 색 고르기 */
+.palgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.palbtn{appearance:none;display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--ink);font:inherit;font-size:14px;cursor:pointer;text-align:left}
+.palbtn[aria-pressed="true"]{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);font-weight:600}
+.palbtn .sw{display:inline-flex;gap:3px;flex:none}
+.palbtn .sw i{width:14px;height:14px;border-radius:50%;border:1px solid rgba(127,127,127,.35)}
 .chip.bad{background:var(--bad-soft);color:var(--danger);border-color:transparent}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .subnav{display:flex;gap:6px;overflow-x:auto;margin:0 -16px;padding:2px 16px 4px;scrollbar-width:none}
@@ -1613,16 +1619,19 @@ function simulateGroup(input, G) {
       ev = evaluate(draws, contribs);
     }
     // 그래도 모자라면 명의자의 생활비 통장(없으면 계좌 밖 현금)을 마이너스로 만든다
-    const od = {}; const odP = {}; const odW = {}; let overdraft = 0;
+    const od = {}; const odP = {}; const odW = {}; const surC = {}; let overdraft = 0;
     for (let k2 = 0; k2 < 6; k2++) {
       let changed = false;
       for (const mid of memberIds) {
         const c = ev.cashP[mid] || 0; if (Math.abs(c) < 500) continue;
         const wid = odW[mid] || (odW[mid] = cashOf(mid).id);
-        if (c < 0) { od[wid] = (od[wid] || 0) - c; odP[mid] = (odP[mid] || 0) - c; }
-        else {
+        if (c < 0) {
+          // 건보료·세금 기준선 근처에서 남는 돈을 통장에 넣었다가 다시 모자라게 되는 경우: 먼저 방금 넣은 돈을 도로 쓴다 (마이너스로 잡지 않는다)
+          const u = Math.min(-c, surC[wid] || 0); if (u > 0) { contribs[wid] -= u; surC[wid] -= u; }
+          const rest = -c - u; if (rest > 0) { od[wid] = (od[wid] || 0) + rest; odP[mid] = (odP[mid] || 0) + rest; }
+        } else {
           const x = Math.min(c, odP[mid] || 0); if (x > 0) { od[wid] -= x; odP[mid] -= x; }
-          if (c - x > 1) contribs[wid] = (contribs[wid] || 0) + (c - x); // 남은 돈은 생활비 통장에 넣는다
+          if (c - x > 1) { contribs[wid] = (contribs[wid] || 0) + (c - x); surC[wid] = (surC[wid] || 0) + (c - x); } // 남은 돈은 생활비 통장에 넣는다
         }
         changed = true;
       }
@@ -1633,8 +1642,9 @@ function simulateGroup(input, G) {
     for (const mid of memberIds) {
       const c = ev.cashP[mid] || 0; if (Math.abs(c) < 1) continue;
       const w = acctById[odW[mid] || cashOf(mid).id]; const e = ev.end[w.id]; if (!e || !e.f) continue;
-      e.balance += c; e.basis = e.balance;
-      if (c < 0) { e.f.draw += -c; ev.drawn[w.id] = (ev.drawn[w.id] || 0) - c; ev.otherDraw -= c; odP[mid] = (odP[mid] || 0) - c; }
+      const b0 = e.balance; e.balance += c; e.basis = e.balance;
+      // 통장에 잔액이 있으면 거기서 빠질 뿐이다: 잔액 아래로 내려간 만큼만 마이너스로 센다 (잔액이 넉넉한데도 ‘모자람’으로 잡혀 생활비 적정화가 ‘0원이어도 부족’으로 나오던 문제)
+      if (c < 0) { e.f.draw += -c; ev.drawn[w.id] = (ev.drawn[w.id] || 0) - c; ev.otherDraw -= c; const neg = Math.max(0, -e.balance) - Math.max(0, -b0); if (neg > 0) odP[mid] = (odP[mid] || 0) + neg; }
       else { e.f.contrib += c; contribs[w.id] = (contribs[w.id] || 0) + c; ev.contribTotal += c; }
       ev.cashP[mid] = 0;
     }
@@ -2217,6 +2227,11 @@ function num(v){const n=parseFloat(numStr(v));return isFinite(n)?n:0;}
 // 입력칸 값이 비어 있지 않은데 숫자로 읽을 수 없으면 true
 function badNum(v){const t=numStr(v);return t!==""&&!isFinite(parseFloat(t));}
 function tkey(t){return String(t||"").trim().toUpperCase();}
+// 종목 약칭 (설정의 aliases: {종목 코드: 약칭}, 안드로이드 앱과 같은 자리). 있으면 화면에는 약칭으로 보인다.
+// 저장하는 종목명과 이름으로 추정하는 계산(종목 유형·세금·ETF 여부)에는 쓰지 않는다
+function aliasMap(){return memo("alias",()=>{const a=(S.settings||{}).aliases,o={};if(a&&typeof a==="object")for(const k in a){const v=String(a[k]??"").trim();if(v)o[tkey(k)]=v;}return o;});}
+function aliasOf(t){return aliasMap()[tkey(t)]||"";}
+function tName(t,name){return aliasOf(t)||name||tkey(t);}
 
 /* ---------- computation ---------- */
 const FX_MIN=500,FX_MAX=3000;   // USD/KRW로 받아들일 범위 (이 밖이면 잘못 읽은 값으로 본다)
@@ -2375,7 +2390,7 @@ async function initDb(){
     vEnd();},()=>vEnd());}catch(e){vEnd();}
   setTimeout(()=>vEnd(),2500);
   const onErr=e=>{if(e&&e.code==="revoked"){S.dbState="none";render();}};
-  const sub=(col,key)=>db.collection(col).onSnapshot(snap=>{const o={};snap.docs.forEach(d=>{o[d.id]={...d.data(),id:d.id};});applyOrdPend(col,o);S[key]=o;S.loaded[key]=true;if(key==="holdingsRaw"||key==="assets")hydrate();render();},onErr);
+  const sub=(col,key)=>db.collection(col).onSnapshot(snap=>{const o={};snap.docs.forEach(d=>{o[d.id]={...d.data(),id:d.id};});applyOrdPend(col,o);if(col==="assets")keepNewAssets(o);S[key]=o;S.loaded[key]=true;if(key==="holdingsRaw"||key==="assets")hydrate();render();},onErr);
   S.loaded={};
   sub("accounts","accounts");sub("holdings","holdingsRaw");sub("prices","prices");sub("assets","assets");
   db.doc("settings/main").onSnapshot(d=>{const v=d.exists?{...d.data()}:{};S.settingsServer=v;
@@ -2441,6 +2456,56 @@ function priceDates(){const held=new Set(Object.values(S.holdings).filter(h=>num
 function freshness(){const d=priceDates();return d?d.now:null;}
 function priceDateTxt(){const d=priceDates();if(!d)return "";return d.old===d.now?d.now:`${d.old}~${d.now.slice(d.old.slice(0,4)===d.now.slice(0,4)?5:0)}`;}
 
+// 전일 대비 (안드로이드 앱과 같은 계산): 보유 종목마다 수량 × (현재가 − 전일 종가)를 원화로 더한다. 전일 종가는 구글 시트로 가격을 가져올 때 함께 받는다.
+// 전일 종가가 없는 종목은 빼고 몇 종목으로 셌는지 함께 돌려준다. 같은 종목은 계좌를 가리지 않고 합치고, 달러 종목은 지금 환율로(환율이 없으면 뺀다).
+// rate: 손익 ÷ 전일 종가로 본 평가액, movers: 종목별 등락률·손익 (등락률 크기 순). 셀 종목이 없으면 null
+function dayMove(){return memo("dayMove",()=>{const by=new Map();
+  for(const h of Object.values(S.holdings)){if(!S.accounts[h.accountId]||!(num(h.qty)>0))continue;const t=tkey(h.ticker);
+    let p=by.get(t);if(!p){p={name:h.name||h.ticker,cur:h.currency||"KRW",qty:0};by.set(t,p);}p.qty+=num(h.qty);}
+  let amount=0,base=0,asOf=null;const movers=[];
+  for(const [t,pos] of by){const p=S.prices[t];if(!p)continue;const price=num(p.price),prev=num(p.prevClose),f=rate(pos.cur);
+    if(!(price>0&&prev>0&&f>0))continue;const d=pos.qty*(price-prev)*f;amount+=d;base+=pos.qty*prev*f;
+    const a=String(p.asOf||"").slice(0,10);if(a&&(!asOf||a>asOf))asOf=a;movers.push({ticker:t,name:tName(t,pos.name),rate:(price-prev)/prev,amount:d});}
+  if(!movers.length)return null;movers.sort((a,b)=>Math.abs(b.rate)-Math.abs(a.rate));
+  return{amount,rate:base>0?amount/base:0,counted:movers.length,held:by.size,asOf,movers};});}
+function dayMoveHtml(){const dm=dayMove();if(!dm)return "";
+  return `<span class="pl ${cls(dm.amount)}">전일 대비 ${fmtM(dm.amount,{plus:true})} (${pct(dm.rate,2)})</span>
+    <span class="meta">${dm.asOf?`${esc(dm.asOf.slice(5).replace("-","/"))} 가격 기준 · `:""}${dm.counted<dm.held?`보유 ${dm.held}종목 중 ${dm.counted}종목`:`보유 종목 ${dm.held}개`}</span>`;}
+function dayMoversCard(){const dm=dayMove();if(!dm||!dm.movers.length)return "";
+  return `<section class="card"><h2>전일 대비 많이 움직인 종목</h2><div class="list">${dm.movers.slice(0,3).map(m=>`<div class="item"><div class="row"><div class="l"><span class="name">${esc(m.name)}</span><span class="meta">${esc(m.ticker)}</span></div>
+    <div class="r"><b class="${cls(m.amount)}">${fmtM(m.amount,{plus:true})}</b><span class="meta ${cls(m.rate)}">${pct(m.rate,2)}</span></div></div></div>`).join("")}</div></section>`;}
+
+/* ---------- 화면 색 (안드로이드 앱과 같은 색 8가지와 밝게·어둡게). 이 기기에만 둔다 ---------- */
+// 색마다 바탕·글자·강조색만 바꾸고, 오름(빨강)·내림(파랑)·주의(주황) 같은 뜻 색은 그대로 둔다. [id, 이름, 밝은 화면, 어두운 화면] (숲은 기본 색 그대로)
+const PALETTES=[["forest","숲 (기본)",null,null],["sea","바다",{"--bg":"#EFF3F3","--surface":"#FFFFFF","--surface-2":"#F5F7F7","--line":"#D7DEDF","--ink":"#181F20","--muted":"#596263","--accent":"#006D77","--accent-ink":"#FFFFFF","--accent-soft":"#DBEBEC"},{"--bg":"#0E1213","--surface":"#181D1E","--surface-2":"#1F2526","--line":"#2D3334","--ink":"#E7E9EA","--muted":"#9CA4A5","--accent":"#4FC3CF","--accent-ink":"#0F1415","--accent-soft":"#254548"}],["olive","올리브",{"--bg":"#F2F3EF","--surface":"#FFFFFF","--surface-2":"#F7F7F5","--line":"#DDDED8","--ink":"#1E1F19","--muted":"#60625A","--accent":"#586A1C","--accent-ink":"#FFFFFF","--accent-soft":"#E8EADF"},{"--bg":"#11120F","--surface":"#1C1D18","--surface-2":"#242520","--line":"#32342D","--ink":"#E9E9E7","--muted":"#A2A49D","--accent":"#B5CC6A","--accent-ink":"#13140F","--accent-soft":"#41472C"}],["bamboo","대나무",{"--bg":"#EFF3F0","--surface":"#FFFFFF","--surface-2":"#F5F7F5","--line":"#D8DED9","--ink":"#191F19","--muted":"#5A625B","--accent":"#2E7D32","--accent-ink":"#FFFFFF","--accent-soft":"#E2EDE2"},{"--bg":"#0F120F","--surface":"#181D19","--surface-2":"#202520","--line":"#2D342E","--ink":"#E7E9E7","--muted":"#9DA49E","--accent":"#7FCB86","--accent-ink":"#0F1410","--accent-soft":"#314733"}],["plum","자두",{"--bg":"#F2F0F2","--surface":"#FFFFFF","--surface-2":"#F7F5F7","--line":"#DED9DD","--ink":"#1F191E","--muted":"#625B60","--accent":"#7D2E6F","--accent-ink":"#FFFFFF","--accent-soft":"#EDE2EB"},{"--bg":"#120F11","--surface":"#1D191C","--surface-2":"#252024","--line":"#332E32","--ink":"#E9E7E9","--muted":"#A39EA2","--accent":"#E39BD5","--accent-ink":"#141013","--accent-soft":"#4C3848"}],["slate","슬레이트",{"--bg":"#F0F1F2","--surface":"#FFFFFF","--surface-2":"#F5F6F7","--line":"#D9DCDE","--ink":"#1A1C1F","--muted":"#5C5F61","--accent":"#3E5A6B","--accent-ink":"#FFFFFF","--accent-soft":"#E4E8EA"},{"--bg":"#0F1112","--surface":"#191B1C","--surface-2":"#212324","--line":"#2E3133","--ink":"#E7E8E9","--muted":"#9EA1A3","--accent":"#9FC0D3","--accent-ink":"#101214","--accent-soft":"#394348"}],["ink","먹 (흑백)",{"--bg":"#F1F1F1","--surface":"#FFFFFF","--surface-2":"#F6F6F6","--line":"#DBDBDB","--ink":"#1C1C1C","--muted":"#5E5E5E","--accent":"#222222","--accent-ink":"#FFFFFF","--accent-soft":"#E0E0E0"},{"--bg":"#111111","--surface":"#1B1B1B","--surface-2":"#222222","--line":"#303030","--ink":"#E8E8E8","--muted":"#A1A1A1","--accent":"#E8E8E8","--accent-ink":"#121212","--accent-soft":"#4C4C4C"}],["paper","종이 (크림)",{"--bg":"#F4F2EE","--surface":"#FDFDFB","--surface-2":"#F8F7F4","--line":"#E0DDD6","--ink":"#211D17","--muted":"#656058","--accent":"#7A4E2D","--accent-ink":"#FFFFFF","--accent-soft":"#ECE6E2"},{"--bg":"#13110E","--surface":"#1E1C17","--surface-2":"#27241E","--line":"#35322C","--ink":"#EAE9E6","--muted":"#A6A29B","--accent":"#D9A77C","--accent-ink":"#16130E","--accent-soft":"#4B3D2F"}]];
+const THEME_L={"--bg":"#EEF2F1","--surface":"#FFFFFF","--surface-2":"#F5F8F7","--ink":"#14201D","--muted":"#5A6864","--line":"#D8E0DD","--accent":"#0E6655","--accent-ink":"#FFFFFF","--accent-soft":"#DDEEE9",
+  "--up":"#C8322B","--down":"#2458B8","--warn":"#A8690F","--warn-soft":"#FBEFD9","--danger":"#B42318","--shadow":"0 1px 2px rgba(20,32,29,.06),0 4px 16px rgba(20,32,29,.05)",
+  "--c1":"#1BAF7A","--c2":"#2A78D6","--c3":"#EDA100","--c4":"#8B6FD1","--b1":"#E8590C","--b2":"#C2255C","--b3":"#0B7285","--good":"#137A4E","--good-soft":"#DDF1E6","--bad-soft":"#FBE3E1"};
+const THEME_D={"--bg":"#0E1614","--surface":"#16211E","--surface-2":"#1B2825","--ink":"#E5EDEA","--muted":"#93A39E","--line":"#293733","--accent":"#4FBFA5","--accent-ink":"#0B1714","--accent-soft":"#1D3832",
+  "--up":"#F0655C","--down":"#6E9CF2","--warn":"#E3AA4E","--warn-soft":"#3A2E17","--danger":"#F07A6E","--shadow":"0 1px 2px rgba(0,0,0,.3)",
+  "--c1":"#199E70","--c2":"#3987E5","--c3":"#C98500","--c4":"#9085E9","--b1":"#FF922B","--b2":"#F06595","--b3":"#3BC9DB","--good":"#5CC98F","--good-soft":"#18352A","--bad-soft":"#3D1D1A"};
+function themePref(){let p="forest",m="system";try{p=localStorage.getItem("kf.palette")||p;m=localStorage.getItem("kf.mode")||m;}catch(e){}
+  return{p:PALETTES.some(x=>x[0]===p)?p:"forest",m:["system","light","dark"].includes(m)?m:"system"};}
+function setThemePref(k,v){try{localStorage.setItem(k,v);}catch(e){}applyTheme();}
+// 시스템 따름일 때: 화면을 띄운 곳이 정한 밝기(data-theme)가 있으면 그것, 없으면 기기 설정
+function sysDark(){const dt=document.documentElement.getAttribute("data-theme");if(dt==="dark")return true;if(dt==="light")return false;
+  try{return matchMedia("(prefers-color-scheme: dark)").matches;}catch(e){return false;}}
+function themeDark(){const {m}=themePref();return m==="dark"||(m==="system"&&sysDark());}
+function themeVars(id,dark){const pal=PALETTES.find(x=>x[0]===id)||PALETTES[0];return{...(dark?THEME_D:THEME_L),...((dark?pal[3]:pal[2])||{})};}
+// 기본(숲·시스템 따름)이면 아무것도 덮지 않는다: 지금까지와 똑같이 스타일시트의 색을 쓴다
+function applyTheme(){const {p,m}=themePref();const st=document.documentElement.style;const dark=themeDark();
+  for(const k in THEME_L)st.removeProperty(k);st.removeProperty("color-scheme");
+  const over=m!=="system"||p!=="forest";const o=themeVars(p,dark);
+  if(over){for(const k in o)st.setProperty(k,o[k]);st.setProperty("color-scheme",dark?"dark":"light");}
+  document.querySelectorAll('meta[name="theme-color"]').forEach(x=>{if(x.dataset.orig==null)x.dataset.orig=x.getAttribute("content")||"";x.setAttribute("content",over?o["--bg"]:x.dataset.orig);});}
+applyTheme();
+try{matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{applyTheme();if(S.tab==="settings")render();});}catch(e){}
+try{new MutationObserver(()=>{applyTheme();if(S.tab==="settings")render();}).observe(document.documentElement,{attributes:true,attributeFilter:["data-theme"]});}catch(e){}
+function themeSection(){const {p,m}=themePref();const dark=themeDark();
+  return `<section class="card"><div class="row"><h2>화면 색</h2><div class="seg-toggle" role="group" aria-label="밝게·어둡게">${[["system","시스템 따름"],["light","밝게"],["dark","어둡게"]].map(([k,l])=>`<button type="button" data-kmode="${k}" aria-pressed="${m===k}">${l}</button>`).join("")}</div></div>
+   <div class="palgrid">${PALETTES.map(([id,name])=>{const c=themeVars(id,dark);return `<button type="button" class="palbtn" data-kpal="${id}" aria-pressed="${p===id}"><span class="sw" aria-hidden="true">${["--accent","--accent-soft","--bg","--ink"].map(k=>`<i style="background:${c[k]}"></i>`).join("")}</span>${esc(name)}</button>`;}).join("")}</div>
+   <span class="hint">오른 값(빨강)·내린 값(파랑)·주의(주황) 같은 뜻 색은 어느 색에서나 같습니다. 고른 색과 밝기는 이 기기에만 남습니다(안드로이드 앱과 같은 색).</span></section>`;}
+
 /* ---------- views ---------- */
 function vHome(){
   const t=totals();const accts=acctList();
@@ -2450,10 +2515,12 @@ function vHome(){
     <span class="label">총 평가액${priceDates()?` · ${esc(priceDateTxt())} 가격 기준`:""}</span>
     <span class="total">${eok(t.total)}</span>
     <span class="pl ${cls(pl)}">평가손익 ${fmtA(pl,{plus:true})} (${pct(plr,2)})</span>
+    ${dayMoveHtml()}
     ${periodChips()}
     ${(()=>{const fe=memberExp("__all");const w=twr(retPts("__all",true));return retCmpHtml(w,fe,{scen:"수익률 "+scenLabel()})+(w||fe?`<span class="hint rnote">${RET_NOTE}</span>`:"");})()}
     ${S.snapshots.length>1?`<button type="button" class="spark-btn" data-go="trend" aria-label="평가액 추이 보기">${sparkline(S.snapshots.slice(-120))}</button>`:""}
     </section>`;
+  h+=dayMoversCard();
   h+=planSummaryCard();
   if(needsFx())h+=`<div class="banner">달러 자산이 있는데 환율이 ${num(S.settings.usdkrw)?"맞지 않습니다(":"비어 있습니다"}${num(S.settings.usdkrw)?`${esc(S.settings.usdkrw)})`:""}. 달러 자산을 0원으로 계산하고 있습니다. <button class="btn small" data-go="settings">환율 입력</button></div>`;
   const missing=Object.values(S.holdings).filter(x=>priceInfo(x).missing).length;
@@ -2487,7 +2554,7 @@ function vHome(){
   return h;}
 
 function holdingRow(x,v,showAcct){const p=priceInfo(x);const c=hCost(x);const r=c?(v-c)/c:0;const a=S.accounts[x.accountId];
-  return `<button class="item" data-hold="${esc(x.id)}"><div class="row"><div class="l"><span class="name">${esc(x.name||x.ticker)}${x.note?` <span class="chip">${esc(x.note)}</span>`:""}</span>
+  return `<button class="item" data-hold="${esc(x.id)}"><div class="row"><div class="l"><span class="name">${esc(tName(x.ticker,x.name))}${x.note?` <span class="chip">${esc(x.note)}</span>`:""}</span>
     <span class="meta">${esc(x.ticker)} · ${nf2.format(num(x.qty))}주 · ${money(p.price,x.currency)}${p.missing?' <span class="chip warn">가격 없음</span>':""}${showAcct&&a?" · "+esc(a.name):""} · 예상 연 ${expTxt(expOf(x.ticker,x.assetClass,x).r+holdAdj(x))}</span></div>
     <div class="r"><b>${eok(v)}</b><span class="meta ${cls(r)}">${pct(r)}</span></div></div></button>`;}
 
@@ -2531,7 +2598,7 @@ function consolidate(mid){
   const byClass={};list.forEach(x=>{byClass[x.assetClass]=(byClass[x.assetClass]||0)+x.value;});if(cash)byClass["현금성"]=(byClass["현금성"]||0)+cash;
   return{accts,list,cash,total,byClass};}
 function conRow(x,total,detail){const r=x.cost?(x.value-x.cost)/x.cost:0;const w=total?x.value/total:0;const p=S.prices[x.ticker];
-  return `<div class="item conrow"><div class="row"><div class="l"><span class="name">${esc(x.name||x.ticker)}</span><span class="meta">${esc(x.ticker)} · ${nf2.format(x.qty)}주${detail?` · 평균 ${money(x.qty?x.costNative/x.qty:0,x.currency)}${p?` · 현재 ${money(p.price,x.currency)}`:""}`:""}</span></div>
+  return `<div class="item conrow"><div class="row"><div class="l"><span class="name">${esc(tName(x.ticker,x.name))}</span><span class="meta">${esc(x.ticker)} · ${nf2.format(x.qty)}주${detail?` · 평균 ${money(x.qty?x.costNative/x.qty:0,x.currency)}${p?` · 현재 ${money(p.price,x.currency)}`:""}`:""}</span></div>
     <div class="r"><b>${P2(w*100)}%</b><span class="meta">${eok(x.value)} · <span class="${cls(r)}">${pct(r)}</span></span></div></div>
     <div class="wbar"><span style="width:${Math.min(100,w*100).toFixed(2)}%"></span></div>
     ${detail&&x.accts.length>1?`<span class="meta">${x.accts.map(a=>`${esc(a.name)} ${nf2.format(a.qty)}주`).join(" · ")}</span>`:detail?`<span class="meta">${esc(x.accts[0].name)}</span>`:""}</div>`;}
@@ -2549,7 +2616,7 @@ function vMemberView(){
   if(!con.list.length&&!con.cash)return h+`<div class="card empty">보유 종목이 없습니다.</div>`;
   const top=con.list.slice(0,TK_COLORS.length);const restV=con.list.slice(TK_COLORS.length).reduce((s,x)=>s+x.value,0)+con.cash;
   h+=`<section class="card"><h2>종목 비중</h2><div class="bar">${top.map((x,i)=>`<span style="width:${con.total?x.value/con.total*100:0}%;background:${TK_COLORS[i]}"></span>`).join("")}${restV>0?`<span style="width:${con.total?restV/con.total*100:0}%;background:var(--line)"></span>`:""}</div>
-    <div class="legend">${top.map((x,i)=>`<span><i style="background:${TK_COLORS[i]}"></i>${esc(x.name||x.ticker)} ${con.total?P2(x.value/con.total*100)+"%":"–"}</span>`).join("")}${restV>0?`<span><i style="background:var(--line)"></i>${con.list.length>TK_COLORS.length?"그 외·":""}예수금 ${con.total?P2(restV/con.total*100)+"%":"–"}</span>`:""}</div>
+    <div class="legend">${top.map((x,i)=>`<span><i style="background:${TK_COLORS[i]}"></i>${esc(tName(x.ticker,x.name))} ${con.total?P2(x.value/con.total*100)+"%":"–"}</span>`).join("")}${restV>0?`<span><i style="background:var(--line)"></i>${con.list.length>TK_COLORS.length?"그 외·":""}예수금 ${con.total?P2(restV/con.total*100)+"%":"–"}</span>`:""}</div>
     <div class="list">${con.list.map(x=>conRow(x,con.total,true)).join("")}${con.cash?`<div class="item conrow"><div class="row"><div class="l"><span class="name">예수금</span><span class="meta">계좌 안 현금</span></div><div class="r"><b>${P2(con.cash/con.total*100)}%</b><span class="meta">${eok(con.cash)}</span></div></div><div class="wbar"><span style="width:${(con.cash/con.total*100).toFixed(2)}%;background:var(--muted)"></span></div></div>`:""}</div></section>`;
   const classes=CLASSES.filter(c=>con.byClass[c]>0);
   h+=`<section class="card"><h2>자산군 배분</h2><div class="bar">${classes.map(c=>`<span style="width:${con.byClass[c]/con.total*100}%;background:${CLASS_COLOR[c]}"></span>`).join("")}</div>
@@ -2582,7 +2649,7 @@ function vAccountDetail(a){const st=acctStats(a);const pl=st.value-st.cost;const
   ${st.hs.some(h=>h.currency==="USD")&&fx()?`<span class="meta">달러 종목은 매입가도 지금 환율(${nf2.format(fx())}원${S.settings.fxAsOf?`, ${esc(S.settings.fxAsOf)}`:""})로 바꿔 계산해, 평가손익·수익률에 환율 변동분은 들어 있지 않습니다.</span>`:""}
   ${a.memo?`<span class="meta">${esc(a.memo)}</span>`:""}</section>
   <section class="card"><div class="row"><h2>보유 종목</h2><div class="btns">${st.hs.length>1?`<button class="btn small${S.reorder==="holds"?" primary":""}" id="reorderHolds">${S.reorder==="holds"?"완료":"순서 변경"}</button>`:""}${S.reorder==="holds"?"":`<button class="btn small primary" id="addHold">종목 추가</button>`}</div></div>
-  ${st.hs.length?`<div class="list">${st.hs.map((x,i)=>S.reorder==="holds"?`<div class="item"><div class="row"><div class="l"><span class="name">${esc(x.name||x.ticker)}</span><span class="meta">${esc(x.ticker)} · ${eok(hVal(x))}</span></div><div class="mvb"><button class="btn small" data-mv="hold" data-id="${esc(x.id)}" data-dir="-1" aria-label="${esc(x.name||x.ticker)} 위로"${i===0?" disabled":""}>↑</button><button class="btn small" data-mv="hold" data-id="${esc(x.id)}" data-dir="1" aria-label="${esc(x.name||x.ticker)} 아래로"${i===st.hs.length-1?" disabled":""}>↓</button></div></div></div>`:holdingRow(x,hVal(x),false)).join("")}</div>`:`<div class="empty">아직 종목이 없습니다.</div>`}</section>`;
+  ${st.hs.length?`<div class="list">${st.hs.map((x,i)=>S.reorder==="holds"?`<div class="item"><div class="row"><div class="l"><span class="name">${esc(tName(x.ticker,x.name))}</span><span class="meta">${esc(x.ticker)} · ${eok(hVal(x))}</span></div><div class="mvb"><button class="btn small" data-mv="hold" data-id="${esc(x.id)}" data-dir="-1" aria-label="${esc(tName(x.ticker,x.name))} 위로"${i===0?" disabled":""}>↑</button><button class="btn small" data-mv="hold" data-id="${esc(x.id)}" data-dir="1" aria-label="${esc(tName(x.ticker,x.name))} 아래로"${i===st.hs.length-1?" disabled":""}>↓</button></div></div></div>`:holdingRow(x,hVal(x),false)).join("")}</div>`:`<div class="empty">아직 종목이 없습니다.</div>`}</section>`;
   return h;}
 
 function heldInfo(){const m={};const seen=[];
@@ -2615,7 +2682,7 @@ function vPrices(){
     const badge=!p?'<span class="chip warn">가격 없음</span>':!isFinite(age)?'<span class="chip warn">날짜 없음</span>':age<=0?'<span class="chip acc">오늘</span>':age<=3?`<span class="chip">${age}일 전</span>`:`<span class="chip warn">${age}일 전</span>`;
     const chg=p&&num(p.prevClose)>0?(num(p.price)-num(p.prevClose))/num(p.prevClose):null;
     const ex=expOf(r.ticker,r.assetClass);
-    const left=`<div class="l"><span class="name">${esc(r.name||r.ticker)} ${r.held?`<span class="chip acc">보유 ${nf2.format(r.held.qty)}주</span>`:""}</span><span class="meta">${esc(r.ticker)} · ${esc(r.assetClass||"기타")} · ${esc(r.currency||"KRW")}</span><span class="meta">예상 수익률 <b class="${ex.autoR?"":"accent"}">${P2(ex.r)}%</b>${ex.autoR?" (기본값)":""} · 배당 ${P2(ex.dy)}%${r.assetClass==="주식"||r.assetClass==="혼합"?` · ${esc(RET_STYLE[styleOf(r)][0])}`:""}</span>${(()=>{const h=pxHistTxt(r.ticker);return h?`<span class="meta">${h}</span>`:"";})()}</div>`;
+    const left=`<div class="l"><span class="name">${esc(tName(r.ticker,r.name))} ${r.held?`<span class="chip acc">보유 ${nf2.format(r.held.qty)}주</span>`:""}</span><span class="meta">${esc(r.ticker)} · ${esc(r.assetClass||"기타")} · ${esc(r.currency||"KRW")}</span><span class="meta">예상 수익률 <b class="${ex.autoR?"":"accent"}">${P2(ex.r)}%</b>${ex.autoR?" (기본값)":""} · 배당 ${P2(ex.dy)}%${r.assetClass==="주식"||r.assetClass==="혼합"?` · ${esc(RET_STYLE[styleOf(r)][0])}`:""}</span>${(()=>{const h=pxHistTxt(r.ticker);return h?`<span class="meta">${h}</span>`:"";})()}</div>`;
     if(ro)return `<div class="item"><div class="row">${left}<div class="mvb"><button class="btn small" data-mv="asset" data-id="${esc(r.ticker)}" data-dir="-1" aria-label="위로"${i===0?" disabled":""}>↑</button><button class="btn small" data-mv="asset" data-id="${esc(r.ticker)}" data-dir="1" aria-label="아래로"${i===rows.length-1?" disabled":""}>↓</button></div></div></div>`;
     return `<button class="item" data-price="${esc(r.ticker)}"><div class="row">${left}
     <div class="r"><b>${p?money(p.price,p.currency||r.currency):"–"}</b><span class="meta">${chg!==null?`<span class="${cls(chg)}">${pct(chg,2)}</span> `:""}${badge}</span></div></div></button>`;}).join("")}</div></section>
@@ -2633,6 +2700,7 @@ function vSettings(){const s=S.settings;const uc=unitCfg();const ex=1234567890;
    <label class="check"><input type="checkbox" id="sMonthMan"${monthMan()?" checked":""}${uc.u==="eok"?"":" disabled"}> 월 금액은 만원으로 보기</label>
    <span class="hint">억원 단위일 때만 적용됩니다. 수입·지출·이체의 월 금액과 연도 상세의 ‘월 ○○’처럼 1억 미만인 월 금액을 ‘월 0.005억원’ 대신 ‘월 50만원’으로 보여 줍니다.</span>
    <span class="hint">장부·계획·결과의 모든 금액을 이 단위로 보여줍니다. 예: 12억 3,456만 7,890원 → <b>${fmtA(ex)}</b>. 억원에 소수점 4자리면 만원 단위까지 정확합니다. 입력 칸은 그대로 만원(또는 원) 단위입니다. 주가·평단가는 원·달러 그대로 둡니다.</span></section>
+   ${themeSection()}
    ${S.planLoaded?vAssume():""}
    ${minCashSection()}
    ${retSection()}
@@ -2657,7 +2725,7 @@ function retSection(){const sc=retScen();const as=AS();const ks=["cons","base","
 function heldExpTable(ks,sc,fam){const {m}=heldInfo();const rows=watchList().filter(x=>m[x.ticker]);if(!rows.length)return "";
   return `<div class="tbl-wrap"><table class="tbl in"><thead><tr><th>보유 종목</th><th>유형</th>${ks.map(k=>`<th>${RET_SCEN[k][0]}</th>`).join("")}</tr></thead><tbody>
    ${rows.map(x=>{const e=expOf(x.ticker,x.assetClass);const st=styleOf(x);const eq=x.assetClass==="주식"||x.assetClass==="혼합";
-     return `<tr><td>${esc(x.name||x.ticker)}</td><td>${esc(x.assetClass||"기타")}${eq?` · ${esc(RET_STYLE[st][0])}`:""}</td>${ks.map(k=>{const v=expTxt(e.r+retAdj(x.assetClass||"기타",k,st));return `<td>${k===sc.k?`<b>${v}</b>`:v}</td>`;}).join("")}</tr>`;}).join("")}
+     return `<tr><td>${esc(tName(x.ticker,x.name))}</td><td>${esc(x.assetClass||"기타")}${eq?` · ${esc(RET_STYLE[st][0])}`:""}</td>${ks.map(k=>{const v=expTxt(e.r+retAdj(x.assetClass||"기타",k,st));return `<td>${k===sc.k?`<b>${v}</b>`:v}</td>`;}).join("")}</tr>`;}).join("")}
    ${fam[0][1]?`<tr class="tot"><td>가족 전체 계좌</td><td>가중평균</td>${fam.map(([k,e])=>`<td>${k===sc.k?`<b>${expTxt(e.r)}</b>`:expTxt(e.r)}</td>`).join("")}</tr>`:""}</tbody></table></div>
    <span class="hint">종목 유형은 이름으로 자동으로 정합니다(배당 ETF → 배당, S&P500 → 시장 지수, 나스닥100 → 성장·기술, 반도체 같은 테마 ETF와 개별 종목 → 테마·섹터·개별 종목). 다르면 ‘관심’ 메뉴에서 종목을 눌러 바꾸세요.</span>`;}
 function minCashSection(){const v=minCash();
@@ -3245,8 +3313,8 @@ function holdSheet(h,accountId){const isNew=!h;h=h||{accountId};
   if(!wl.length){openSheet(`<h3>종목 추가</h3><p style="margin:0">계좌에 넣을 종목은 ‘관심’ 메뉴의 종목 목록에서 고릅니다. 관심 종목에 종목을 먼저 추가하세요.</p><div class="btns"><span class="grow"></span><button class="btn" id="hCancel">닫기</button><button class="btn primary" id="hGo">‘관심’으로 이동</button></div>`,bg=>{bg.querySelector("#hCancel").onclick=closeSheet;bg.querySelector("#hGo").onclick=()=>{closeSheet();setTab("prices");};});return;}
   const cur0=tkey(h.ticker)||"";
   const aOf=t=>wl.find(x=>x.ticker===t)||{};
-  openSheet(`<h3>${isNew?"종목 추가":"종목 수정"}</h3>
-  <div class="field"><label for="hAsset">종목 (관심 종목)</label><select id="hAsset">${isNew?`<option value="">선택하세요</option>`:""}${wl.map(x=>`<option value="${esc(x.ticker)}"${x.ticker===cur0?" selected":""}>${esc(x.name||x.ticker)} · ${esc(x.ticker)}</option>`).join("")}</select><span class="hint" id="hAssetInfo"></span></div>
+  openSheet(`<h3>${isNew?"종목 추가":"종목 수정"}</h3>${isNew?"":tradeSeg(h.id,"edit")}
+  <div class="field"><label for="hAsset">종목 (관심 종목)</label><select id="hAsset">${isNew?`<option value="">선택하세요</option>`:""}${wl.map(x=>`<option value="${esc(x.ticker)}"${x.ticker===cur0?" selected":""}>${esc(tName(x.ticker,x.name))} · ${esc(x.ticker)}</option>`).join("")}</select><span class="hint" id="hAssetInfo"></span></div>
   <div class="grid2"><div class="field"><label for="hQty">수량</label><input id="hQty" inputmode="decimal" value="${fmtIn(h.qty)}"></div>
   <div class="field"><label for="hAvg" id="hAvgL">평균매입가</label><input id="hAvg" inputmode="decimal" value="${fmtIn(h.avgPrice)}"></div></div>
   <div class="field" id="hFxBox" hidden><label for="hFx">매입 환율 (원/달러, 선택)</label><input id="hFx" inputmode="decimal" value="${fmtIn(h.avgFx)}" placeholder="예: 1,380"><span class="hint">넣으면 원금을 그 환율로 세어 환율 손익까지 평가손익에 들어갑니다. 비우면 오늘 환율로 셉니다.</span></div>
@@ -3256,6 +3324,7 @@ function holdSheet(h,accountId){const isNew=!h;h=h||{accountId};
   <span class="hint">종목명, 통화, 자산군은 ‘관심’ 메뉴에서 관리합니다. 목록에 없는 종목은 ‘관심’ 메뉴에 먼저 추가하세요.</span>
   <span class="err" id="hErr" hidden></span>
   <div class="btns">${isNew?"":'<button class="btn danger" id="hDel">삭제</button>'}<span class="grow"></span><button class="btn" id="hCancel">취소</button><button class="btn primary" id="hSave">저장</button></div>`,bg=>{
+    bindTradeSeg(bg);
     const sel=bg.querySelector("#hAsset"),rk=bg.querySelector("#hRisky");
     const sync=first=>{const a=aOf(sel.value);const info=bg.querySelector("#hAssetInfo");
       info.textContent=a.ticker?`${a.assetClass||"기타"} · ${a.currency||"KRW"}${S.prices[a.ticker]?` · 현재가 ${money(S.prices[a.ticker].price,a.currency)}`:" · 현재가 없음"}`:"";
@@ -3277,14 +3346,69 @@ function holdSheet(h,accountId){const isNew=!h;h=h||{accountId};
     const del=bg.querySelector("#hDel");if(del)armDelete(del,async()=>{if(await write(db=>db.doc("holdings/"+h.id).delete(),"종목을 계좌에서 뺐습니다"))closeSheetOf(bg);});
   });}
 
+// 매수·매도 (안드로이드 앱과 같은 계산): 거래한 수량·단가(달러 종목은 환율)로 보유 수량과 평균 매입가(달러 종목은 매입 환율도)를 바꾸고,
+// 고르면 그 계좌의 예수금에서 빼거나(매수) 더한다(매도). 거래 기록은 따로 남기지 않는다 — 종목 수정과 같은 항목(qty·avgPrice·avgFx·cash)만 바꾼다.
+// 매수: 평균 매입가 = (가진 수량 × 평균가 + 산 수량 × 단가) ÷ 새 수량. 달러 종목의 매입 환율은 원금(달러) 가중평균 (예전 환율이 없으면 그대로 비워 둔다).
+// 매도: 평균 매입가는 그대로 수량만 준다. 전부 팔면 계좌에서 종목을 뺀다. 실현 손익 = 판 수량 × (단가 − 평균가) (원화, 달러는 매입 환율 또는 오늘 환율로)
+function tradeCalc(h,buy,qs,ps,fs,toCash){const q=num(qs),p=num(ps);
+  if(badNum(qs)||!(q>0))throw new Error("수량을 0보다 크게 입력하세요.");
+  if(badNum(ps)||!(p>0))throw new Error("단가를 0보다 크게 입력하세요.");
+  const usd=h.currency==="USD";const rt=!usd?1:String(fs||"").trim()===""?fx():num(fs);
+  if(usd&&!(rt>=FX_MIN&&rt<=FX_MAX))throw new Error(`환율을 넣으세요 (원/달러, ${FX_MIN}~${FX_MAX}).`);
+  const q0=num(h.qty),a0=num(h.avgPrice),f0=num(h.avgFx);
+  if(!buy&&q>q0+1e-9)throw new Error(`가진 수량(${nf2.format(q0)}주)보다 많이 팔 수 없습니다.`);
+  const rd=(x,d)=>Math.round(x*Math.pow(10,d))/Math.pow(10,d);
+  const q1=buy?q0+q:Math.max(0,q0-q),a1=buy?(q0*a0+q*p)/q1:a0;
+  const setFx=buy&&usd&&f0>0,f1=setFx?(q0*a0*f0+q*p*rt)/(q0*a0+q*p):f0;
+  const amount=q*p*rt;const realized=!buy&&a0>0?q*(p*rt-a0*(usd?(f0>0?f0:rt):1)):null;
+  const closes=!buy&&q1<1e-9;const acct=S.accounts[h.accountId]||null;const cash0=acct?num(acct.cash):0;
+  const cash1=toCash&&acct?Math.round(cash0+(buy?-amount:amount)):cash0;
+  return{usd,q0,q1:rd(q1,6),a0,a1:closes?a0:rd(a1,usd?4:2),setFx,f1:rd(f1,2),amount,realized,closes,acct,toCash:!!(toCash&&acct),cash0,cash1};}
+function tradeSeg(id,mode){return `<div class="seg-toggle" role="group" aria-label="수정·매수·매도" style="align-self:flex-start">${[["edit","수정"],["buy","매수"],["sell","매도"]].map(([k,l])=>`<button type="button" data-tmode="${k}" data-tid="${esc(id)}" aria-pressed="${k===mode}">${l}</button>`).join("")}</div>`;}
+function bindTradeSeg(bg){bg.querySelectorAll("[data-tmode]").forEach(b=>b.addEventListener("click",()=>{if(b.getAttribute("aria-pressed")==="true")return;const h=S.holdings[b.dataset.tid];if(!h){toast("종목을 찾을 수 없습니다");return;}
+  const m=b.dataset.tmode;if(m==="edit")holdSheet(h);else tradeSheet(h,m==="buy");}));}
+function tradeSheet(h,buy){const usd=h.currency==="USD";const pi=priceInfo(h);const acct=S.accounts[h.accountId];const m=v=>money(v,h.currency);
+  openSheet(`<h3>${esc(tName(h.ticker,h.name))}</h3>${tradeSeg(h.id,buy?"buy":"sell")}
+  <span class="meta">${acct?esc(acct.name)+" · ":""}가진 수량 ${nf2.format(num(h.qty))}주 · 평균 매입가 ${m(num(h.avgPrice))}${pi.missing?"":` · 현재가 ${m(pi.price)}`}</span>
+  <div class="grid2"><div class="field"><label for="tQty">${buy?"산 수량":"판 수량"}</label><input id="tQty" inputmode="decimal" autocomplete="off"></div>
+  <div class="field"><label for="tPrice">단가 (${usd?"달러":"원"})</label><input id="tPrice" inputmode="decimal" value="${pi.missing?"":fmtIn(pi.price)}"></div></div>
+  ${usd?`<div class="field"><label for="tFx">환율 (원/달러)</label><input id="tFx" inputmode="decimal" placeholder="${fx()>0?`비우면 오늘 ${nf2.format(fx())}`:"예: 1,400"}"></div>`:""}
+  ${acct?`<label class="check"><input type="checkbox" id="tCash" checked> ${esc(acct.name)} 예수금에 반영 (지금 ${eok(num(acct.cash))})</label>`:""}
+  <div class="kvlist" id="tPrev" hidden></div>
+  <span class="hint" id="tWarn" hidden style="color:var(--warn)"></span>
+  <span class="err" id="tErr" hidden></span>
+  <span class="hint">거래 기록은 따로 남기지 않고 보유 수량·평균 매입가${usd?"·매입 환율":""}${acct?"·예수금":""}만 바꿉니다.</span>
+  <div class="btns"><span class="grow"></span><button class="btn" id="tCancel">취소</button><button class="btn primary" id="tSave">${buy?"매수 기록":"매도 기록"}</button></div>`,bg=>{
+    bindTradeSeg(bg);
+    const g=s=>bg.querySelector(s);const val=s=>{const e=g(s);return e?e.value:"";};const cash=()=>{const c=g("#tCash");return !!(c&&c.checked);};
+    const calc=()=>tradeCalc(S.holdings[h.id]||h,buy,val("#tQty"),val("#tPrice"),val("#tFx"),cash());
+    const upd=()=>{g("#tErr").hidden=true;let r=null;try{if(val("#tQty").trim())r=calc();}catch(e){r=null;}
+      const pv=g("#tPrev"),wn=g("#tWarn");if(!r){pv.hidden=true;wn.hidden=true;return;}
+      pv.innerHTML=kv("수량",`${nf2.format(r.q0)}주 → <b>${nf2.format(r.q1)}주</b>`)+(buy?kv("평균 매입가",`${m(r.a0)} → <b>${m(r.a1)}</b>`):"")
+        +(r.setFx?kv("매입 환율",`${nf2.format(num(h.avgFx))} → <b>${nf2.format(r.f1)}</b>`):"")+kv("거래 금액",eok(r.amount))
+        +(r.toCash?kv("예수금",`${eok(r.cash0)} → <b${r.cash1<0?' class="up"':""}>${eok(r.cash1)}</b>`):"")
+        +(r.realized!=null?kv("실현 손익",`<b class="${cls(r.realized)}">${fmtA(r.realized,{plus:true})}</b>`):"");pv.hidden=false;
+      const w=[];if(r.closes)w.push("전부 팔면 이 종목을 계좌에서 뺍니다.");if(r.toCash&&r.cash1<0)w.push("예수금이 모자랍니다. 그대로 저장하면 예수금이 마이너스가 됩니다.");
+      wn.textContent=w.join(" ");wn.hidden=!w.length;};
+    bg.querySelectorAll("input").forEach(i=>i.addEventListener(i.type==="checkbox"?"change":"input",upd));upd();
+    g("#tCancel").onclick=closeSheet;
+    g("#tSave").onclick=async()=>{let r;try{r=calc();}catch(e){const er=g("#tErr");er.textContent=e.message;er.hidden=false;return;}
+      const ok=await write(async db=>{
+        if(r.closes)await db.doc("holdings/"+h.id).delete();
+        else{const f={qty:r.q1,avgPrice:r.a1};if(r.setFx)f.avgFx=r.f1;await db.doc("holdings/"+h.id).update(f);}
+        if(r.toCash)await db.doc("accounts/"+r.acct.id).update({cash:r.cash1});
+      },buy?"매수를 기록했습니다":r.closes?"전부 팔아 종목을 계좌에서 뺐습니다":"매도를 기록했습니다");
+      if(ok)closeSheetOf(bg);};
+  });}
 function priceSheet(ticker){assetSheet(ticker);}
 function assetSheet(ticker){const isNew=!ticker;const wl=watchList();const w=(ticker&&wl.find(x=>x.ticker===ticker))||{currency:"KRW",assetClass:"주식"};
   const p=(ticker&&S.prices[ticker])||{};const as0=(ticker&&S.assets[ticker])||{};const A0=AS();const cls0=w.assetClass||"기타";
   const held=w.held;
-  openSheet(`<h3>${isNew?"관심 종목 추가":esc(w.name||ticker)}</h3>${isNew?"":`<span class="meta">${esc(ticker)}${p.asOf?` · 가격 ${esc(p.asOf)} · ${esc(p.source||"")}`:""}</span>`}
+  openSheet(`<h3>${isNew?"관심 종목 추가":esc(tName(ticker,w.name))}</h3>${isNew?"":`<span class="meta">${esc(ticker)}${p.asOf?` · 가격 ${esc(p.asOf)} · ${esc(p.source||"")}`:""}</span>`}
   <div class="grid2"><div class="field"><label for="aTicker">종목코드</label><input id="aTicker" value="${esc(ticker||"")}" placeholder="예: 360750, SCHD" autocapitalize="characters"${isNew?"":" readonly"}></div>
   <div class="field"><label for="aCur">통화</label><select id="aCur">${opts(["KRW","USD"],w.currency||"KRW")}</select></div></div>
   <div class="field"><label for="aName">종목명</label><input id="aName" value="${esc(w.name||"")}" placeholder="예: TIGER 미국S&P500"></div>
+  <div class="field"><label for="aAlias">약칭 (선택)</label><input id="aAlias" value="${esc(ticker?aliasOf(ticker):"")}" placeholder="예: S&P500"><span class="hint">넣으면 계좌·종목 비중·요약·추이·자산 배분 등 화면에 약칭으로 보입니다. 비우면 종목명으로 보입니다. 안드로이드 앱과 같은 약칭을 씁니다.</span></div>
   <div class="grid2"><div class="field"><label for="aClass">자산군</label><select id="aClass">${opts(CLASSES,cls0)}</select></div>
   <div class="field" style="justify-content:flex-end"><label class="check"><input type="checkbox" id="aRisky"${(w.riskyDefault??RISKY_DEFAULT[cls0])?" checked":""}> 퇴직연금 위험자산</label></div></div>
   <h4>현재가</h4>
@@ -3328,7 +3452,9 @@ function assetSheet(ticker){const isNew=!ticker;const wl=watchList();const w=(ti
         if(priceEdited){const data={name,price,currency:cur.value,asOf:date,source:price!==num(pc.price)||!pc.source?"직접 입력":pc.source,updatedAt:new Date().toISOString()};if(pc.prevClose&&date===pc.asOf)data.prevClose=pc.prevClose;await db.doc("prices/"+t).set(data);}
         else if(metaOnly)await db.doc("prices/"+t).update({name,currency:cur.value,updatedAt:new Date().toISOString()});
       },isNew?"관심 목록에 추가했습니다":"저장했습니다");
-      if(ok)closeSheetOf(bg);};
+      // 약칭: 설정 문서의 aliases에 둔다 (안드로이드 앱과 같은 자리. 종목 정보를 다시 저장해도 지워지지 않게)
+      if(ok){const al=bg.querySelector("#aAlias").value.trim();if(al!==aliasOf(t)){const A={...((S.settings||{}).aliases||{})};for(const k of Object.keys(A))if(tkey(k)===t)delete A[k];if(al)A[t]=al;writeSettings({...S.settings,aliases:A});render();}
+        closeSheetOf(bg);}};
     const del=bg.querySelector("#aDel");if(del)armDelete(del,async()=>{
       if(heldInfo().m[ticker]){toast("보유 중인 종목은 삭제할 수 없습니다");return;}
       if(await write(async db=>{if(S.assets[ticker])await db.doc("assets/"+ticker).delete();if(S.prices[ticker])await db.doc("prices/"+ticker).delete();},"‘관심’ 메뉴에서 삭제했습니다"))closeSheetOf(bg);});
@@ -3342,13 +3468,21 @@ function moveAcct(id,dir){const g=ownerGroups().find(x=>x.accts.some(a=>a.id===i
 function moveHold(id,dir){const h=S.holdings[id];if(!h)return;const list=acctHoldings(h.accountId).slice();
   const i=list.findIndex(x=>x.id===id),j=i+dir;if(j<0||j>=list.length)return;[list[i],list[j]]=[list[j],list[i]];
   applyOrder("holdings",list,S.holdings);}
+// 관심 목록에 아직 저장하지 않은 종목(보유 종목·가격에서 온 것)을 순서 변경으로 새로 저장하는 중: {종목: 저장할 문서}.
+// 저장이 끝나기 전에 저장소 기록이 들어와도 목록에서 빠지지 않게 붙여 두고, 기록에 나타나면 뺀다
+S.assetNew={};
+function keepNewAssets(o){for(const t in S.assetNew){if(o[t])delete S.assetNew[t];else o[t]={...S.assetNew[t],id:t};}}
 function moveAsset(t,dir){const list=watchList();const i=list.findIndex(x=>x.ticker===t),j=i+dir;if(i<0||j<0||j>=list.length)return;[list[i],list[j]]=[list[j],list[i]];
   const changed=list.map((x,k)=>[x,k]).filter(([x,k])=>x.order!==k);
-  const had=new Set(changed.filter(([x])=>S.assets[x.ticker]).map(([x])=>x.ticker));
-  changed.forEach(([x,k])=>{S.assets[x.ticker]={...(S.assets[x.ticker]||{ticker:x.ticker,name:x.name,currency:x.currency,assetClass:x.assetClass,riskyDefault:x.riskyDefault??null}),order:k};S.ordPend.assets[x.ticker]=k;});hydrate();render();
-  // 이미 있는 관심 종목은 순서만 고친다 (다른 곳에서 바뀐 이름 등을 옛 값으로 덮지 않게)
-  orderQ=orderQ.then(async()=>{const ok=await write(async db=>{for(const [x,k] of changed){if(had.has(x.ticker))await db.doc("assets/"+x.ticker).update({order:k});else{const {id,saved,held,...doc}=S.assets[x.ticker];await db.doc("assets/"+x.ticker).set({...doc,order:k});}}});
-    if(!ok)changed.forEach(([x])=>delete S.ordPend.assets[x.ticker]);});}
+  // 저장할 내용은 누른 때 정해 둔다 (쓰는 도중에 저장소 기록이 들어와 S.assets가 바뀌어도 그대로 쓴다).
+  // 이미 저장된 관심 종목은 순서만 고치고(다른 곳에서 바뀐 이름 등을 옛 값으로 덮지 않게), 아직 없는 종목은 문서를 통째로 만든다
+  const jobs=changed.map(([x,k])=>{const tk=x.ticker;
+    if(S.assets[tk]&&!S.assetNew[tk])return [tk,k,null];
+    const base=S.assetNew[tk]||{ticker:tk,name:x.name||tk,currency:x.currency||"KRW",assetClass:x.assetClass||"기타",riskyDefault:x.riskyDefault??null};
+    const doc={...base,order:k};S.assetNew[tk]=doc;return [tk,k,doc];});
+  jobs.forEach(([tk,k,doc])=>{if(doc)S.assets[tk]={...doc,id:tk};else{S.assets[tk]={...S.assets[tk],order:k};S.ordPend.assets[tk]=k;}});hydrate();render();
+  orderQ=orderQ.then(async()=>{const ok=await write(async db=>{for(const [tk,k,doc] of jobs){if(doc)await db.doc("assets/"+tk).set(doc);else await db.doc("assets/"+tk).update({order:k});}});
+    if(!ok){jobs.forEach(([tk,k,doc])=>{if(!doc){delete S.ordPend.assets[tk];return;}if(S.assetNew[tk]===doc){delete S.assetNew[tk];if(S.assets[tk]&&S.assets[tk].order===k)delete S.assets[tk];}});hydrate();render();}});}
 let orderQ=Promise.resolve();
 function applyOrder(col,list,store){
   const changed=list.map((x,i)=>[x.id,i]).filter(([id,i])=>store[id]&&store[id].order!==i);
@@ -3363,6 +3497,8 @@ app.addEventListener("click",async e=>{const t=e.target.closest("button");if(!t)
   if(t.dataset.hold){holdSheet(S.holdings[t.dataset.hold]);return;}
   if(t.dataset.price){priceSheet(t.dataset.price);return;}
   if(t.dataset.mv){const d=num(t.dataset.dir);if(t.dataset.mv==="acct")moveAcct(t.dataset.id,d);else if(t.dataset.mv==="asset")moveAsset(t.dataset.id,d);else moveHold(t.dataset.id,d);return;}
+  if(t.dataset.kmode){setThemePref("kf.mode",t.dataset.kmode);render();return;}
+  if(t.dataset.kpal){setThemePref("kf.palette",t.dataset.kpal);render();return;}
   if(t.dataset.rscen){await saveRet({retScenario:t.dataset.rscen},`수익률을 ‘${RET_SCEN[t.dataset.rscen][0]}’으로 계산합니다`);return;}
   if(t.dataset.gd){gdRun(t.dataset.gd);return;}
   if(trendClick(t))return;
@@ -3959,7 +4095,7 @@ function rateInfo(id) {
   const ea = acctExp(a);
   if (has(ap.returnOverride)) return `계좌 계획에서 직접 넣은 수익률 ${P2(num(ap.returnOverride))}%.${adjNote(ea.adj)}`;
   const st = acctStats(a); const tot = st.total; if (!(tot > 0)) { const dc = a.type === "생활비" ? "현금성" : "혼합"; return `‘${dc}’ 가정 ${P2(num(as.returns[dc]))}%.${adjNote(ea.adj)}`; }
-  const parts = st.hs.map(h => { const e = expOf(h.ticker, h.assetClass, h); return { n: h.name || h.ticker, w: hVal(h) / tot, r: e.r, auto: e.autoR, cls: h.assetClass || "기타" }; });
+  const parts = st.hs.map(h => { const e = expOf(h.ticker, h.assetClass, h); return { n: tName(h.ticker, h.name), w: hVal(h) / tot, r: e.r, auto: e.autoR, cls: h.assetClass || "기타" }; });
   if (st.cash > 0) parts.push({ n: a.type === "생활비" ? "현금" : "예수금", w: st.cash / tot, r: num(as.returns["현금성"]), auto: true, cls: "현금성" });
   parts.sort((x, y) => y.w - x.w);
   const top = parts.slice(0, 4).map(q => `${esc(q.n)} ${P2(num(q.r))}%${q.auto ? `(‘${esc(q.cls)}’ 가정)` : ""}×비중 ${P2(q.w * 100)}%`).join(" + ");
@@ -4560,14 +4696,14 @@ function alInfo(key) {
   const as = AS();
   if (key === AL_CASH) return { key, name: "예수금", cls: "현금성", r: num(as.returns["현금성"]), rBase: num(as.returns["현금성"]), dy: num(as.divYield["현금성"]), risky: false, kind: "cash", price: 0, etf: true };
   const w = watchList().find(x => x.ticker === key) || {}; const h = Object.values(S.holdings).find(x => tkey(x.ticker) === key);
-  const cls = w.assetClass || (h && h.assetClass) || "기타"; const cur = w.currency || (h && h.currency) || "KRW"; const name = w.name || (h && h.name) || key;
+  const cls = w.assetClass || (h && h.assetClass) || "기타"; const cur = w.currency || (h && h.currency) || "KRW"; const name0 = w.name || (h && h.name) || key; const name = aliasOf(key) || name0;   // name: 화면에 보일 이름(약칭), name0: 이름으로 추정하는 계산용
   const p = S.prices[key]; const px = p && num(p.price) > 0 ? num(p.price) : h ? num(h.avgPrice) : 0;
-  const e = expOf(key, cls, h); const st = styleOf({ ticker: key, name, assetClass: cls });
+  const e = expOf(key, cls, h); const st = styleOf({ ticker: key, name: name0, assetClass: cls });
   // 위험자산 여부: IRP·DC 계좌에 든 보유분에 적은 값(하나라도 위험자산이면 위험자산), 없으면 다른 보유분, 그다음 종목 기본값
   const hk = Object.values(S.holdings).filter(x => tkey(x.ticker) === key && x.risky != null); const hc = hk.filter(x => RISK_CAPPED.has((S.accounts[x.accountId] || {}).type));
   const risky = hc.length ? hc.some(x => !!x.risky) : hk.length ? hk.some(x => !!x.risky) : (w.riskyDefault != null ? !!w.riskyDefault : !!RISKY_DEFAULT[cls]);
-  return { key, name, cls, cur, r: e.r + retAdj(cls, null, st), rBase: e.r, dy: e.dy, risky, kind: holdTaxKind({ name, currency: cur, assetClass: cls }), price: px * rate(cur), priceNative: px,
-    etf: cur === "USD" ? !!KNOWN_STYLE[key] || /ETF|TRUST|FUND/i.test(name) : ETF_RE.test(name), lev: LEV_RE.test(name), missing: !(p && num(p.price) > 0) };
+  return { key, name, name0, cls, cur, r: e.r + retAdj(cls, null, st), rBase: e.r, dy: e.dy, risky, kind: holdTaxKind({ name: name0, currency: cur, assetClass: cls }), price: px * rate(cur), priceNative: px,
+    etf: cur === "USD" ? !!KNOWN_STYLE[key] || /ETF|TRUST|FUND/i.test(name0) : ETF_RE.test(name0), lev: LEV_RE.test(name0), missing: !(p && num(p.price) > 0) };
 }
 // 계좌 규칙: 해외 상장은 일반계좌만, 개별 종목·레버리지는 연금계좌(연금저축·IRP) 불가
 function alRule(a, inf) {
@@ -4788,11 +4924,11 @@ function vAlloc() {
    <div class="tbl-wrap" data-keep="alTgt"><table class="tbl in al"><thead><tr><th>종목</th><th>목표 (${c.year}년, %)</th><th>현재</th><th>예상 수익률</th></tr></thead><tbody>
    ${c.keys.map((k, j) => { const i = c.info[k]; const rm = k !== AL_CASH && !((c.heldNow[k] || 0) > 0); const nk = c.keys.filter(x => x !== AL_CASH).length;
      const ord = S.alOrdMode && k !== AL_CASH ? `<span class="ordb"><button type="button" class="btn small" data-alord="${esc(k)}|-1" aria-label="${esc(i.name)} 위로"${j === 0 ? " disabled" : ""}>↑</button><button type="button" class="btn small" data-alord="${esc(k)}|1" aria-label="${esc(i.name)} 아래로"${j >= nk - 1 ? " disabled" : ""}>↓</button></span>` : "";
-     return `<tr><td>${ord}<span class="tgn">${esc(i.name)}${rm ? `<button type="button" class="rmx" data-alrm="${esc(k)}" aria-label="${esc(i.name)} 목록에서 빼기" title="목록에서 빼기">×</button>` : ""}</span><span class="meta">${esc(i.cls)}${k !== AL_CASH && (i.cls === "주식" || i.cls === "혼합") ? " · " + esc(RET_STYLE[styleOf({ ticker: k, name: i.name })][0]) : ""}${i.risky ? " · 위험자산" : ""}${c.lockedK[k] ? ` · 잠금 ${pct2(c.lockedK[k] / c.total)}` : ""}</span></td>
+     return `<tr><td>${ord}<span class="tgn">${esc(i.name)}${rm ? `<button type="button" class="rmx" data-alrm="${esc(k)}" aria-label="${esc(i.name)} 목록에서 빼기" title="목록에서 빼기">×</button>` : ""}</span><span class="meta">${esc(i.cls)}${k !== AL_CASH && (i.cls === "주식" || i.cls === "혼합") ? " · " + esc(RET_STYLE[styleOf({ ticker: k, name: i.name0 || i.name })][0]) : ""}${i.risky ? " · 위험자산" : ""}${c.lockedK[k] ? ` · 잠금 ${pct2(c.lockedK[k] / c.total)}` : ""}</span></td>
      <td><input data-altgt="${esc(k)}" inputmode="decimal" value="${esc(c.tg[k] || 0)}" aria-label="${esc(i.name)} 목표 비중(%)"></td><td>${pct2(c.cw[k] || 0)}</td><td>연 ${expTxt(i.r)}${c.divMode === "reinvest" ? "" : `<br><span class="meta">${c.pool ? "가격 상승" : "배당 빼면"} ${expTxt(c.er(k))}</span>`}</td></tr>`; }).join("")}
    <tr class="tot"><td>합계</td><td><b class="${Math.abs(c.tsum - 100) > 0.05 ? "up" : ""}">${P2(c.tsum)}%</b></td><td>100%</td><td></td></tr></tbody></table></div>
    ${Math.abs(c.tsum - 100) > 0.05 ? `<span class="hint">합계가 100%가 아니어서 비율대로 나눠 계산했습니다.</span>` : ""}
-   ${addable.length ? `<div class="btns"><select id="alAdd" aria-label="종목 추가"><option value="">종목 추가…</option>${addable.map(x => `<option value="${esc(x.ticker)}">${esc(x.name || x.ticker)}</option>`).join("")}</select></div>` : ""}
+   ${addable.length ? `<div class="btns"><select id="alAdd" aria-label="종목 추가"><option value="">종목 추가…</option>${addable.map(x => `<option value="${esc(x.ticker)}">${esc(tName(x.ticker, x.name))}</option>`).join("")}</select></div>` : ""}
    <span class="hint">예상 수익률은 ‘관심’ 메뉴의 종목별 값(없으면 자산군 가정)에 설정의 보수·낙관 보정을 더한 값입니다. 목표 비중을 0으로 두면 그 종목은 모두 팝니다. 지금 가지고 있지 않은 종목은 이름 옆 ×로 목록에서 뺍니다(그 종목에 지정한 수량도 함께 풉니다).</span></details>`;
   // 기대 수익률
   const ex = c.exp; const col = (l, f) => `<tr><td>${l}</td><td>${f(ex.before)}</td><td><b>${f(ex.after)}</b></td><td>${f(ex.ideal)}</td></tr>`;
@@ -5163,7 +5299,7 @@ function trToggles(pctMode, list, first) {
   let h = `<div class="legend tgls"><span><i style="background:var(--c1)"></i>${pctMode ? `${esc(first.date)}부터 실제 수익률` : "평가액"}</span>`;
   if (!pctMode && list.some(x => x.cost > 0)) h += tg("cost", "원금 (매입 금액 + 현금)", `<i class="dash" style="border-color:var(--c2)"></i>`);
   for (const [sc, nm, c] of EXP_SC) { const e = memberExp(k, sc); if (e) h += tg("exp:" + sc, `기대 ${nm} 연 ${expTxt(e.r)}`, `<i class="dash dot" style="border-color:${c}"></i>`); }
-  trBench().forEach((t, i) => { const w = wl.find(x => x.ticker === t) || {}; h += `<span class="tgl-wrap">${tg("b:" + t, `${esc(w.name || t)}${S.pxHistBusy && !pxHistOk(t) ? " (가격 불러오는 중…)" : ""}`, `<i style="background:${BENCH_C[i]};height:3px;border-radius:1px"></i>`)}<button type="button" class="tgl-x" data-trbx="${esc(t)}" aria-label="${esc(w.name || t)} 비교 빼기">×</button></span>`; });
+  trBench().forEach((t, i) => { const w = wl.find(x => x.ticker === t) || {}; h += `<span class="tgl-wrap">${tg("b:" + t, `${esc(tName(t, w.name))}${S.pxHistBusy && !pxHistOk(t) ? " (가격 불러오는 중…)" : ""}`, `<i style="background:${BENCH_C[i]};height:3px;border-radius:1px"></i>`)}<button type="button" class="tgl-x" data-trbx="${esc(t)}" aria-label="${esc(tName(t, w.name))} 비교 빼기">×</button></span>`; });
   if (trBench().length < 3) h += `<button type="button" class="tgl add" data-trbadd>+ 비교 종목</button>`;
   return h + `</div>`;
 }
@@ -5193,7 +5329,7 @@ function trSeries() {
     if (sc === retScen().k) { exp = path; er = e.r / 100; }
     if (trShowOn("exp:" + sc)) lines.push({ key: "exp:" + sc, label: `기대 ${nm}`, color: c, dash: "2 3", w: 1.6, vals: path, cls: "trexp" }); }
   trBench().forEach((t, i) => { if (!trShowOn("b:" + t)) return; const v = benchPath(t); if (!v) return; const w = watchList().find(x => x.ticker === t) || {};
-    lines.push({ key: "b:" + t, label: w.name || t, color: BENCH_C[i], dash: null, w: 1.6, vals: v, cls: "trbench" }); });
+    lines.push({ key: "b:" + t, label: tName(t, w.name), color: BENCH_C[i], dash: null, w: 1.6, vals: v, cls: "trbench" }); });
   let hi = 0, lo = 0; val.forEach((v, i) => { if (v > val[hi]) hi = i; if (v < val[lo]) lo = i; });
   return { list, tt, val, exp, er, hi, lo, pctMode, lines };
 }
@@ -5260,7 +5396,7 @@ function trendClick(t) {
 function benchSheet() {
   const cur = trBench(); const wl = watchList().filter(w => w.ticker);
   openSheet(`<h3>비교 종목</h3><span class="meta">기간 첫 기록부터 이 종목에 모두 넣었다면 어떻게 됐을지 그래프에 함께 그립니다. 가격만 따라가고 분배금(배당)은 넣지 않습니다. 최대 3개, 관심 종목에서 고릅니다. 가격 기록은 구글 시트(GOOGLEFINANCE)에서 가져옵니다.</span>
-    <div class="list">${wl.map(w => `<label class="item check" style="display:flex;gap:10px;align-items:center"><input type="checkbox" value="${esc(w.ticker)}"${cur.includes(w.ticker) ? " checked" : ""}> <span><b>${esc(w.name || w.ticker)}</b> <span class="meta">${esc(w.ticker)}</span></span></label>`).join("")}</div>
+    <div class="list">${wl.map(w => `<label class="item check" style="display:flex;gap:10px;align-items:center"><input type="checkbox" value="${esc(w.ticker)}"${cur.includes(w.ticker) ? " checked" : ""}> <span><b>${esc(tName(w.ticker, w.name))}</b> <span class="meta">${esc(w.ticker)}</span></span></label>`).join("")}</div>
     <div class="btns"><button type="button" class="btn primary" id="bSave">저장</button><span class="grow"></span><button type="button" class="btn" id="pCancel">닫기</button></div>`, bg => {
     const boxes = [...bg.querySelectorAll('input[type="checkbox"]')];
     const lim = () => { const n = boxes.filter(b => b.checked).length; boxes.forEach(b => { b.disabled = !b.checked && n >= 3; }); }; lim(); boxes.forEach(b => b.addEventListener("change", lim));

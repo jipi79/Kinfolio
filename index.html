@@ -547,6 +547,8 @@ b.accent{color:var(--accent)}
 .kvlist h4{margin:10px 0 2px;color:var(--muted);font-size:12.5px;letter-spacing:.03em}
 .kvr{display:flex;justify-content:space-between;gap:12px;padding:3px 0;border-bottom:1px dashed var(--line);font-size:14px}
 .kvr span:last-child{text-align:right;white-space:nowrap}
+details.synclog>summary{cursor:pointer;font-size:13px;color:var(--muted);padding:2px 0}
+details.synclog .kvr span:first-child{white-space:nowrap}details.synclog .kvr span:last-child{white-space:normal}
 .acf{border-bottom:1px dashed var(--line)}
 .acf summary{display:flex;align-items:center;gap:10px;padding:7px 0;cursor:pointer;list-style:none;font-size:14px}
 .acf summary::-webkit-details-marker{display:none}
@@ -585,6 +587,9 @@ b.accent{color:var(--accent)}
 const KSync = (() => {
   const COLS = ["accounts", "holdings", "prices", "assets", "snapshots"];
   const TOMB_DAYS = 180, SEEN_MAX = 100;
+  // 업로드 기록(log): 올릴 때마다 맨 앞에 한 줄 (언제·어느 앱·판·바꾼 문서 수). 세 앱(웹·안드로이드·윈도우)이 같은 모양으로 이어 쓴다
+  const LOG_MAX = 50;
+  const LOG_COLS = ["accounts", "holdings", "prices", "assets", "snapshots", "settings", "plan"];
   // 설정·계획은 한 문서에 여러 항목이 있어, 양쪽이 고쳤으면 항목별로 합친다 (지난 동기화 내용을 기준으로)
   const FIELD = new Set(["settings/main", "plan/main"]);
   const clone = v => v === undefined ? undefined : JSON.parse(JSON.stringify(v));
@@ -735,18 +740,26 @@ const KSync = (() => {
     for (const p in h || {}) { const e = h[p]; if (p.startsWith("snapshots/") && Array.isArray(e) && e.length === 2 && !e[1]) { s[p.slice(10)] = e[0]; n++; } else o[p] = e; }
     if (n) o["~snapshots"] = s; return o; }
   function unpackBase(h) { if (!h || !h["~snapshots"]) return h; const o = { ...h }; const s = o["~snapshots"]; delete o["~snapshots"]; for (const d in s) o["snapshots/" + d] = [s[d], null]; return o; }
-  function serialize(docs, tombs, device, now, rev, seen) {
+  // 업로드 기록 한 줄: 이번 업로드가 드라이브 파일에서 바꾼 문서 수(모음별). before(p): 올리기 전 드라이브 파일의 그 문서 해시 (없으면 "")
+  function logEntry(docs, paths, before, app, rev, now, ver) {
+    const n = {};
+    for (const p of paths) { if (hash(docs[p]) === before(p)) continue; const c = p.slice(0, p.indexOf("/")); n[c] = (n[c] || 0) + 1; }
+    const chg = {}; for (const c of LOG_COLS) if (n[c]) chg[c] = n[c]; for (const c in n) if (!(c in chg)) chg[c] = n[c];
+    const e = { at: new Date(now).toISOString(), app: app || "" }; if (ver) e.ver = ver; e.rev = rev || 1; e.chg = chg; return e;
+  }
+  function serialize(docs, tombs, device, now, rev, seen, log) {
     const o = { app: "Kinfolio", format: 1, kind: "sync", rev: rev || 1, exportedAt: new Date(now || Date.now()).toISOString(), device: device || "", data: unflatten(docs), tombs: tombs || {} };
     if (Array.isArray(seen)) o.seen = seen.slice(0, SEEN_MAX);
+    if (Array.isArray(log)) o.log = log.slice(0, LOG_MAX);
     return JSON.stringify(o);
   }
   function parse(text) {
     let d; try { d = JSON.parse(text); } catch (e) { return null; }
     if (!d || d.app !== "Kinfolio" || !d.data || typeof d.data !== "object") return null;
     const tombs = d.tombs && typeof d.tombs === "object" ? d.tombs : {};
-    return { docs: flatten(d.data), tombs, rev: Number(d.rev) || 0, exportedAt: d.exportedAt || null, device: d.device || "", seen: Array.isArray(d.seen) ? d.seen.filter(x => typeof x === "string") : null };
+    return { docs: flatten(d.data), tombs, rev: Number(d.rev) || 0, exportedAt: d.exportedAt || null, device: d.device || "", seen: Array.isArray(d.seen) ? d.seen.filter(x => typeof x === "string") : null, log: Array.isArray(d.log) ? d.log.filter(isObj) : null };
   }
-  return { COLS, FIELD, SEEN_MAX, stable, hash, flatten, unflatten, baseOf, merge, merge3, mergeLocal, serialize, parse, packBase, unpackBase };
+  return { COLS, FIELD, SEEN_MAX, LOG_MAX, logEntry, stable, hash, flatten, unflatten, baseOf, merge, merge3, mergeLocal, serialize, parse, packBase, unpackBase };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = KSync;
 </script>
@@ -3024,7 +3037,7 @@ async function syncRun(auto){
       const B=first?{}:S.syncBase.h,brev=first?0:(S.syncBase.rev||0),head=first?null:(S.syncBase.head||null);
       // 드라이브 파일이 지난 동기화 뒤 그대로면 내려받지 않는다 (이 기기에서 고친 것만 올리면 된다)
       const same=!first&&!!list[0]&&!!S.syncBase.fk&&syncKey(list)===S.syncBase.fk;
-      let R={},T={},from=null,rrev=0,res,rseen=same?(S.syncBase.seen||null):null;
+      let R={},T={},from=null,rrev=0,res,rseen=same?(S.syncBase.seen||null):null,rlog=same?(S.syncBase.log||null):null,rlast=same?(S.syncBase.last||null):null;
       const t1=new Date().toISOString();
       // 평가액 기록이 1000개를 넘으면 앞 기록도 읽어 함께 맞춘다 (못 읽은 기록을 ‘지운 것’으로 보지 않게)
       const oldSn={};for(const x of await olderSnaps())oldSn["snapshots/"+x.date]=x;
@@ -3034,7 +3047,7 @@ async function syncRun(auto){
       if(same){res=KSync.mergeLocal(L,B,S.syncBase.t||{},dopt);rrev=brev;}
       else{
         if(list[0]){const r=await gdCall("download_file_content",{fileId:list[0].id});const doc=KSync.parse(b64utf8(r&&r.content));
-          if(!doc)throw{code:"tool_error",message:"드라이브의 동기화 파일을 읽을 수 없습니다"};R=doc.docs;T=doc.tombs;rrev=doc.rev;rseen=doc.seen;}
+          if(!doc)throw{code:"tool_error",message:"드라이브의 동기화 파일을 읽을 수 없습니다"};R=doc.docs;T=doc.tombs;rrev=doc.rev;rseen=doc.seen;rlog=doc.log;rlast={app:doc.device,at:doc.exportedAt};}
         else if(first&&PWA&&!acctList().length){   // 앱을 처음 연결했는데 동기화 파일이 없으면 가장 최근 백업에서 시작
           const b=(await gdBackupsIn(fid))[0];
           if(b){const r=await gdCall("download_file_content",{fileId:b.id});const doc=KSync.parse(b64utf8(r&&r.content));if(doc){R=doc.docs;from=b.title;}}}
@@ -3042,12 +3055,16 @@ async function syncRun(auto){
         // 들어 있으면 파일이 내 것 뒤에 이어진 것이라, 다른 기기가 지운 기록을 없앤 것(다시 추가)도 그대로 따른다. 예전 형식 파일은 판 번호로 판단
         const lost=!first&&head&&Array.isArray(rseen)?!rseen.includes(head):null;
         res=KSync.merge(L,R,B,T,{...dopt,knownTombs:lost===false?{}:((!first&&S.syncBase.t)||{}),preferRemote:first&&!acctList().length,regress:!first&&!!list[0]&&(lost!==null?lost:rrev<=brev)});}
-      const upload=res.remoteChanged||!list[0];let rev=Math.max(rrev,brev),fk=syncKey(list),old=[],up=null,seenOut=Array.isArray(rseen)?rseen:[];
+      const upload=res.remoteChanged||!list[0];let rev=Math.max(rrev,brev),fk=syncKey(list),old=[],up=null,seenOut=Array.isArray(rseen)?rseen:[],logOut=Array.isArray(rlog)?rlog:null,lastOut=rlast;
       if(upload){
         let now2=list;
         if(!same&&list[0]){now2=await syncFiles(fid);if(syncKey(now2)!==syncKey(list)&&round<2)continue;}   // 내려받는 사이 다른 기기가 올렸으면 처음부터 다시 맞춘다
         rev=Math.max(rrev,brev)+1;up=Date.now().toString(36)+Math.random().toString(36).slice(2,8);seenOut=[up,...(Array.isArray(rseen)?rseen:[])].slice(0,KSync.SEEN_MAX);
-        const text=KSync.serialize(res.docs,res.tombs,PWA?"앱":"아티팩트",Date.now(),rev,seenOut);
+        // 업로드 기록: 이번에 드라이브 파일에서 바꾼 문서 수 (내려받지 않았으면 지난 기준이 곧 드라이브 파일)
+        const nowMs=Date.now(),dev=PWA?"앱":"아티팩트",before=same?(p=>B[p]?B[p][0]:""):(p=>KSync.hash(R[p]));
+        logOut=[KSync.logEntry(res.docs,new Set([...Object.keys(res.docs),...Object.keys(same?B:R)]),before,dev,rev,nowMs),...(Array.isArray(rlog)?rlog:[])].slice(0,KSync.LOG_MAX);
+        lastOut={app:dev,at:new Date(nowMs).toISOString()};
+        const text=KSync.serialize(res.docs,res.tombs,dev,nowMs,rev,seenOut,logOut);
         if(PWA&&now2[0]){const f=await gdCall("update_file",{fileId:now2[0].id,textContent:text,contentMimeType:"application/json"});fk=fileKey(f&&f.id?f:null)||"";old=now2.slice(1);}
         else{const f=await gdCall("create_file",{title:SYNC_NAME,contentMimeType:"application/json",disableConversionToGoogleType:true,textContent:text,parentId:fid});
           if(!f||!f.id)throw{code:"tool_error",message:"동기화 파일을 만들지 못했습니다"};fk=fileKey(f);old=now2.filter(o=>o.id!==f.id);}   // 커넥터는 내용을 고칠 수 없어 새로 만들고 예전 것은 휴지통으로
@@ -3074,7 +3091,7 @@ async function syncRun(auto){
       // 동기화하는 사이에 고친 문서는 기준을 ‘고치기 전 이 기기 내용’으로 두고 다음에 파일을 내려받아 다시 합친다
       // (합친 내용을 기준으로 두면, 다음 동기화가 이 기기의 예전 값을 ‘새로 고친 것’으로 보고 다른 기기의 변경을 되돌린다)
       const h=KSync.baseOf(res.docs);for(const p of skipped){if(L[p]===undefined)delete h[p];else h[p]=KSync.baseOf({[p]:L[p]})[p];}
-      const base={h,t:res.tombs,rev,fk:skip?"":fk,fid,at:new Date().toISOString(),n:Object.keys(res.docs).length,seen:seenOut,head:up||seenOut[0]||null};
+      const base={h,t:res.tombs,rev,fk:skip?"":fk,fid,at:new Date().toISOString(),n:Object.keys(res.docs).length,seen:seenOut,head:up||seenOut[0]||null,log:logOut,last:lastOut};
       if(upload||done||skip||fk!==S.syncBase?.fk||fid!==S.syncBase?.fid||first)await S.dbRaw.doc("sync/base").set(baseDoc(base));else base.at=S.syncBase.at;   // 아무것도 안 바뀌었으면 기준도 다시 쓰지 않는다
       S.syncBase=base;clearDel(t1);
       S.sync.at=Date.now();S.sync.msg=`${from?`‘${from}’에서 시작했습니다. `:""}받은 변경 ${done}건 · ${upload?"드라이브에 저장했습니다":"드라이브는 그대로입니다"} (${secTxt(t0)}).`;
@@ -3087,6 +3104,14 @@ const baseDoc=b=>b&&b.h?{...b,h:KSync.packBase(b.h)}:b;   // 저장할 때만 �
 async function syncOff(){const b={...(S.syncBase||{}),off:true};try{await S.dbRaw.doc("sync/base").set(baseDoc(b));}catch(e){toast("동기화를 끄지 못했습니다. 다시 누르세요",5000);return;}S.syncBase=b;S.sync.at=null;S.sync.msg="동기화를 껐습니다. 드라이브의 파일은 그대로 둡니다.";S.sync.err=false;render();}
 const hhmm=t=>{const d=new Date(t);return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");};
 const whenTxt=iso=>{const d=new Date(iso);return isFinite(d)?`${d.getMonth()+1}/${d.getDate()} ${hhmm(d)}`:"";};
+// 최근 드라이브 업데이트: 파일의 업로드 기록(log). 기록이 없는 파일(예전 판 앱이 올림)은 마지막으로 올린 앱만
+const SYNC_APP={"앱":"웹앱(PWA)","아티팩트":"아티팩트","안드로이드":"Android 앱","윈도우":"Windows 앱","복원":"복원"};
+const SYNC_COL={accounts:"계좌",holdings:"보유 종목",prices:"가격",assets:"관심 종목",snapshots:"평가액 기록",settings:"설정",plan:"계획"};
+function syncLogHtml(){const b=S.syncBase||{};const log=(Array.isArray(b.log)?b.log:[]).filter(x=>x&&typeof x==="object");
+  const app=a=>esc(SYNC_APP[a]||a||"알 수 없음");
+  if(!log.length)return b.last&&b.last.at?`<span class="meta">마지막 업로드: ${app(b.last.app)} · ${esc(whenTxt(b.last.at))}</span>`:"";
+  const chg=c=>Object.entries(c&&typeof c==="object"?c:{}).filter(([,n])=>num(n)>0).map(([k,n])=>k==="settings"||k==="plan"?SYNC_COL[k]:`${SYNC_COL[k]||k} ${nf.format(num(n))}`).join(" · ")||"바뀐 문서 없음";
+  return `<details class="synclog"><summary>최근 드라이브 업데이트 · ${app(log[0].app)} ${esc(whenTxt(log[0].at))}</summary><div class="kvlist">${log.slice(0,10).map(e=>`<div class="kvr"><span>${esc(whenTxt(e.at))} · ${app(e.app)}${e.ver?` ${esc(e.ver)}`:""}</span><span class="meta">${esc(chg(e.chg))}</span></div>`).join("")}</div></details>`;}
 function syncSection(){const on=syncOn();const b=S.syncBase||{};
   const st=S.sync.busy?"동기화 중…":S.sync.at?`마지막 동기화 ${hhmm(S.sync.at)}`:b.at?`마지막 동기화 ${whenTxt(b.at)}`:"";
   const msg=S.sync.msg?`<span class="${S.sync.err?"err":"hint"}">${esc(S.sync.msg)}</span>`:"";
@@ -3098,11 +3123,11 @@ function syncSection(){const on=syncOn();const b=S.syncBase||{};
     const con=KinfolioPWA.hasToken();
     return `<h4 style="margin:4px 0 0">동기화 (아티팩트·다른 기기와 같은 데이터)</h4>
      <span class="meta">${con?"구글 드라이브에 연결됨":"연결 안 됨"}${st?` · ${st}`:""}</span>
-     <div class="btns">${con?`${nowBtn}<button class="btn" data-sync="disconnect">연결 해제</button>`:`<button class="btn primary" data-sync="connect">드라이브 연결</button>`}</div>${msg}
+     <div class="btns">${con?`${nowBtn}<button class="btn" data-sync="disconnect">연결 해제</button>`:`<button class="btn primary" data-sync="connect">드라이브 연결</button>`}</div>${msg}${syncLogHtml()}
      <span class="hint">이 기기의 장부를 구글 드라이브 ‘Kinfolio’ 폴더의 ‘${SYNC_NAME}’과 맞춥니다. 고치면 몇 초 뒤, 앱을 열거나 다시 볼 때 자동으로 맞춥니다. 연결은 한 시간쯤 유지되고, 끊기면 위쪽 ‘드라이브 연결’을 누르면 됩니다. 연결이 끊긴 동안 고친 내용은 이 기기에 남아 있다가 다음에 연결하면 올라갑니다.</span>`;}
   return `<h4 style="margin:4px 0 0">동기화 (PC·안드로이드 앱과 같은 데이터)</h4>
    <span class="meta">${on?`켜짐${st?` · ${st}`:""}`:"꺼짐"}</span>
-   <div class="btns">${on?`${nowBtn}<button class="btn" data-sync="off"${S.sync.busy?" disabled":""}>동기화 끄기</button>`:`<button class="btn primary" data-sync="start"${S.sync.busy?" disabled":""}>${S.sync.busy?"동기화 중…":"드라이브와 동기화 시작"}</button>`}</div>${msg}
+   <div class="btns">${on?`${nowBtn}<button class="btn" data-sync="off"${S.sync.busy?" disabled":""}>동기화 끄기</button>`:`<button class="btn primary" data-sync="start"${S.sync.busy?" disabled":""}>${S.sync.busy?"동기화 중…":"드라이브와 동기화 시작"}</button>`}</div>${msg}${syncLogHtml()}
    <span class="hint">구글 드라이브 ‘Kinfolio’ 폴더의 ‘${SYNC_NAME}’ 파일로 PC·안드로이드 앱(PWA)과 같은 데이터를 씁니다. 켜 두면 이 화면을 열 때와 고치고 15초 뒤에 자동으로 맞춥니다. 양쪽에서 같은 항목을 고쳤으면 나중에 고친 쪽을 남깁니다.</span>`;}
 // 머리글의 동기화 표시
 function syncChip(){const c=document.getElementById("syncChip");if(!c)return;let txt="",warn=false;
@@ -3211,7 +3236,7 @@ function render0(){
   if(S.tab==="plan"&&S.planView==="result")drawChart();
   if(S.tab==="trend")drawTrend();
   syncChip();navSync();
-  if(!S.snapBoot&&snapReady()&&S.gdAvail!==null&&(!syncOn()||!S.gdAvail||S.sync.at||S.sync.err||(PWA&&!KinfolioPWA.hasToken()))){S.snapBoot=true;autoSnap(1500);}
+  if(!S.snapBoot&&snapReady()&&S.gdAvail!==null&&S.syncBase!==undefined&&(!syncOn()||!S.gdAvail||S.sync.at)){S.snapBoot=true;autoSnap(1500);}   // 동기화 기준을 읽은 뒤, 동기화를 켜 두었으면 드라이브와 한 번 맞춘 뒤에만 (연결이 끊긴 채 예전 가격으로 기록해 다른 기기의 기록을 덮지 않게)
   if(!S.pxBoot&&S.gdAvail&&syncLoaded()&&(!syncOn()||S.sync.at||S.sync.err||(PWA&&!KinfolioPWA.hasToken()))){S.pxBoot=true;pxT=setTimeout(pxAutoRun,800);bkT=setTimeout(bkAutoRun,4000);}   // 주 단위 자동 백업은 가격을 가져온 뒤에   // 가격 자동 업데이트 (동기화가 켜져 있으면 첫 동기화 뒤)
   if(!S.sync.boot&&syncOn()&&S.gdAvail&&syncLoaded()){S.sync.boot=true;setTimeout(()=>syncRun(true),400);}
 }
@@ -5188,7 +5213,8 @@ async function recordSnap(auto) {
   if (needsFx()) { if (!auto) toast("달러 자산이 있는데 환율이 비어 있어 기록하지 않았습니다. 설정에서 환율을 넣거나 가격을 가져오세요.", 5000); return false; }
   const d = snapDoc(auto); if (!(d.total > 0)) return false;
   const cur = (S.snapshots || []).find(x => x.date === d.date);
-  if (auto && cur && cur.total === d.total && cur.cost === d.cost && cur.holdA) return false;   // 그대로면 다시 쓰지 않는다 (계좌별 보유 종목을 남기지 않은 예전 기록은 한 번 다시 쓴다)
+  if (auto && cur && cur.total === d.total && cur.cost === d.cost && cur.holdA) return false;
+  if (auto && cur && cur.pxOld && d.pxOld && d.pxOld < cur.pxOld) return false;   // 같은 날 기록이 이미 더 최근 가격으로 있으면(다른 기기가 기록) 예전 가격으로 덮지 않는다   // 그대로면 다시 쓰지 않는다 (계좌별 보유 종목을 남기지 않은 예전 기록은 한 번 다시 쓴다)
   if (auto) { try { await S.db.doc("snapshots/" + d.date).set(d); } catch (e) { if (!S.snapErr) { S.snapErr = true; render(); } return false; } if (S.snapErr) { S.snapErr = false; render(); } return true; }
   return write(db => db.doc("snapshots/" + d.date).set(d), `${d.date} 평가액을 기록했습니다`);
 }
